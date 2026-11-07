@@ -75,9 +75,23 @@ PC 侧也有 `phone/revive.sh` 一键拉起。
   "height": 448,
   "fps": 8,
   "grabIntervalMs": 70,
+  "rotate": 90,
+  "camera": "back",
   "mode": "general"
 }
 ```
+
+### `rotate` 必须是 90（否则画面是歪的）
+
+Camera2 的 sensor 成像相对手机自然方向转了 90°。不转的话 IP Camera App 输出
+800×600 横图，`cover` 缩到 336×448 会**横向裁掉 44%** 的画面，而且图里的
+"左右前后"全是错的。转 90° 后源是 600×800 = 3:4，和 336×448 **同比例，零裁切**。
+
+插件启动时会把 `rotate` / `camera` / `resolution` / `torch` 拼成查询串发给
+IP Camera App（`GET /?camera=back&rotate=90`，App 侧持久化），再开始取流。
+`status` 里 `preset:{tried,ok}` 能看到下发结果。
+
+换机型发现图歪了就改这个值（0 / 180 / 270），不用改代码。
 
 ---
 
@@ -130,10 +144,13 @@ see_phone({ action: "look", mode: "guide" })      // 导盲话术（后续定制
 - [x] **开源 MIT 的 IP Camera App 装上**，关掉认证/TLS → 纯 HTTP MJPEG
 - [x] `cam_server.py` 流模式跑起来：`/frame`、`/jpg`、`/stream`、`/view`
 - [x] **端到端 12.95fps** 验证通过，多帧宫格出图
-- [x] 插件 `see_phone` 已装进 dsh-go（`plugin_manager install_bundle`）
-- [x] 插件已升级到 `http-mjpeg`（`remove_bundle` → `install_bundle`），
-      配置已切到 `127.0.0.1:4444/video/mjpeg`
+- [x] 插件 `see_phone` 已装进 dsh-go
+- [x] 插件已升级到 `http-mjpeg`，配置已切到 `127.0.0.1:4444/video/mjpeg`
 - [x] **Termux 整层退役**：采集链只剩 IP Camera App 一个外部程序
+- [x] **0.1.2 真机验收（2026-11-07 20:45）**：6.3fps / 解码 25ms / 首帧 455ms /
+      0 失败 / 出 8 帧宫格；`rotate=90` 修好方向，`preset.ok=true`
+
+装/升走 `dsh plugin --profile web add <tgz>`，装完**必须重启引擎**。
 
 ## 开源与商用
 
