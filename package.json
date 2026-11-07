@@ -1,7 +1,7 @@
 {
   "name": "dsh-see-now-phone",
-  "version": "0.1.0",
-  "description": "SeeNow Phone Version — hand the phone camera to DSH so a blind user can be told what is in front of them. · 手机摄像头版 SeeNow：让 AI 看见用户前方，用语音带路。",
+  "version": "0.1.1",
+  "description": "SeeNow Phone Version — 手机版 see-now：保留桌面版多帧宫格能力，采集源换成手机摄像头。",
   "keywords": [
     "dsh",
     "dsh-plugin",

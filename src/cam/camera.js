@@ -17,15 +17,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { createFrameReader } from './ffmpeg.js';
+import { createMjpegReader } from './mjpeg.js';
 
 /** @typedef {'termux'|'mjpeg'|'rtsp'|'v4l2'|'avfoundation'|'dshow'|'file'|'testsrc'} Backend */
 
 export const BACKENDS = Object.freeze([
-  'termux', 'http-raw', 'http-jpg', 'mjpeg', 'rtsp', 'v4l2', 'avfoundation', 'dshow', 'file', 'testsrc',
+  'termux', 'http-mjpeg', 'http-raw', 'http-jpg', 'mjpeg', 'rtsp', 'v4l2', 'avfoundation', 'dshow', 'file', 'testsrc',
 ]);
 
 /** 手机上真正能干活的（其余是桌面调试/回归用） */
-export const MOBILE_BACKENDS = Object.freeze(['http-raw', 'termux', 'http-jpg', 'mjpeg', 'rtsp']);
+export const MOBILE_BACKENDS = Object.freeze(['http-mjpeg', 'http-raw', 'termux', 'http-jpg', 'mjpeg', 'rtsp']);
 
 /**
  * 后端 → ffmpeg 输入参数。
@@ -55,6 +56,14 @@ export function resolveSource(backend, opts = {}, platform = process.platform) {
         backend, pushMode: 'jpgpipe', live: true,
         inputArgs: ['-f', 'image2pipe', '-c:v', 'mjpeg', '-i', '-'],
       };
+    }
+
+    case 'http-mjpeg': {
+      // **推荐的手机后端**：插件自己直连 IP Camera App 的 MJPEG 流，
+      // 内置 jpeg-js 解码。不依赖 Termux / ffmpeg / python，采集链只有
+      // IP Camera 一个外部程序，不会因为它俩被系统清后台而断掉。
+      if (!url) throw new RangeError('http-mjpeg 后端需要 url（例：http://127.0.0.1:4444/video/mjpeg）');
+      return { backend, pushMode: 'direct', live: true, inputArgs: [] };
     }
 
     case 'http-raw': {
@@ -223,6 +232,7 @@ export function openCamera(opts) {
   const source = resolveSource(backend, { ...opts, fps });
 
   let reader = null;
+  let mjpeg = null;
   let grabTimer = null;
   let grabChild = null;
   let stopped = false;
@@ -363,6 +373,16 @@ export function openCamera(opts) {
   async function start() {
     const piped = source.pushMode === 'jpgpipe';
     const raw = source.pushMode === 'raw';
+    const direct = source.pushMode === 'direct';
+
+    if (direct) {
+      mjpeg = createMjpegReader({
+        url, width, height, intervalMs: grabIntervalMs,
+        onFrame, onError,
+      });
+      mjpeg.start();
+      return { backend, width, height };
+    }
 
     if (!raw) {
       reader = createFrameReader({
@@ -414,6 +434,8 @@ export function openCamera(opts) {
 
   async function stop() {
     stopped = true;
+    // 保留引用：stop 之后 status 还要能读到最后一轮的统计
+    if (mjpeg) mjpeg.stop();
     if (grabTimer) { clearTimeout(grabTimer); grabTimer = null; }
     if (grabChild) { try { grabChild.kill('SIGKILL'); } catch { /* ignore */ } grabChild = null; }
     await reader?.stop();
@@ -421,6 +443,14 @@ export function openCamera(opts) {
   }
 
   function snapshot() {
+    if (mjpeg) {
+      const s = mjpeg.snapshot();
+      return {
+        backend, width, height, running: s.running,
+        frames: s.frames, fps: s.fps, firstFrameMs: null,
+        grab: s.grab, stderrTail: null, decodeMs: s.decodeMs,
+      };
+    }
     const isRaw = source.pushMode === 'raw';
     const elapsed = rawStartedAt ? (Date.now() - rawStartedAt) / 1000 : 0;
     return {

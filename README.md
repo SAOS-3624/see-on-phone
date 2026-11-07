@@ -34,41 +34,32 @@
 
 ---
 
-## 2. 手机上的架构（真机实测通过）
+## 2. 手机上的架构（当前版本）
 
-**默认走连续流，12–20fps。** 采集端用开源 App
-[DigitallyRefined/android-ip-camera](https://github.com/DigitallyRefined/android-ip-camera)
-（**MIT**，可商用；v0.16.1 官方 GitHub Release，arm64，SHA-256 与公布值核对一致）。
+**采集链只剩一个外部程序。** 插件内置纯 JS 的 JPEG 解码器
+（[jpeg-js](https://github.com/jpeg-js/jpeg-js) 0.4.4，BSD-3-Clause，40KB，已 vendor 到
+`src/cam/vendor/jpeg-js/`），自己直连开源 IP Camera App 的 MJPEG 流：
 
 ```
-IP Camera App  Camera2 长连接 → HTTP :4444/video/mjpeg（免认证、免 TLS，约 17fps）
-   │
-Termux ffmpeg（常驻一次启动）→ scale/cover → rgb24
-   │
-cam_server.py  维护最新帧；HTTP :8123/frame（约 25ms/次）、/jpg、/stream、/view
-   │
-dsh-go (PRoot Ubuntu) 里的 dsh-see-now-phone
-   │  http-raw 后端：收现成 rgb24 → pipeline.push({t,buf})
-   ▼
-打分 → 切点 → 装箱 DP → 多帧宫格 → PNG → 宿主附件
+Android IP Camera App (MIT, :4444/video/mjpeg, ~17fps)
+  → 插件 http-mjpeg 后端：SOI/EOI 抠帧 → jpeg-js 解码 → cover 缩放 → rgb24
+  → 打分 → 切点 → 装箱 DP → 多帧宫格 → PNG → 宿主附件
 ```
 
-两个 Android App 共享同一个网络栈，PRoot 直连 `127.0.0.1` 即可，**不需要端口转发**。
-插件侧**零 ffmpeg 依赖**（PRoot 里没有 ffmpeg，解码全在 Termux 侧做完）。
+**Termux / python / ffmpeg / watchdog 全部不再需要**。这是刻意收敛的结果：
+早期版本把解码放在 Termux 的几个后台进程里，华为锁屏会把它们一次性全清掉，
+整条链就断。现在插件跟着 dsh-go 活，唯一要保住的是 IP Camera App（它有
+`foregroundServiceType="camera"` 前台服务）。
 
-**为什么必须换流**：`termux-camera-photo` 每次 camera2 open/close ~800ms（上限 ~1.2fps），
-Termux 的 ffmpeg 没有 `android_camera`/`v4l2` demuxer，`/dev/video*` 属 `system:camera`、
-普通进程 `Permission denied`。抓拍路径调不出 12fps，是权限模型决定的。
-
-**保留的回退**：`CAM_MODE=grab` 时不依赖任何额外 App，用
-`cam_grab.sh` + `termux-camera-photo` + PIL `draft()` 走 ~1fps 抓拍路径
-（IP Camera 没装/没开时自动可用）。帧标记用**递增序号**，不用时间戳。
+锁屏回来只要**点开一下 Android IP Camera App**，相机就重新接管；
+PC 侧也有 `phone/revive.sh` 一键拉起。
 
 ## 3. 后端
 
 | 后端 | 帧率 | 需要 | 说明 |
 |---|---|---|---|
-| **`http-raw`** | **12–20 fps** | Termux + ffmpeg + IP Camera App | **手机默认**，零插件侧依赖 |
+| **`http-mjpeg`** | **8–13 fps** | 只要 IP Camera App | **手机默认**，插件内置解码，零外部进程 |
+| `http-raw` | 12–20 fps | Termux + 帧服务 | 旧链路，保留作回退（8123） |
 | `termux` | ~1 fps | Termux + Termux:API | 插件自己抓拍（只在插件直接跑在 Termux 里时用） |
 | `mjpeg` / `rtsp` | 15–30 fps | 任意流源 | 插件侧需 ffmpeg（PRoot 里没有，慎用） |
 | `v4l2` / `avfoundation` / `dshow` | 原生 | 桌面摄像头 | PC 调试 |
@@ -78,8 +69,8 @@ Termux 的 ffmpeg 没有 `android_camera`/`v4l2` demuxer，`/dev/video*` 属 `sy
 
 ```json
 {
-  "backend": "http-raw",
-  "url": "http://127.0.0.1:8123/frame",
+  "backend": "http-mjpeg",
+  "url": "http://127.0.0.1:4444/video/mjpeg",
   "width": 336,
   "height": 448,
   "fps": 8,
@@ -117,18 +108,19 @@ see_phone({ action: "look", mode: "guide" })      // 导盲话术（后续定制
 | Termux ffmpeg → rgb24 | 336×448×3 = **451584 B**，精确对上 |
 | `/frame` 端到端 | **~25 ms** |
 | 帧服务内部计数 | **19.8 fps**（`ok=382 fail=0 age=0.03`） |
-| **插件端到端 8 秒** | **104 帧 = 12.95 fps**，出 6 帧宫格 |
+| **插件端到端（新后端）** | **51 帧 / 6 秒 = 8.47 fps**，出 4 帧宫格，0 失败 |
 
-⚠️ 插件的轮询间隔必须跟上：`grabIntervalMs` 默认 **70ms**（`http-raw` 钳到 80ms）。
-抓拍时代的 220ms 会把 20fps 的源压成 4.4fps —— 这个坑实测踩过。
+⚠️ `grabIntervalMs` 默认 **70ms**（`http-raw` 钳到 80ms）。抓拍时代的 220ms
+会把 20fps 的源压成 4.4fps —— 这个坑实测踩过。
+纯 JS 解码比 ffmpeg 稍慢（8.47 vs 12.95fps）；把 IP Camera App 的分辨率调到
+640×480 能再提一截，因为 jpeg-js 的耗时跟源像素数成正比。
 
-**悬浮预览**：`http://127.0.0.1:8123/view` 是实时画面页，`/stream` 是 MJPEG 流。
-手机浏览器打开 `/view`，再从最近任务把浏览器切成小窗/悬浮窗，
-就是「后台采集 + 悬浮预览」，不用编译原生 overlay App。
+**悬浮预览**：手机浏览器直接打开 `http://127.0.0.1:4444/`（App 自带 Web 面板），
+或从最近任务把浏览器切成小窗/悬浮窗，不用编译原生 overlay App。
 
 其他边界：
 - 单帧 336×448 ≈ 130 token，**图会留在会话历史里每轮重发**；长时间看要留意
-- 保持 IP Camera App 在后台（别从最近任务划掉），断流时帧服务会自动重连
+- 保持 IP Camera App 在跑（别从最近任务划掉），断流时插件会自动重连
 - 用完记得 `stop`；持续采集会耗电发热
 
 ## 6. 当前装机进度
@@ -139,15 +131,18 @@ see_phone({ action: "look", mode: "guide" })      // 导盲话术（后续定制
 - [x] `cam_server.py` 流模式跑起来：`/frame`、`/jpg`、`/stream`、`/view`
 - [x] **端到端 12.95fps** 验证通过，多帧宫格出图
 - [x] 插件 `see_phone` 已装进 dsh-go（`plugin_manager install_bundle`）
-- [ ] 把**更新后的**插件包/配置刷进 dsh-go：在它终端里跑一次
-      `sh /sdcard/Download/install-on-phone.sh`（改了轮询间隔，装一次即可）
+- [x] 插件已升级到 `http-mjpeg`（`remove_bundle` → `install_bundle`），
+      配置已切到 `127.0.0.1:4444/video/mjpeg`
+- [x] **Termux 整层退役**：采集链只剩 IP Camera App 一个外部程序
 
 ## 开源与商用
 
 摄像头流 App：MIT License，允许商用、修改、再分发，无 copyleft 义务。
 从[官方 GitHub Releases](https://github.com/DigitallyRefined/android-ip-camera/releases) 下载，
 校验 SHA-256 `0e9d5fb859b9dc2d77f401f31964c412b22d6d787b88556a3001ea3b79f099fc`。
-插件本体 Apache-2.0，引擎同 `dsh-see-now`。
+插件本体 Apache-2.0，引擎同 `dsh-see-now`；内置
+[jpeg-js](https://github.com/jpeg-js/jpeg-js) 0.4.4 为 BSD-3-Clause
+（版权声明保留在 `src/cam/vendor/jpeg-js/LICENSE`）。三者均允许商用。
 
 ## 7. 开发
 

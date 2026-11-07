@@ -97,13 +97,13 @@ function createSession(cfg) {
     width: Number(cfg.width) || DEFAULT_SIZE.width,
     height: Number(cfg.height) || DEFAULT_SIZE.height,
   };
-  const camBackend = cfg.backend ?? 'http-raw';
+  const camBackend = cfg.backend ?? 'http-mjpeg';
   const camOpts = {
     backend: camBackend,
-    // 手机上默认连 Termux 那个帧服务（cam_server.py）：抓拍 + 缩放 + rgb24 都在
-    // 手机侧做完，插件侧零依赖（PRoot 里没有 ffmpeg 也能跑）。
-    // 两个 App 共享网络栈，127.0.0.1 直连，不需要端口映射。
-    url: cfg.url ?? 'http://127.0.0.1:8123/frame',
+    // 手机上默认直连 IP Camera App 的 MJPEG 流，插件内置 jpeg-js 解码。
+    // 不再经过 Termux / python / ffmpeg —— 采集链只剩一个外部 App，
+    // 不会因为它俩被系统清后台而断掉。127.0.0.1 直连，无需端口映射。
+    url: cfg.url ?? 'http://127.0.0.1:4444/video/mjpeg',
     width: size.width,
     height: size.height,
     fps: Number(cfg.fps) || 8,
