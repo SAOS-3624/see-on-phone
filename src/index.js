@@ -24,7 +24,7 @@ import { join } from 'node:path';
 import { createPipeline } from './engine/pipeline.js';
 import { openCamera } from './cam/camera.js';
 import { seePhoneToolSpec, TOOL_NAME, DEFAULT_WAIT_SEC } from './tool-spec.js';
-import { buildLookText, buildStatusText, gradeView } from './guide.js';
+import { buildLookText, buildGuideText, buildStatusText, gradeView } from './guide.js';
 import { speak, ttsState, stopSpeaking } from './tts.js';
 import { loadDefineTool } from './define-tool.js';
 
@@ -94,7 +94,11 @@ function createSession(cfg) {
     height: Number(cfg.height) || DEFAULT_SIZE.height,
   };
   const camOpts = {
-    backend: cfg.backend ?? null,
+    backend: cfg.backend ?? 'http-raw',
+    // 手机上默认连 Termux 那个帧服务（cam_server.py）：抓拍 + 缩放 + rgb24 都在
+    // 手机侧做完，插件侧零依赖（PRoot 里没有 ffmpeg 也能跑）。
+    // 两个 App 共享网络栈，127.0.0.1 直连，不需要端口映射。
+    url: cfg.url ?? 'http://127.0.0.1:8123/frame',
     width: size.width,
     height: size.height,
     fps: Number(cfg.fps) || 8,
@@ -238,10 +242,12 @@ export async function apply(ctx) {
     s.sheets += 1;
     const ageSec = (Date.now() - s.lastWall) / 1000;
     const quality = gradeView({ meanLuma: s.lastLuma, frames: s.frames, firstFrameMs: null });
-    const text = buildLookText({
-      note: args.note ? String(args.note).slice(0, 300) : null,
-      ageSec, frames: 1, quality, backend: s.snapshot().backend,
-    });
+    const mode = String(args.mode ?? cfg.mode ?? 'general').toLowerCase();
+    const note = args.note ? String(args.note).slice(0, 300) : null;
+    const backend = s.snapshot().backend;
+    const text = mode === 'guide'
+      ? buildGuideText({ note, ageSec, quality })
+      : buildLookText({ note, ageSec, frames: sheet.frames.length, quality, backend });
     return attach(ctx, sheet, text, {
       ageSec: +ageSec.toFixed(2),
       quality,
@@ -255,29 +261,34 @@ export async function apply(ctx) {
     const s = await ensure();
     const waitSec = Number.isFinite(Number(args.wait)) && Number(args.wait) > 0
       ? Math.min(Number(args.wait), 120)
-      : 30;
+      : DEFAULT_WAIT_SEC * 4;
+    const note = args.note ? String(args.note).slice(0, 300) : null;
+    const mode = String(args.mode ?? cfg.mode ?? 'general').toLowerCase();
+    const quality = gradeView({ meanLuma: s.lastLuma, frames: s.frames });
+    const backend = s.snapshot().backend;
     const t0 = Date.now();
-    // 先给一张现在的，别让模型空等 —— 导盲场景"等变化"是最没用的一件事
-    const first = await doLook({ ...args, wait: Math.min(waitSec, DEFAULT_WAIT_SEC) });
-    if (first.meta?.ok) return first;
 
+    // pipeline 在 push 里按"变化量 / 张数 / 等待时间"自己 flush，
+    // watch 只负责把攒出来的那张（可能是多帧宫格）领走。
     while (Date.now() - t0 < waitSec * 1000) {
       const sheet = s.pipeline.take();
       if (sheet) {
         s.sheets += 1;
-        return attach(ctx, sheet, buildLookText({
-          note: args.note ? String(args.note).slice(0, 300) : null,
-          ageSec: (Date.now() - s.lastWall) / 1000,
-          quality: gradeView({ meanLuma: s.lastLuma, frames: s.frames }),
-          backend: s.snapshot().backend,
-        }), { ok: true, sheets: s.sheets });
+        const ageSec = (Date.now() - s.lastWall) / 1000;
+        const text = mode === 'guide'
+          ? buildGuideText({ note, ageSec, quality })
+          : buildLookText({ note, ageSec, frames: sheet.frames.length, quality, backend });
+        return attach(ctx, sheet, text, {
+          ok: true, sheets: s.sheets, frames: sheet.frames.length,
+          why: sheet.why, backend,
+        });
       }
       await sleep(150);
     }
     return {
-      text: `${waitSec} 秒内画面没有明显变化。要么用户站着没动，要么摄像头看不见（镜头被挡）。`
-        + '这时候不要复述旧画面，直接问用户一句。',
-      meta: { ok: false, reason: 'no-change' },
+      text: `${waitSec} 秒内没有出图。静止画面会一直攒着不叫你（这是省 token 的设计）；`
+        + '要「此刻」单帧就调 `look`，或直接 `status` 看采集是不是停了。',
+      meta: { ok: false, reason: 'no-sheet' },
     };
   }
 
@@ -296,7 +307,7 @@ export async function apply(ctx) {
   }
 
   async function route(args = {}) {
-    const action = String(args.action ?? 'look').toLowerCase();
+    const action = String(args.action ?? 'watch').toLowerCase();
 
     // `say` 在任何动作之前处理：用户等着回话时，一张图晚两秒无所谓，一句话晚两秒就很难受
     const said = args.say ? String(args.say).trim().slice(0, 400) : null;
@@ -320,11 +331,9 @@ export async function apply(ctx) {
       case 'look':
       default: {
         const out = await doLook(args);
-        if (speakResult && !speakResult.ok && said) {
-          const why = speakResult.reason === 'no-tts'
-            ? '这台机器上没找到 `termux-tts-speak`（Termux 里 `pkg install termux-api` + 装 Termux:API App）。'
-            : `朗读失败（${speakResult.reason}）。`;
-          return { ...out, text: `${out.text}\n\n⚠ 你想说的话没能念出来：${why}把这句话写进回复里，让用户自己用读屏听。` };
+        if (speakResult && !speakResult.ok && said
+            && String(args.mode ?? cfg.mode ?? 'general').toLowerCase() === 'guide') {
+          return { ...out, text: `${out.text}\n\n⚠ 没找到 termux-tts-speak：把要说的话写进回复里，让用户用系统读屏听。` };
         }
         return out;
       }
@@ -358,8 +367,7 @@ export async function apply(ctx) {
 const HELP = `SeeNow Phone Version · 手机摄像头导盲
 
 ## 它在做什么
-手机后置摄像头 → ffmpeg 解码缩放到 ${DEFAULT_SIZE.width}×${DEFAULT_SIZE.height} → 打分 → 拼成一帧 →
-交给宿主作为图片附件 → 你用文字描述回去，同时 \`say\` 走系统 TTS 念给用户。
+手机摄像头 → 手机侧缩放成 rgb24 → 打分/切点 → 装箱 DP 拼图 → 图片附件交给宿主。\n与桌面 \`see_now\` 同一套引擎，只是采集源从屏幕换成摄像头。
 
 ## 采集后端（配置文件 ~/.dsh/see-phone.json 的 backend）
 - \`termux\`（默认）：Termux:API 抓拍，2~4 fps，零额外 App，**够用来判断台阶/门/人**

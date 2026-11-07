@@ -15,16 +15,17 @@ import { spawn } from 'node:child_process';
 import { existsSync, unlinkSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { request as httpRequest } from 'node:http';
 import { createFrameReader } from './ffmpeg.js';
 
 /** @typedef {'termux'|'mjpeg'|'rtsp'|'v4l2'|'avfoundation'|'dshow'|'file'|'testsrc'} Backend */
 
 export const BACKENDS = Object.freeze([
-  'termux', 'mjpeg', 'rtsp', 'v4l2', 'avfoundation', 'dshow', 'file', 'testsrc',
+  'termux', 'http-raw', 'http-jpg', 'mjpeg', 'rtsp', 'v4l2', 'avfoundation', 'dshow', 'file', 'testsrc',
 ]);
 
 /** 手机上真正能干活的（其余是桌面调试/回归用） */
-export const MOBILE_BACKENDS = Object.freeze(['termux', 'mjpeg', 'rtsp']);
+export const MOBILE_BACKENDS = Object.freeze(['http-raw', 'termux', 'http-jpg', 'mjpeg', 'rtsp']);
 
 /**
  * 后端 → ffmpeg 输入参数。
@@ -45,6 +46,25 @@ export function resolveSource(backend, opts = {}, platform = process.platform) {
         backend, pushMode: 'jpgpipe', live: true,
         inputArgs: ['-f', 'image2pipe', '-c:v', 'mjpeg', '-i', '-'],
       };
+
+    case 'http-jpg': {
+      // 拿 JPEG 再本地解码。**手机场景不推荐** —— dsh-go 的 PRoot 里通常没有 ffmpeg，
+      // 而且 image2pipe 喂多张 JPEG 时 ffmpeg 会把"数据停顿"判成 EOF 提前退出。
+      if (!url) throw new RangeError('http-jpg 后端需要 url（例：http://127.0.0.1:8123/jpg）');
+      return {
+        backend, pushMode: 'jpgpipe', live: true,
+        inputArgs: ['-f', 'image2pipe', '-c:v', 'mjpeg', '-i', '-'],
+      };
+    }
+
+    case 'http-raw': {
+      // **手机上的默认后端**：Termux 侧（cam_server.py）抓拍 + 缩放 + 转 rgb24，
+      // 这里只收字节。好处是插件侧零依赖 —— 不需要 ffmpeg，PRoot 里也能跑。
+      if (!url) throw new RangeError('http-raw 后端需要 url（例：http://127.0.0.1:8123/frame）');
+      return {
+        backend, pushMode: 'raw', live: true, inputArgs: [],
+      };
+    }
 
     case 'mjpeg':
       if (!url) throw new RangeError('mjpeg 后端需要 url（例：http://192.168.1.5:8080/video）');
@@ -194,6 +214,7 @@ export function openCamera(opts) {
     backend: wantBackend = null,
     width = 448, height = 336, fps = 8,
     grabIntervalMs = 220, cameraId = 0,
+    url = null,
     ffmpegPath = 'ffmpeg',
     onFrame, onError, onExit,
   } = opts;
@@ -261,36 +282,133 @@ export function openCamera(opts) {
     grabChild.on('close', finish);
   }
 
+  /**
+   * HTTP 抓一张 → 塞进 ffmpeg stdin。
+   *
+   * 服务端是 Termux 里的一个 python 服务：每次 GET 现抓一张 JPEG 返回
+   * （见 `phone/cam_server.py`）。**串行**：服务端背后是 camera2 的
+   * open/close，并发请求只会让两张都超时。
+   */
+  let httpBusy = false;
+  function grabHttp() {
+    if (stopped || httpBusy || !url) return;
+    httpBusy = true;
+    const done = (ok, bytes) => {
+      httpBusy = false;
+      if (ok) {
+        grabStats.shots += 1;
+        grabStats.bytes += bytes;
+        grabFails = 0;
+      } else {
+        grabStats.fails += 1;
+        grabFails += 1;
+        if (grabFails === 5) {
+          onError?.(Object.assign(
+            new Error(`连续 5 次取不到画面：${url} 没响应。检查 Termux 里的 cam_server.py 是否在跑。`),
+            { code: 'camera-unavailable' },
+          ));
+        }
+      }
+    };
+    const req = httpRequest(url, { method: 'GET', timeout: 10000 }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); done(false, 0); return; }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        if (buf.length < 512) { done(false, 0); return; }
+        reader?.writeToStdin(buf);
+        done(true, buf.length);
+      });
+      res.on('error', () => done(false, 0));
+    });
+    req.on('error', () => done(false, 0));
+    req.on('timeout', () => { req.destroy(); done(false, 0); });
+    req.end();
+  }
+
+  /** `http-raw`：直接收 rgb24，不经过 ffmpeg。 */
+  const rawStats = { frames: 0, fails: 0, bytes: 0 };
+  let rawBusy = false;
+  let rawStartedAt = 0;
+
+  function grabRaw() {
+    if (stopped || rawBusy || !url) return;
+    rawBusy = true;
+    const q = url.includes('?') ? '&' : '?';
+    const full = `${url}${q}w=${width}&h=${height}`;
+    const fail = () => { rawBusy = false; rawStats.fails += 1; };
+    const req = httpRequest(full, { method: 'GET', timeout: 15000 }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); fail(); return; }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        rawBusy = false;
+        const buf = Buffer.concat(chunks);
+        // 长度必须**正好**是 w*h*3：短了会被下游当成错位的帧，
+        // 画面上表现为斜条纹，比直接丢弃难查得多
+        if (buf.length !== width * height * 3) { rawStats.fails += 1; return; }
+        rawStats.frames += 1;
+        rawStats.bytes += buf.length;
+        const now = Date.now();
+        onFrame({ buf, t: +((now - rawStartedAt) / 1000).toFixed(3), wall: now });
+      });
+      res.on('error', fail);
+    });
+    req.on('error', fail);
+    req.on('timeout', () => { req.destroy(); fail(); });
+    req.end();
+  }
+
   async function start() {
+    const piped = source.pushMode === 'jpgpipe';
+    const raw = source.pushMode === 'raw';
+
+    if (!raw) {
+      reader = createFrameReader({
+        ffmpegPath, args: captureArgs({ source, width, height }),
+        width, height, label: backend, onFrame, onError, onExit,
+      });
+      reader.start();
+      // 等 ffmpeg 把 mjpeg demuxer 初始化完再灌第一张，否则首张会被当探测数据吞掉
+      if (piped) await new Promise((r) => setTimeout(r, 120));
+    } else {
+      rawStartedAt = Date.now();
+    }
+
     if (backend === 'termux') {
       const bin = (await whichTermuxCamera()) ?? findTermuxCamera();
       if (!bin) {
+        await reader?.stop();
+        reader = null;
         throw Object.assign(
           new Error('没找到 termux-camera-photo。手机需要：Termux 里 `pkg install termux-api`，'
             + '并安装 Termux:API App，然后在系统设置里给 Termux 相机权限。'),
           { code: 'backend-unavailable' },
         );
       }
-      reader = createFrameReader({
-        ffmpegPath, args: captureArgs({ source, width, height, ffmpegPath }),
-        width, height, label: 'termux', onFrame, onError, onExit,
-      });
-      reader.start();
-      // 等 ffmpeg 把 mjpeg demuxer 初始化完再灌第一张，否则首张会被当探测数据吞掉
-      await new Promise((r) => setTimeout(r, 120));
       const loop = () => {
         if (stopped) return;
         grabOnce(bin);
         grabTimer = setTimeout(loop, grabIntervalMs);
       };
       loop();
-    } else {
-      reader = createFrameReader({
-        ffmpegPath, args: captureArgs({ source, width, height, ffmpegPath }),
-        width, height, label: backend, onFrame, onError, onExit,
-      });
-      reader.start();
+    } else if (backend === 'http-jpg') {
+      const loop = () => {
+        if (stopped) return;
+        grabHttp();
+        grabTimer = setTimeout(loop, grabIntervalMs);
+      };
+      loop();
+    } else if (backend === 'http-raw') {
+      const loop = () => {
+        if (stopped) return;
+        grabRaw();
+        grabTimer = setTimeout(loop, grabIntervalMs);
+      };
+      loop();
     }
+
     return { backend, width, height };
   }
 
@@ -303,12 +421,19 @@ export function openCamera(opts) {
   }
 
   function snapshot() {
+    const isRaw = source.pushMode === 'raw';
+    const elapsed = rawStartedAt ? (Date.now() - rawStartedAt) / 1000 : 0;
     return {
-      backend, width, height, running: Boolean(reader?.running),
-      frames: reader?.stats.frames ?? 0,
-      fps: reader?.stats.fps ?? 0,
-      firstFrameMs: reader?.stats.firstFrameMs ?? null,
-      grab: { ...grabStats },
+      backend, width, height,
+      running: isRaw ? (!stopped && rawStartedAt > 0) : Boolean(reader?.running),
+      frames: isRaw ? rawStats.frames : (reader?.stats.frames ?? 0),
+      fps: isRaw
+        ? (elapsed > 0 ? +(rawStats.frames / elapsed).toFixed(2) : 0)
+        : (reader?.stats.fps ?? 0),
+      firstFrameMs: isRaw ? null : (reader?.stats.firstFrameMs ?? null),
+      grab: isRaw
+        ? { shots: rawStats.frames, fails: rawStats.fails, bytes: rawStats.bytes }
+        : { ...grabStats },
       stderrTail: reader?.stderrTail || null,
     };
   }

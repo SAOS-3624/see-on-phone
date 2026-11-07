@@ -35,6 +35,7 @@ const cam = openCamera({
   width: W, height: H, fps: 8,
   size: '640x480',
   path: filePath ?? undefined,
+  url: process.env.CAM_URL ?? undefined,
   onFrame: (f) => {
     frames.push(f);
     pipeline.push({ t: f.t, buf: f.buf });
@@ -53,7 +54,9 @@ await new Promise((r) => setTimeout(r, seconds * 1000));
 const { stats, sheets } = pipeline.finish();
 await cam.stop();
 
-console.log('frames in :', frames.length, ' fps =', cam.snapshot().fps);
+const snap = cam.snapshot();
+console.log('frames in :', frames.length, ' fps =', snap.fps);
+console.log('capture   :', JSON.stringify({ running: snap.running, firstFrameMs: snap.firstFrameMs, grab: snap.grab, err: (snap.stderrTail||'').slice(-160) }));
 console.log('stats     :', JSON.stringify(pipeline.stats));
 console.log('sheets    :', sheets.length);
 

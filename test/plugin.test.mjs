@@ -82,7 +82,14 @@ test('look 能从合成源出图并交给 attachments', async (t) => {
   assert.equal(host.saved[0].mediaType, 'image/png');
   assert.ok(host.saved[0].bytes > 1000, 'PNG 太小说明出的是空图');
   assert.equal(out.images.length, 1);
-  assert.match(out.text, /正前|风险/);
+  assert.match(out.text, /画面变化|帧/, '通用模式应当给画面变化说明，不是导盲话术');
+});
+
+test('mode:"guide" 仍保留导盲读图规范（后续定制用）', async (t) => {
+  const host = await boot(t);
+  const out = await host.tools[0].execute({ action: 'look', mode: 'guide', wait: 6 });
+  assert.equal(out.meta.ok, true, `look 失败：${out.text}`);
+  assert.match(out.text, /正前|风险/, '导盲模式必须给出方位与风险约束');
 });
 
 test('stop 之后 status 说没在跑', async (t) => {

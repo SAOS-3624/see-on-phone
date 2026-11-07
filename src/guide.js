@@ -41,36 +41,41 @@ const QUALITY_LINE = {
  * @param {string} p.quality          gradeView 的结果
  * @param {number} p.spokenPacingSec  上次说话到现在过了多久（怕把用户念烦）
  */
-export function buildLookText({ note = null, ageSec = 0, frames = 1, quality = 'good', backend = 'termux' } = {}) {
+/** 出图时附在文本里的一段话（general 模式：与桌面 see_now 一致）。 */
+export function buildLookText({ note = null, ageSec = 0, frames = 1, quality = 'good', backend = 'http-raw' } = {}) {
   const parts = [];
-
-  parts.push(
-    '这是用户手机摄像头**此刻**拍到的画面。用户看不见它 —— 只有你能看见，'
-    + '你说什么他就信什么，所以只说你真看见的东西。',
-  );
-
-  if (note) parts.push(`用户刚说：「${note}」。按这句话决定重点，不要泛泛描述。`);
-
+  parts.push(`这是手机摄像头/屏幕的画面，共 ${frames} 帧，按「画面变化」挑出来的 —— `
+    + '静止时帧少、变化多时帧多。编号按时间先后。');
+  if (note) parts.push(`用户刚说：「${note}」。按这句话决定重点。`);
   const q = QUALITY_LINE[quality] ?? '';
   if (q) parts.push(q);
-
-  if (ageSec >= 3) {
-    parts.push(`这一帧是 ${ageSec.toFixed(1)} 秒前抓的，人可能已经动了 —— 报方位时说"刚才"，`
-      + '或者先 `look` 一次再回答。');
+  if (ageSec >= 3) parts.push(`最新一帧是 ${ageSec.toFixed(1)} 秒前的；要「此刻」就再调一次 \`look\`。`);
+  if (backend === 'http-raw' || backend === 'termux') {
+    parts.push('（手机抓拍后端约每秒 1 帧，比桌面录屏慢得多；判断快速运动时说「刚才」而不是「现在」。）');
   }
+  return parts.join('\n');
+}
 
+/**
+ * 导盲模式的读图规范。**后续定制用，general 模式不走这里。**
+ * 这段每次出图都要重发，而不是只写在工具描述里 —— 工具描述会被长会话滚远，
+ * 模型看到图的那一刻手上只有它。所以必须短、必须是祈使句、必须直接约束输出格式。
+ */
+export function buildGuideText({ note = null, ageSec = 0, quality = 'good' } = {}) {
+  const parts = [
+    '这是用户手机摄像头**此刻**拍到的画面。用户看不见它 —— 只有你能看见，'
+      + '你说什么他就信什么，所以只说你真看见的东西。',
+  ];
+  if (note) parts.push(`用户刚说：「${note}」。按这句话决定重点，不要泛泛描述。`);
+  const q = QUALITY_LINE[quality] ?? '';
+  if (q) parts.push(q);
+  if (ageSec >= 3) parts.push(`这一帧是 ${ageSec.toFixed(1)} 秒前抓的，人可能已经动了 —— 报方位时说"刚才"。`);
   parts.push(
-    '回答格式（给语音念的）：**先风险，再通路，最后动作**。'
-    + '一句到两句，不超过 40 字。方位用「正前 / 左前 / 右前 / 脚下」，距离用「半步 / 一两步 / 五米外」。'
-    + '不要描述颜色、天气、画面构图；不要用"图片中""画面左侧"这类第三人称说法。'
-    + '看不清就说看不清，并给出怎么调整手机（抬高/放低/转向/开灯）。',
+    '回答格式（给语音念的）：**先风险，再通路，最后动作**。一句到两句，不超过 40 字。'
+      + '方位用「正前 / 左前 / 右前 / 脚下」，距离用「半步 / 一两步 / 五米外」。'
+      + '不要描述颜色、天气、画面构图；不要用"图片中""画面左侧"这类第三人称说法。'
+      + '看不清就说看不清，并给出怎么调整手机（抬高/放低/转向/开灯）。',
   );
-
-  if (backend === 'termux') {
-    parts.push('（后置摄像头是抓拍模式，最多每秒 3~4 张；走快了画面会跟不上，'
-      + '要确认"现在"就再调一次 `look`。）');
-  }
-
   return parts.join('\n');
 }
 

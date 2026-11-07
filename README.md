@@ -1,172 +1,159 @@
 # SeeNow Phone Version
 
-> 让 DSH 用**手机摄像头**看见使用者前方，再用语音告诉他前面是什么。
+> **手机版 see-now**：保留桌面版原有的「打分 → 挑帧 → 多帧宫格 → 时间线」能力，
+> 只把采集源从电脑屏幕换成手机摄像头。
 >
-> 这是给视障用户的导盲版 SeeNow：不能截屏（他看不见屏幕），只能看摄像头。
+> 导盲是**可选模式**（`mode:"guide"`），后续再定制；默认 `mode:"general"`，
+> 行为和桌面 `see_now` 一致 —— 其他用户装上去就是原来那套东西。
 
 - npm：`dsh-see-now-phone`
 - 工具名：`see_phone`
-- 依赖：Node ≥ 20 + `ffmpeg`；手机上另需 Termux:API
+- 依赖：Node ≥ 20；手机场景另需 Termux + Termux:API
 
 ---
 
-## 1. 它和 dsh-see-now 是什么关系
+## 1. 和 dsh-see-now 的关系
 
-**同一个引擎，两个产品。**
+**同一套引擎，两个采集源。**
 
-| | `dsh-see-now` | `dsh-see-now-phone` |
+| | `dsh-see-now`（桌面） | `dsh-see-now-phone` |
 |---|---|---|
-| 采集 | 屏幕（ddagrab / gdigrab / portal） | **摄像头**（termux 抓拍 / MJPEG / RTSP） |
-| 读者 | 能看见画面的人（自己确认用） | **看不见的盲人**（只听模型说） |
-| 输出形态 | 多帧宫格时间线（看"怎么变的"） | **单帧**（看"现在有什么"） |
-| 节奏 | 15–40 秒一张 | 秒级 |
-| 语音 | 可选 `say` | **强制走系统 TTS** |
-| 浮窗 / 字幕 / region | 有 | 无（他看不见，也听不到视频台词） |
+| 采集 | 屏幕：ddagrab / gdigrab / portal / PipeWire | **摄像头**：Termux 抓拍 / MJPEG / RTSP |
+| 引擎 | 打分、切点、装箱 DP、拼图、PNG、token 换算 | **整块 vendor 过来，一行没改** |
+| 输出 | 多帧宫格（按画面变化挑帧） | **一样** |
+| 动作 | watch / peek / status / stop | **一样**（另有 `look` 取单帧） |
+| 语音 | 可选 `say` | 可选 `say`（有 TTS 就念） |
 
-引擎部分（`src/engine/`）整块 vendor 自 `dsh-see-now` 0.1.5：打分、切点、装箱 DP、
-拼图、PNG 编码、token 换算。**采集层整个重写**，因为 Android 上
-`/dev/video*` 对普通进程不可见，PC 那套 ffmpeg 设备枚举一个都用不了。
+引擎 `src/engine/` 的 9 个文件来自 `dsh-see-now` 0.1.5，零宿主依赖（只用 `node:zlib`）。
+**采集层整个重写**：Android 上普通进程看不到 `/dev/video*`，桌面那套 ffmpeg 设备枚举一个都用不了。
 
-### 为什么不是「see-now 加个 `--camera`」
+### 为什么独立成包而不是给 see-now 加 `--camera`
 
-三条硬理由，不是洁癖：
-
-1. **默认值冲突**：see-now 默认多帧拼图（省 token、看变化），导盲要单帧（看此刻）。
-   同一个 `scene` 开关两头都要改，最后必然分叉。
-2. **失败语义不同**：see-now 采不到画面 = "稍后再试"；导盲采不到画面 = **必须明确说看不清**，
-   绝不能沉默。这个差别渗到每一处返回值里。
-3. **发版节奏**：导盲要按真机反馈狂调阈值，不该带着"看视频"的用户一起发版。
+采集配置、默认值、发版节奏都不同；导盲那套后续还要按真机反馈反复调阈值，
+不该带着"看视频"的用户一起发版。
 
 ---
 
-## 2. 安装
+## 2. 手机上的架构（真机实测通过）
 
-### 2.1 PC（验证用）
-
-```bash
-npm i -g dsh-see-now-phone
-dsh plugin add dsh-see-now-phone
+```
+Termux:API (camera2)
+   │  termux-camera-photo  ~800ms/张（open→capture→close，物理下限）
+   ▼
+cam_grab.sh   shell 循环抓拍 → 原子替换 .cam-frame.jpg + 毫秒时间戳
+   │
+cam_server.py  PIL 解码（draft 降采样）→ 等比 cover → rgb24
+   │  HTTP 127.0.0.1:8123/frame?w=&h=   ≈ 80ms/次
+   ▼
+dsh-go (PRoot Ubuntu) 里的 dsh-see-now-phone
+   │  http-raw 后端：收现成 rgb24 → pipeline.push({t,buf})
+   ▼
+打分 → 切点 → 装箱 DP → 拼图 → PNG → 宿主附件
 ```
 
-PC 上没有 `termux-camera-photo`，会自动落到本机摄像头（v4l2 / avfoundation / dshow）。
+**两个关键决策**（都是实测踩出来的）：
 
-### 2.2 手机（DSH Go / Termux 系宿主）
+1. **抓拍和发包拆成两个进程**。同一条 `termux-camera-photo`，
+   shell 直接调 ~800ms，python 的 `subprocess` 调 **~3500ms**（差 4 倍，与环境变量无关）。
+   shell 循环抓、python 只读文件，各自都在最优点。
+2. **解码放在手机侧**，插件只收 rgb24。dsh-go 的 PRoot 里大概率没有 ffmpeg，
+   而且 `image2pipe` 喂多张 JPEG 时，ffmpeg 会把"数据停顿"判成 EOF 提前退出（实测只走 1 帧）。
+   插件侧因此**零 ffmpeg 依赖**。
 
-```bash
-# 1. Termux 里装 API 桥
-pkg install termux-api
-# 2. 装 Termux:API App（F-Droid），并在系统设置里给 Termux 相机权限
-# 3. 装插件
-npm i -g dsh-see-now-phone
-dsh plugin add dsh-see-now-phone
-```
+`PIL.Image.draft()` 让 JPEG 解码器直接按 1/4 降采样解码：
+4096×3072 全图 open 208ms → 52ms，resize 61ms → 14ms。
 
-验证采集是否通（**在装插件之前先跑这一步**，能省掉一半排错）：
-
-```bash
-termux-camera-photo -c 0 /sdcard/dcim/test.jpg && ls -l /sdcard/dcim/test.jpg
-```
-
-拍出来是黑的 → 权限没给；报 `Permission Denial` → Termux:API App 没装；
-命令不存在 → `pkg install termux-api` 没装。
+两个 Android App 共享同一个网络栈，所以 PRoot 里直连 `127.0.0.1:8123` 即可，**不需要端口转发**。
 
 ---
 
-## 3. 配置
+## 3. 后端
 
-`~/.dsh/see-phone.json`（也可以 `DSH_SEE_PHONE_CONFIG='{"backend":"mjpeg"}'` 覆盖）：
+| 后端 | 帧率 | 需要 | 说明 |
+|---|---|---|---|
+| **`http-raw`** | ~1 fps | Termux + Termux:API + Pillow | **手机默认**，零插件侧依赖 |
+| `termux` | ~1 fps | Termux + Termux:API | 插件自己抓拍（只在插件直接跑在 Termux 里时用） |
+| `mjpeg` / `rtsp` | 15–30 fps | IP Webcam / DroidCam | **要流畅就用这个**，见 §5 |
+| `v4l2` / `avfoundation` / `dshow` | 原生 | 桌面摄像头 | PC 调试 |
+| `file` / `testsrc` | — | — | 回归测试 |
+
+配置 `~/.dsh/see-phone.json`（或 `DSH_SEE_PHONE_CONFIG='{"backend":"testsrc"}'`）：
 
 ```json
 {
-  "backend": "termux",
-  "camera": "back",
+  "backend": "http-raw",
+  "url": "http://127.0.0.1:8123/frame",
   "width": 336,
   "height": 448,
   "fps": 8,
-  "grabIntervalMs": 220
+  "grabIntervalMs": 220,
+  "mode": "general"
 }
 ```
-
-| 键 | 说明 |
-|---|---|
-| `backend` | `termux`（默认，无需额外 App）/ `mjpeg` / `rtsp` / `v4l2` / `avfoundation` / `dshow` / `file` / `testsrc` |
-| `camera` | `back`（默认，看前方）/ `front` |
-| `width` / `height` | 画布尺寸。336×448 单帧 ≈ 130 token |
-| `grabIntervalMs` | 抓拍间隔。220ms ≈ 4.5fps 上限，Android camera2 open/close 的物理下限 |
-
-### 后端怎么挑
-
-| 后端 | 帧率 | 需要什么 | 适合 |
-|---|---|---|---|
-| `termux` | 2–4 fps | Termux + Termux:API | **默认**。判断台阶、门、人、车足够 |
-| `mjpeg` | 15–30 fps | 另一个 App（IP Webcam）+ 同一 Wi-Fi | 走路快、要连贯画面 |
-| `rtsp` | 15–30 fps | DroidCam 等 | 同上，延迟更低 |
-
-`termux` 抓拍是**一次一张**，走路时画面会比人慢半拍。所以描述方位时要说"刚才"，
-或者先再 `look` 一次。要真正连贯得上 `mjpeg`/`rtsp`。
 
 ---
 
 ## 4. 工具用法
 
 ```js
-see_phone({ action: "look", note: "我在找 3 号楼" })   // 默认，秒级返回一张图
-see_phone({ action: "watch", wait: 30 })             // 背景等画面大变（过马路、进楼）
-see_phone({ action: "status" })                      // 后端、帧率、亮度、上次错误
-see_phone({ action: "stop" })                        // 放掉摄像头，别让电池和相机一直热着
+see_phone({ action: "watch" })                    // 默认：等多帧宫格（和桌面 see_now 一样）
+see_phone({ action: "peek" })                     // 不等待，领走已攒好的图
+see_phone({ action: "look" })                     // 单帧「此刻」，用户插话时用
+see_phone({ action: "status" })                   // 后端、帧率、抓拍成功/失败数、上次错误
+see_phone({ action: "stop" })                     // 放掉摄像头，别一直耗电
+see_phone({ action: "look", mode: "guide" })      // 导盲话术（后续定制，默认不用）
 ```
 
-`say` 会真的走一次 `termux-tts-speak`。**上一句没念完就打断**——导盲最怕一句话排在
-一句话后面（"前面有台阶"晚 3 秒到达，人已经迈出去了）。
-
-`look` 的返回值里带一段给模型的硬约束：先风险、再通路、最后动作；方位用
-"正前/左前/右前"；距离用"半步/一两步/五米外"；看不清就说看不清。
-这段话在 `src/guide.js`，不是可选的文案。
+`watch` 的阻塞就是"暂停"，回完话再调一次；静止画面会一直攒着不打扰你（省 token 的设计）。
 
 ---
 
-## 5. 诚实的边界
+## 5. 实测性能与诚实的边界
 
-这套东西能帮到什么程度，先说清楚，别让人对它有错误期待：
+真机：HUAWEI nova 11（FOA-AL00），HarmonyOS 4.2 / Android 12，arm64。
 
-**能做**
-- 正前方 5 米内的台阶、路沿、门、柱子、停着的车、站着的人
-- 招牌门牌、公交车号、店名（静止时）
-- 粗略方位与绕行方向
+| 环节 | 实测 |
+|---|---|
+| `termux-camera-photo` 抓一张 | **~800ms**（camera2 open/close） |
+| PIL 解码 4096×3072 → 336×448 | 60–80ms（加 `draft` 后） |
+| HTTP `/frame` 端到端 | **~80ms** |
+| 插件 10 秒收到 | **25 帧（2.5 fps）**，成功出图 |
 
-**做不好**
-- **相对速度和动态障碍**：4fps 抓拍判断不了自行车多快过来。要这个必须上 `mjpeg`/`rtsp`
-- **精确距离**：单目摄像头没有深度，只能说"一两步""五米外"，不能说"1.2 米"
-- **细窄空间**：门缝、栏杆间距、地砖高差
-- **延迟**：`look` 从调用到用户听见，端到端 2–6 秒（摄像头 0.2s + ffmpeg 0.1s +
-  模型 TTFT 1–3s + TTS 0.3s）。**这个延迟不适合当作过马路的唯一依据**
+⚠️ **抓拍路径的物理上限就是 ~1 fps 的真实画面更新**。
+`termux-camera-photo` 每次都要完整 open/close 摄像头，且没有分辨率参数，改不动。
+手机抓拍的间隔抖动也大，所以帧时间戳用**真实墙钟**而不是 `frameIndex/fps`。
 
-**明确不做**
-- 不替代盲杖和导盲犬。这是补充信息，不是碰撞检测
-- 不做实时避障（那需要连续视频 + 边缘计算，不是这个架构）
+这个帧率对「看眼前静态画面」够用，但**做不了桌面版那种 12fps 的连续运动分析**。
+要流畅（15–30fps）只能换流：装 IP Webcam / DroidCam，配置
+`{"backend":"mjpeg","url":"http://127.0.0.1:8080/video"}`，插件侧已经有这个后端。
 
-> 一句话：它能回答"我前面有什么"，不能回答"我现在迈这一步安全吗"。后者要靠盲杖。
+其他边界：
+- 全黑/太暗时 `gradeView` 会拦掉出图，只提示调整，不让模型在烂画面上编
+- 单帧 336×448 ≈ 130 token，**图会留在会话历史里每轮重发**；长时间看要留意
+- 手机抓拍持续耗电发热，用完记得 `stop`
 
 ---
 
-## 6. 开发
+## 6. 当前装机进度
+
+- [x] dsh-go APK 装上（本机模式）
+- [x] Termux + Termux:API 装上、`termux-api` / Pillow 装好、相机权限已授
+- [x] `cam_grab.sh` + `cam_server.py` 部署并跑起来（Termux 前台服务 + wake-lock）
+- [x] `http-raw` 端到端打通：手机摄像头 → rgb24 → 插件 → PNG
+- [x] 插件改回通用模式（保留原功能），导盲留作 `mode:"guide"`
+- [ ] **把插件装进 dsh-go 的 PRoot**（还差这一步：需要在 dsh-go 里开一个终端执行 `npm i`）
+
+---
+
+## 7. 开发
 
 ```bash
 npm run check:syntax      # 全量语法体检
-npm test                  # 宿主契约测试（假 ctx）
-npm run smoke testsrc 6   # 合成源跑通整条管线，图落 .tmp/
-npm run smoke file 12 -- <视频路径>   # 用真实视频当"摄像头"
+npm test                  # 宿主契约测试（假 ctx，6 条）
+npm run smoke testsrc 6   # 合成源跑通整条管线
+DSH_SEE_PHONE_CONFIG='{"backend":"http-raw","url":"http://127.0.0.1:8123/frame"}' npm run smoke http-raw 10
 ```
-
-手机上调试：
-
-```bash
-DSH_SEE_PHONE_CONFIG='{"backend":"testsrc"}' dsh   # 先证明管线通，再换 termux
-```
-
----
 
 ## License
 
-Apache-2.0。`src/engine/` 来自 [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now)，
-同一许可证。
+Apache-2.0。`src/engine/` 来自 [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now)，同一许可证。
