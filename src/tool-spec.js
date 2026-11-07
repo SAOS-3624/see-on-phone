@@ -51,7 +51,7 @@ export function seePhoneToolSpec() {
     parameters: {
       action: {
         type: 'string',
-        description: 'watch (default) | peek | look | status | stop | help',
+        description: 'watch (default) | peek | look | status | reload | stop | help',
       },
       mode: {
         type: 'string',

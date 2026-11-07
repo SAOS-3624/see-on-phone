@@ -189,7 +189,10 @@ function createSession(cfg) {
 
 export async function apply(ctx) {
   const defineTool = await loadDefineTool();
-  const cfg = loadConfig();
+  let cfg = loadConfig();
+  // 插件原来只在启动时读一次配置，改完 see-phone.json 必须重载插件才生效
+  // （dsh-go 上真踩过）。改成每次调用比对，变了就重建会话。
+  let cfgSnapshot = JSON.stringify(cfg);
   let session = null;
   let disposers = [];
 
@@ -315,8 +318,21 @@ export async function apply(ctx) {
     return { text: t, meta: { ok: true, running: snap.running, backend: snap.backend } };
   }
 
+  /** 配置变了就重建会话；返回是否重建过，供 status 提示 */
+  async function refreshConfig() {
+    const fresh = loadConfig();
+    const snap = JSON.stringify(fresh);
+    if (snap === cfgSnapshot) return false;
+    cfg = fresh;
+    cfgSnapshot = snap;
+    if (session) { await session.stop(); session = null; }
+    return true;
+  }
+
   async function route(args = {}) {
     const action = String(args.action ?? 'watch').toLowerCase();
+    // help/status/stop 也要过这里：改了配置后第一次调用就该生效
+    await refreshConfig();
 
     // `say` 在任何动作之前处理：用户等着回话时，一张图晚两秒无所谓，一句话晚两秒就很难受
     const said = args.say ? String(args.say).trim().slice(0, 400) : null;
@@ -326,6 +342,11 @@ export async function apply(ctx) {
     switch (action) {
       case 'help':
         return { text: HELP, meta: { action } };
+      case 'reload': {
+        cfgSnapshot = '__force__';   // 强制走一次重建
+        await refreshConfig();
+        return { text: '配置已重载，下次取帧会用新参数重启采集。', meta: { ok: true } };
+      }
       case 'status':
         return doStatus();
       case 'stop': {
