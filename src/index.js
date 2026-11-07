@@ -379,7 +379,10 @@ export async function apply(ctx) {
     const snap = session.snapshot();
     const quality = gradeView({ meanLuma: session.lastLuma, frames: session.frames });
     const t = buildStatusText({ cam: snap, pipeline: session.pipeline, quality });
-    return { text: t, meta: { ok: true, running: snap.running, backend: snap.backend } };
+    return {
+      text: `${t}\n声音：${JSON.stringify(ttsState())}`,
+      meta: { ok: true, running: snap.running, backend: snap.backend, tts: ttsState() },
+    };
   }
 
   /** 配置变了就重建会话；返回是否重建过，供 status 提示 */
@@ -438,9 +441,14 @@ export async function apply(ctx) {
       case 'look':
       default: {
         const out = await doLook(args);
-        if (speakResult && !speakResult.ok && said
-            && String(args.mode ?? cfg.mode ?? 'general').toLowerCase() === 'guide') {
-          return { ...out, text: `${out.text}\n\n⚠ 没找到 termux-tts-speak：把要说的话写进回复里，让用户用系统读屏听。` };
+        // 说了但没出声，等于没说 —— 必须把原因亮出来，让模型改用文字回复
+        if (speakResult && !speakResult.ok && said) {
+          return {
+            ...out,
+            text: `${out.text}\n\n⚠ 这句话没说出口（${speakResult.reason ?? 'unknown'}）：`
+              + '把内容直接写进回复给用户，让他用系统读屏听；'
+              + '并提醒他检查 DSH TTS Bridge 是否还在。',
+          };
         }
         return out;
       }
@@ -486,6 +494,13 @@ const HELP = `SeeNow Phone Version · 手机摄像头导盲
 - \`mjpeg\` / \`rtsp\`：外部 App（IP Webcam / DroidCam），需要 url
 - \`v4l2\` / \`avfoundation\` / \`dshow\`：桌面调试用（PC 上的摄像头）
 - \`file\` / \`testsrc\`：回归测试用
+
+## 声音
+\`say\` 参数会真的念出来 —— 插件发一条显式广播给 **DSH TTS Bridge**（自制 13KB App），
+由它调 Android 的 TextToSpeech（华为 hiai 引擎）。**PRoot 里没有别的通道**：
+碰不到 TextToSpeech、\`am start\` 被 SecurityException 拒、\`cmd texttospeech\` 没有实现。
+桥 App 没装或被杀时返回 \`no-sound\`，这时把话直接写进回复，让用户用读屏听。
+\`status\` 里 \`tts.channel\` 会显示当前走的是 \`bridge\` 还是 \`termux\`。
 
 ## 成本
 一张 ${DEFAULT_SIZE.width}×${DEFAULT_SIZE.height} 单帧图 ≈ 130 token，且**会留在会话历史里每轮重发**。
