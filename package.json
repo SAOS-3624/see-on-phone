@@ -1,0 +1,62 @@
+{
+  "name": "dsh-see-now-phone",
+  "version": "0.1.0",
+  "description": "SeeNow Phone Version — hand the phone camera to DSH so a blind user can be told what is in front of them. · 手机摄像头版 SeeNow：让 AI 看见用户前方，用语音带路。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "accessibility",
+    "blind",
+    "navigation",
+    "camera",
+    "termux",
+    "vision"
+  ],
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./camera": "./src/cam/camera.js",
+    "./frames": "./src/cam/ffmpeg.js",
+    "./guide": "./src/guide.js",
+    "./pipeline": "./src/engine/pipeline.js",
+    "./tokens": "./src/engine/tokens.js"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "dsh.plugin.json",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:file": "node scripts/smoke.mjs file 12",
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "prepublishOnly": "node scripts/check-syntax.mjs && npm test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "author": "SAOS-3624",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SAOS-3624/dsh-see-now-phone.git"
+  }
+}
