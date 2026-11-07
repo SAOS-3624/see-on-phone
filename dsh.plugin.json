@@ -1,7 +1,7 @@
 {
   "name": "dsh-see-now-phone",
   "description": "SeeNow Phone Version — let DSH look through the phone's camera and describe what is in front of a blind user.",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "entry": {
     "name": "dsh-see-now-phone",
     "inject": [

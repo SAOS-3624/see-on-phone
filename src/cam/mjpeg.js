@@ -42,8 +42,29 @@ function coverToRgb(rgb, sw, sh, W, H) {
   return out;
 }
 
+/**
+ * IP Camera App 的控制端点：`GET /?camera=back&rotate=90`。
+ *
+ * App 支持一批 GET 参数（`camera` / `rotate` / `resolution` / `torch` /
+ * `exposure` / `contrast` / `mirror` …），改完**持久化**在 App 里。
+ *
+ * 为什么必须下发 rotate：摄像头 sensor 的成像相对手机自然方向转了 90°
+ * （华为 nova 11 实测），不转的话：
+ *   - 600×800 的竖构图会被当成 800×600 横图，`cover` 缩放要横向裁掉 44% 画面；
+ *   - 模型描述的"左/右/前"全部错位，导盲直接失效。
+ * 转 90° 之后源是 600×800 = 3:4，和 336×448 完全同比例，`cover` 零裁切。
+ */
+function controlEndpoint(url) {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}/`;
+  } catch {
+    return null;
+  }
+}
+
 export function createMjpegReader({
-  url, width, height, intervalMs = 70, onFrame, onError,
+  url, width, height, intervalMs = 70, preset = null, onFrame, onError,
 }) {
   let stopped = false;
   let buf = Buffer.alloc(0);
@@ -51,12 +72,50 @@ export function createMjpegReader({
   let retryTimer = null;
   let lastAt = 0;
   let startedAt = 0;
-  const stats = { frames: 0, fails: 0, ms: 0, bytes: 0 };
+  const stats = {
+    frames: 0, fails: 0, ms: 0, bytes: 0, presetOk: null, presetTried: null,
+  };
   let warned = false;
 
   function scheduleReconnect() {
     if (stopped || retryTimer) return;
     retryTimer = setTimeout(() => { retryTimer = null; connect(); }, 500);
+  }
+
+  /**
+   * 把 preset 下发给 App。失败**不阻塞**取流 —— rotate 已经在 App 里持久化过，
+   * 第二次启动就算这一步失败，画面照样是正的。
+   */
+  function applyPreset() {
+    const base = controlEndpoint(url);
+    if (!base || !preset) return Promise.resolve(null);
+    const qs = Object.entries(preset)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '')
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    if (!qs) return Promise.resolve(null);
+    stats.presetTried = qs;
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        stats.presetOk = v;
+        resolve(v);
+      };
+      let r = null;
+      try {
+        r = http.get(`${base}?${qs}`, { timeout: 4000 }, (res) => {
+          res.resume();
+          res.on('end', () => finish(res.statusCode < 400));
+          res.on('error', () => finish(false));
+        });
+      } catch {
+        return finish(false);
+      }
+      r.on('error', () => finish(false));
+      r.on('timeout', () => { r.destroy(); finish(false); });
+    });
   }
 
   function publish(jpg) {
@@ -106,7 +165,9 @@ export function createMjpegReader({
   function connect() {
     if (stopped) return;
     try {
-      req = http.get(url, { timeout: 15000 }, (res) => {
+      // 6s 不是随便定的：IP Camera 有帧时首帧 ~1.6s 就到；没帧时（App 停了 /
+      // 锁屏后停推）socket 建起来但一个字节都不来，15s 会把这个动作整个卡死。
+      req = http.get(url, { timeout: 6000 }, (res) => {
         if (res.statusCode !== 200) {
           res.resume();
           scheduleReconnect();
@@ -135,8 +196,10 @@ export function createMjpegReader({
     }
   }
 
-  function start() {
+  async function start() {
     startedAt = Date.now();
+    // 先下发 rotate/camera，再取流 —— 首帧就是正的，不用等第二次调用
+    if (preset) await applyPreset();
     connect();
   }
 
@@ -154,6 +217,7 @@ export function createMjpegReader({
       fps: elapsed > 0 ? +(stats.frames / elapsed).toFixed(2) : 0,
       decodeMs: +stats.ms.toFixed(1),
       grab: { shots: stats.frames, fails: stats.fails, bytes: stats.bytes },
+      preset: { tried: stats.presetTried, ok: stats.presetOk },
     };
   }
 

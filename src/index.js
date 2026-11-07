@@ -88,6 +88,27 @@ function meanLuma(buf) {
 }
 
 /**
+ * 给 IP Camera App 下发的控制参数（`GET /?camera=back&rotate=90`）。
+ *
+ * `rotate` 默认 90 是**实测结论**，不是猜的：nova 11 的 sensor 成像相对手机
+ * 自然方向转了 90°，不转的话源是 800×600 横图，`cover` 缩到 336×448 要横向
+ * 裁掉 44% 画面，而且模型说的"左/右/前"全错。转 90° 后源是 600×800 = 3:4，
+ * 和 336×448 同比例，零裁切。
+ *
+ * 换机型如果发现画面是歪的，把配置里的 `rotate` 改成 0/180/270 试。
+ */
+function buildPreset(cfg) {
+  const preset = {};
+  const cam = String(cfg.camera ?? 'back').toLowerCase();
+  if (cam === 'front' || cam === 'back') preset.camera = cam;
+  const rotate = cfg.rotate === undefined || cfg.rotate === null ? 90 : Number(cfg.rotate);
+  if (Number.isFinite(rotate)) preset.rotate = rotate;
+  if (cfg.resolution) preset.resolution = String(cfg.resolution);
+  if (cfg.torch === true || cfg.torch === 'on') preset.torch = 'on';
+  return Object.keys(preset).length ? preset : null;
+}
+
+/**
  * 摄像头会话：采集 + 管线 + 最近一帧。
  *
  * 单例。手机上只有一个摄像头，两个会话必然互相抢。
@@ -113,6 +134,7 @@ function createSession(cfg) {
       ? Math.min(Number(cfg.grabIntervalMs) || DEFAULT_GRAB_MS, 80)
       : (Number(cfg.grabIntervalMs) || DEFAULT_GRAB_MS),
     cameraId: cfg.camera === 'front' ? 1 : (Number(cfg.cameraId) || 0),
+    preset: camBackend === 'http-mjpeg' ? buildPreset(cfg) : null,
     ffmpegPath: cfg.ffmpegPath ?? 'ffmpeg',
   };
 
@@ -194,6 +216,9 @@ export async function apply(ctx) {
   // （dsh-go 上真踩过）。改成每次调用比对，变了就重建会话。
   let cfgSnapshot = JSON.stringify(cfg);
   let session = null;
+  // `args.camera` 覆盖配置里的 camera；null = 跟配置走。
+  // 摄像头是单例资源，换摄像头只能整个会话重建。
+  let activeCamera = null;
   let disposers = [];
 
   const log = (...a) => { try { ctx.logger?.info?.('[see-phone]', ...a); } catch { /* 无 logger */ } };
@@ -201,7 +226,9 @@ export async function apply(ctx) {
   /** 拿会话；没有就建。任何 action（除 help/status 未启动）都要先过这里。 */
   async function ensure() {
     if (session?.cam) return session;
-    if (!session) session = createSession(cfg);
+    if (!session) {
+      session = activeCamera ? createSession({ ...cfg, camera: activeCamera }) : createSession(cfg);
+    }
     try {
       await session.start();
       log('摄像头已启动', session.camOpts.backend ?? 'auto', session.size);
@@ -304,6 +331,43 @@ export async function apply(ctx) {
     };
   }
 
+  /**
+   * `peek`：不阻塞地领走管线里已经攒好的那张图。
+   *
+   * 和 `look` 的区别：`look` 会等一帧新的、再强制 flush 单帧；`peek` 只是
+   * 把"已经攒出来的"取走，一帧都不等。插件叫醒模型时（"有新画面了"）用它，
+   * 免得又一次 8 秒阻塞。
+   */
+  async function doPeek(args) {
+    if (!session?.cam) {
+      return {
+        text: '摄像头还没启动过，没有攒着的图。先 `see_phone({action:"look"})` 或 `watch` 一次。',
+        meta: { ok: false, reason: 'not-started' },
+      };
+    }
+    const sheet = session.pipeline.take();
+    if (!sheet) {
+      return {
+        text: '没有攒好的新画面。静止场景不会攒图（这是省 token 的设计）；'
+          + '要「此刻」就调 `look`。',
+        meta: { ok: true, reason: 'no-sheet' },
+      };
+    }
+    session.sheets += 1;
+    const ageSec = (Date.now() - session.lastWall) / 1000;
+    const quality = gradeView({ meanLuma: session.lastLuma, frames: session.frames });
+    const mode = String(args.mode ?? cfg.mode ?? 'general').toLowerCase();
+    const note = args.note ? String(args.note).slice(0, 300) : null;
+    const backend = session.snapshot().backend;
+    const text = mode === 'guide'
+      ? buildGuideText({ note, ageSec, quality })
+      : buildLookText({ note, ageSec, frames: sheet.frames.length, quality, backend });
+    return attach(ctx, sheet, text, {
+      ageSec: +ageSec.toFixed(2), quality, frames: sheet.frames.length,
+      why: sheet.why, backend, sheets: session.sheets,
+    });
+  }
+
   async function doStatus() {
     if (!session) {
       return {
@@ -325,6 +389,7 @@ export async function apply(ctx) {
     if (snap === cfgSnapshot) return false;
     cfg = fresh;
     cfgSnapshot = snap;
+    activeCamera = null;          // 文件改了，camera 覆盖作废，回到配置值
     if (session) { await session.stop(); session = null; }
     return true;
   }
@@ -333,6 +398,16 @@ export async function apply(ctx) {
     const action = String(args.action ?? 'watch').toLowerCase();
     // help/status/stop 也要过这里：改了配置后第一次调用就该生效
     await refreshConfig();
+
+    // 换摄像头：args.camera 和当前不一致就重建（摄像头单例，只能整个换）
+    const wantCam = String(args.camera ?? '').toLowerCase();
+    if (wantCam === 'front' || wantCam === 'back') {
+      const nowCam = activeCamera ?? String(cfg.camera ?? 'back').toLowerCase();
+      if (wantCam !== nowCam) {
+        activeCamera = wantCam;
+        if (session) { await session.stop(); session = null; }
+      }
+    }
 
     // `say` 在任何动作之前处理：用户等着回话时，一张图晚两秒无所谓，一句话晚两秒就很难受
     const said = args.say ? String(args.say).trim().slice(0, 400) : null;
@@ -358,6 +433,8 @@ export async function apply(ctx) {
       }
       case 'watch':
         return doWatch(args);
+      case 'peek':
+        return doPeek(args);
       case 'look':
       default: {
         const out = await doLook(args);
@@ -400,9 +477,13 @@ const HELP = `SeeNow Phone Version · 手机摄像头导盲
 手机摄像头 → 手机侧缩放成 rgb24 → 打分/切点 → 装箱 DP 拼图 → 图片附件交给宿主。\n与桌面 \`see_now\` 同一套引擎，只是采集源从屏幕换成摄像头。
 
 ## 采集后端（配置文件 ~/.dsh/see-phone.json 的 backend）
-- \`termux\`（默认）：Termux:API 抓拍，2~4 fps，零额外 App，**够用来判断台阶/门/人**
-- \`mjpeg\`：外部 App 开 MJPEG（IP Webcam 等），需要 url，接近原生帧率
-- \`rtsp\`：DroidCam 等，需要 url
+- \`http-mjpeg\`（**手机默认**）：插件直连 IP Camera App 的 MJPEG 流，内置 jpeg-js 解码。
+  实测 nova 11 上 8.7fps、单帧解码 31.6ms。要求 App 在后台跑着。
+  配置项 \`url\`（默认 \`http://127.0.0.1:4444/video/mjpeg\`）、\`rotate\`（默认 90，
+  画面上下颠倒就改 0/180/270）、\`camera\`（back/front）、\`resolution\`（low/medium/high）。
+- \`http-raw\`：Termux 侧 cam_server.py 出 rgb24（旧链路，留作回退）
+- \`termux\`：Termux:API 抓拍，~1fps（camera2 每次 open/close 800ms，物理上限）
+- \`mjpeg\` / \`rtsp\`：外部 App（IP Webcam / DroidCam），需要 url
 - \`v4l2\` / \`avfoundation\` / \`dshow\`：桌面调试用（PC 上的摄像头）
 - \`file\` / \`testsrc\`：回归测试用
 

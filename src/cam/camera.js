@@ -224,6 +224,7 @@ export function openCamera(opts) {
     width = 448, height = 336, fps = 8,
     grabIntervalMs = 70, cameraId = 0,
     url = null,
+    preset = null,
     ffmpegPath = 'ffmpeg',
     onFrame, onError, onExit,
   } = opts;
@@ -378,9 +379,12 @@ export function openCamera(opts) {
     if (direct) {
       mjpeg = createMjpegReader({
         url, width, height, intervalMs: grabIntervalMs,
+        preset,
         onFrame, onError,
       });
-      mjpeg.start();
+      // await：preset（rotate/camera）要在取流之前下发，首帧方向才对。
+      // 最长 4s，失败也只当没下发，不抛错。
+      await mjpeg.start();
       return { backend, width, height };
     }
 
@@ -449,6 +453,7 @@ export function openCamera(opts) {
         backend, width, height, running: s.running,
         frames: s.frames, fps: s.fps, firstFrameMs: null,
         grab: s.grab, stderrTail: null, decodeMs: s.decodeMs,
+        preset: s.preset,
       };
     }
     const isRaw = source.pushMode === 'raw';
