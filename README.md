@@ -36,44 +36,41 @@
 
 ## 2. 手机上的架构（真机实测通过）
 
+**默认走连续流，12–20fps。** 采集端用开源 App
+[DigitallyRefined/android-ip-camera](https://github.com/DigitallyRefined/android-ip-camera)
+（**MIT**，可商用；v0.16.1 官方 GitHub Release，arm64，SHA-256 与公布值核对一致）。
+
 ```
-Termux:API (camera2)
-   │  termux-camera-photo  ~800ms/张（open→capture→close，物理下限）
-   ▼
-cam_grab.sh   shell 循环抓拍 → 原子替换 .cam-frame.jpg + 毫秒时间戳
+IP Camera App  Camera2 长连接 → HTTP :4444/video/mjpeg（免认证、免 TLS，约 17fps）
    │
-cam_server.py  PIL 解码（draft 降采样）→ 等比 cover → rgb24
-   │  HTTP 127.0.0.1:8123/frame?w=&h=   ≈ 80ms/次
-   ▼
+Termux ffmpeg（常驻一次启动）→ scale/cover → rgb24
+   │
+cam_server.py  维护最新帧；HTTP :8123/frame（约 25ms/次）、/jpg、/stream、/view
+   │
 dsh-go (PRoot Ubuntu) 里的 dsh-see-now-phone
    │  http-raw 后端：收现成 rgb24 → pipeline.push({t,buf})
    ▼
-打分 → 切点 → 装箱 DP → 拼图 → PNG → 宿主附件
+打分 → 切点 → 装箱 DP → 多帧宫格 → PNG → 宿主附件
 ```
 
-**两个关键决策**（都是实测踩出来的）：
+两个 Android App 共享同一个网络栈，PRoot 直连 `127.0.0.1` 即可，**不需要端口转发**。
+插件侧**零 ffmpeg 依赖**（PRoot 里没有 ffmpeg，解码全在 Termux 侧做完）。
 
-1. **抓拍和发包拆成两个进程**。同一条 `termux-camera-photo`，
-   shell 直接调 ~800ms，python 的 `subprocess` 调 **~3500ms**（差 4 倍，与环境变量无关）。
-   shell 循环抓、python 只读文件，各自都在最优点。
-2. **解码放在手机侧**，插件只收 rgb24。dsh-go 的 PRoot 里大概率没有 ffmpeg，
-   而且 `image2pipe` 喂多张 JPEG 时，ffmpeg 会把"数据停顿"判成 EOF 提前退出（实测只走 1 帧）。
-   插件侧因此**零 ffmpeg 依赖**。
+**为什么必须换流**：`termux-camera-photo` 每次 camera2 open/close ~800ms（上限 ~1.2fps），
+Termux 的 ffmpeg 没有 `android_camera`/`v4l2` demuxer，`/dev/video*` 属 `system:camera`、
+普通进程 `Permission denied`。抓拍路径调不出 12fps，是权限模型决定的。
 
-`PIL.Image.draft()` 让 JPEG 解码器直接按 1/4 降采样解码：
-4096×3072 全图 open 208ms → 52ms，resize 61ms → 14ms。
-
-两个 Android App 共享同一个网络栈，所以 PRoot 里直连 `127.0.0.1:8123` 即可，**不需要端口转发**。
-
----
+**保留的回退**：`CAM_MODE=grab` 时不依赖任何额外 App，用
+`cam_grab.sh` + `termux-camera-photo` + PIL `draft()` 走 ~1fps 抓拍路径
+（IP Camera 没装/没开时自动可用）。帧标记用**递增序号**，不用时间戳。
 
 ## 3. 后端
 
 | 后端 | 帧率 | 需要 | 说明 |
 |---|---|---|---|
-| **`http-raw`** | ~1 fps | Termux + Termux:API + Pillow | **手机默认**，零插件侧依赖 |
+| **`http-raw`** | **12–20 fps** | Termux + ffmpeg + IP Camera App | **手机默认**，零插件侧依赖 |
 | `termux` | ~1 fps | Termux + Termux:API | 插件自己抓拍（只在插件直接跑在 Termux 里时用） |
-| `mjpeg` / `rtsp` | 15–30 fps | IP Webcam / DroidCam | **要流畅就用这个**，见 §5 |
+| `mjpeg` / `rtsp` | 15–30 fps | 任意流源 | 插件侧需 ffmpeg（PRoot 里没有，慎用） |
 | `v4l2` / `avfoundation` / `dshow` | 原生 | 桌面摄像头 | PC 调试 |
 | `file` / `testsrc` | — | — | 回归测试 |
 
@@ -86,7 +83,7 @@ dsh-go (PRoot Ubuntu) 里的 dsh-see-now-phone
   "width": 336,
   "height": 448,
   "fps": 8,
-  "grabIntervalMs": 220,
+  "grabIntervalMs": 70,
   "mode": "general"
 }
 ```
@@ -108,42 +105,47 @@ see_phone({ action: "look", mode: "guide" })      // 导盲话术（后续定制
 
 ---
 
-## 5. 实测性能与诚实的边界
+## 5. 实测性能
 
 真机：HUAWEI nova 11（FOA-AL00），HarmonyOS 4.2 / Android 12，arm64。
 
 | 环节 | 实测 |
 |---|---|
-| `termux-camera-photo` 抓一张 | **~800ms**（camera2 open/close） |
-| PIL 解码 4096×3072 → 336×448 | 60–80ms（加 `draft` 后） |
-| HTTP `/frame` 端到端 | **~80ms** |
-| 插件 10 秒收到 | **25 帧（2.5 fps）**，成功出图 |
+| IP Camera MJPEG 源 | **~17 fps**（3 秒 49 帧） |
+| Termux ffmpeg → rgb24 | 336×448×3 = **451584 B**，精确对上 |
+| `/frame` 端到端 | **~25 ms** |
+| 帧服务内部计数 | **19.8 fps**（`ok=382 fail=0 age=0.03`） |
+| **插件端到端 8 秒** | **104 帧 = 12.95 fps**，出 6 帧宫格 |
 
-⚠️ **抓拍路径的物理上限就是 ~1 fps 的真实画面更新**。
-`termux-camera-photo` 每次都要完整 open/close 摄像头，且没有分辨率参数，改不动。
-手机抓拍的间隔抖动也大，所以帧时间戳用**真实墙钟**而不是 `frameIndex/fps`。
+⚠️ 插件的轮询间隔必须跟上：`grabIntervalMs` 默认 **70ms**（`http-raw` 钳到 80ms）。
+抓拍时代的 220ms 会把 20fps 的源压成 4.4fps —— 这个坑实测踩过。
 
-这个帧率对「看眼前静态画面」够用，但**做不了桌面版那种 12fps 的连续运动分析**。
-要流畅（15–30fps）只能换流：装 IP Webcam / DroidCam，配置
-`{"backend":"mjpeg","url":"http://127.0.0.1:8080/video"}`，插件侧已经有这个后端。
+**悬浮预览**：`http://127.0.0.1:8123/view` 是实时画面页，`/stream` 是 MJPEG 流。
+手机浏览器打开 `/view`，再从最近任务把浏览器切成小窗/悬浮窗，
+就是「后台采集 + 悬浮预览」，不用编译原生 overlay App。
 
 其他边界：
-- 全黑/太暗时 `gradeView` 会拦掉出图，只提示调整，不让模型在烂画面上编
 - 单帧 336×448 ≈ 130 token，**图会留在会话历史里每轮重发**；长时间看要留意
-- 手机抓拍持续耗电发热，用完记得 `stop`
-
----
+- 保持 IP Camera App 在后台（别从最近任务划掉），断流时帧服务会自动重连
+- 用完记得 `stop`；持续采集会耗电发热
 
 ## 6. 当前装机进度
 
-- [x] dsh-go APK 装上（本机模式）
-- [x] Termux + Termux:API 装上、`termux-api` / Pillow 装好、相机权限已授
-- [x] `cam_grab.sh` + `cam_server.py` 部署并跑起来（Termux 前台服务 + wake-lock）
-- [x] `http-raw` 端到端打通：手机摄像头 → rgb24 → 插件 → PNG
-- [x] 插件改回通用模式（保留原功能），导盲留作 `mode:"guide"`
-- [ ] **把插件装进 dsh-go 的 PRoot**（还差这一步：需要在 dsh-go 里开一个终端执行 `npm i`）
+- [x] dsh-go APK 装上（本机模式），引导走完、引擎启动
+- [x] Termux + Termux:API + Pillow + ffmpeg（`libc++` 27c→30 后能装）
+- [x] **开源 MIT 的 IP Camera App 装上**，关掉认证/TLS → 纯 HTTP MJPEG
+- [x] `cam_server.py` 流模式跑起来：`/frame`、`/jpg`、`/stream`、`/view`
+- [x] **端到端 12.95fps** 验证通过，多帧宫格出图
+- [x] 插件 `see_phone` 已装进 dsh-go（`plugin_manager install_bundle`）
+- [ ] 把**更新后的**插件包/配置刷进 dsh-go：在它终端里跑一次
+      `sh /sdcard/Download/install-on-phone.sh`（改了轮询间隔，装一次即可）
 
----
+## 开源与商用
+
+摄像头流 App：MIT License，允许商用、修改、再分发，无 copyleft 义务。
+从[官方 GitHub Releases](https://github.com/DigitallyRefined/android-ip-camera/releases) 下载，
+校验 SHA-256 `0e9d5fb859b9dc2d77f401f31964c412b22d6d787b88556a3001ea3b79f099fc`。
+插件本体 Apache-2.0，引擎同 `dsh-see-now`。
 
 ## 7. 开发
 

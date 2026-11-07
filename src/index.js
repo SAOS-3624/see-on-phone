@@ -33,8 +33,12 @@ export const inject = ['tools', 'attachments'];
 /** 竖持手机，4:3 竖构图。够看清两三米内的台阶和门框，单张 ≈ 130 token。 */
 const DEFAULT_SIZE = Object.freeze({ width: 336, height: 448 });
 
-/** 抓拍后端的真实节奏：termux-camera-photo 单次 150~500ms，取 220ms 留余量。 */
-const DEFAULT_GRAB_MS = 220;
+/**
+ * 取帧间隔。
+ * 抓拍后端：termux-camera-photo 单次 ~800ms，220ms 留余量；
+ * http-raw（流模式）：本地回环单帧 ~25ms、源 15–20fps，必须压到 70ms 才跟得上。
+ */
+const DEFAULT_GRAB_MS = 70;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -93,8 +97,9 @@ function createSession(cfg) {
     width: Number(cfg.width) || DEFAULT_SIZE.width,
     height: Number(cfg.height) || DEFAULT_SIZE.height,
   };
+  const camBackend = cfg.backend ?? 'http-raw';
   const camOpts = {
-    backend: cfg.backend ?? 'http-raw',
+    backend: camBackend,
     // 手机上默认连 Termux 那个帧服务（cam_server.py）：抓拍 + 缩放 + rgb24 都在
     // 手机侧做完，插件侧零依赖（PRoot 里没有 ffmpeg 也能跑）。
     // 两个 App 共享网络栈，127.0.0.1 直连，不需要端口映射。
@@ -102,7 +107,11 @@ function createSession(cfg) {
     width: size.width,
     height: size.height,
     fps: Number(cfg.fps) || 8,
-    grabIntervalMs: Number(cfg.grabIntervalMs) || DEFAULT_GRAB_MS,
+    // 存量配置里可能还写着抓拍时代的 220ms（会把 20fps 的流压成 4fps）。
+    // http-raw 走本地回环，钳到 80ms 是安全上限，不必让用户改配置文件。
+    grabIntervalMs: camBackend === 'http-raw'
+      ? Math.min(Number(cfg.grabIntervalMs) || DEFAULT_GRAB_MS, 80)
+      : (Number(cfg.grabIntervalMs) || DEFAULT_GRAB_MS),
     cameraId: cfg.camera === 'front' ? 1 : (Number(cfg.cameraId) || 0),
     ffmpegPath: cfg.ffmpegPath ?? 'ffmpeg',
   };

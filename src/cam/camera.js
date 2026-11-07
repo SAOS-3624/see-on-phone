@@ -213,7 +213,7 @@ export function openCamera(opts) {
   const {
     backend: wantBackend = null,
     width = 448, height = 336, fps = 8,
-    grabIntervalMs = 220, cameraId = 0,
+    grabIntervalMs = 70, cameraId = 0,
     url = null,
     ffmpegPath = 'ffmpeg',
     onFrame, onError, onExit,
