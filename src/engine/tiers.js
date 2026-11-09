@@ -36,6 +36,57 @@
 
 /** 帧/秒。docx 的 7 道阈值 × 30fps。 */
 export const LEVEL_THRESHOLDS = Object.freeze([0.26, 0.6, 0.9, 1.2, 1.8, 2.4, 3.0]);
+
+/**
+ * 感知档位阈值 —— 用「人眼瞬时记忆 / 主观现在」的实测时长当端点重排的 7 道。
+ *
+ * 阈值在这里的实际含义是 **一格代表着多少秒画面**（一格覆盖 `1/F` 秒）。所以两端各有一个
+ * 感知上的界：
+ *
+ * - **下界 3.0 s → F=0.333**：Pöppel 的"主观现在"实测 2~3 s（跨视觉/听觉/言语/运动多范式），
+ *   Fraisse 汇总的心理现在 2~3 s；**电影的镜头时长本身就有 ~3 s 的偏好**。一格超过 3 秒，
+ *   等于把一整个"现在"压成一张图。
+ * - **上界 0.30 s → F=3.333**：注意眨眼（AB）在 200~500 ms，第二目标落在这个窗口里就看不见；
+ *   图标记忆的部分报告优势在 250~500 ms 内消失（Sperling 1960）；可用的变化检测窗口只有
+ *   ~120 ms、"报告"约 190 ms、"静态检测"≥240 ms。**两条边界比 300 ms 还近，人眼就当成一次变化**，
+ *   再多留帧只是白花代价。
+ *
+ * 中间六道按**等比**排（时长辨别服从 Weber 律，等比对等距更贴近感知）：
+ * `r = (3.333/0.333)^(1/6) = 1.4678`，于是每格代表
+ * `3.00 / 2.04 / 1.39 / 0.95 / 0.65 / 0.44 / 0.30` 秒。
+ *
+ * 注意端点都往里收了：旧的 0.26（3.9 s）比"现在"还长，旧的 3.0 又比 300 ms 的界刚好卡齐。
+ * 中间比旧表更低 —— 同样的密度会更早进小格子（每张塞更多帧、单帧更小）。
+ *
+ * 用 `tierCurve: 'perceptual'` 打开；默认仍是 `docx`。
+ */
+export const PERCEPTUAL_THRESHOLDS = Object.freeze([0.333, 0.489, 0.718, 1.054, 1.547, 2.271, 3.333]);
+
+/** 可选的阈值表。改默认值之前先看 `scripts/sim.mjs` 的对比数据。 */
+export const TIER_CURVES = Object.freeze({
+  docx: LEVEL_THRESHOLDS,
+  perceptual: PERCEPTUAL_THRESHOLDS,
+});
+
+/**
+ * **这里删掉过一种分配方式**（`tierMode: 'dwell'`：按"这一段在屏幕上停了多久"给尺寸，
+ * 端点是 3 s / 0.3 s、中间等比，与 `PERCEPTUAL_THRESHOLDS` 互为倒数）。
+ *
+ * 删掉的原因有数据（五段素材跑了 A/B，**零次胜出**）：
+ *
+ * | 素材 | density | dwell |
+ * |---|---|---|
+ * | base（14 s，7 刀） | 2 张 / fill 100% | 3 张 / fill 51.1% |
+ * | dark-jian | 5 张 / fill 90.5% | 4 张 / fill 74.3% |
+ * | 讲课（无切点） | 2 张 / 75% | 完全相同 |
+ * | 游戏（60 s） | 平均 4.56 档 | 平均 7.28 档，100 帧里 **64 帧落 8 档** |
+ *
+ * 根因不是"停留时长这个信号不好"，是**我们量错了对象**：采样间隔由我们自己定
+ * （积分帧、兜底帧把节奏压平到 0.5~0.6 s），所以"两次**采样**之间隔多久"几乎不携带
+ * 内容信息。真要用这个信号，得量"两次**真切点**之间的时长" —— 那是另一件事，
+ * 别在原地上重试。
+ */
+
 export const HYSTERESIS = 0.05;
 export const TIER_MIN = 1;
 export const TIER_MAX = 8;
@@ -111,12 +162,13 @@ export const DEFAULT_TIER_MAP = Object.freeze([1, 2, 3, 4, 5, 6, 7, 8]);
 
 export function createTiers({
   fps = 12, dtFrames = 12, smoothFrames = 6,
-  thresholds = LEVEL_THRESHOLDS, hysteresis = HYSTERESIS,
+  curve = 'docx', thresholds, hysteresis = HYSTERESIS,
 } = {}) {
+  const table = thresholds ?? TIER_CURVES[curve] ?? LEVEL_THRESHOLDS;
   const W = Math.max(1, dtFrames) / fps;             // 密度窗（秒）
   const alpha = 1 / Math.max(1, smoothFrames);       // 每帧一步的 EMA 系数
-  const up = thresholds.map((v) => v * (1 + hysteresis));
-  const down = thresholds.map((v) => v * (1 - hysteresis));
+  const up = table.map((v) => v * (1 + hysteresis));
+  const down = table.map((v) => v * (1 - hysteresis));
 
   const bounds = [];      // 已留下的帧的时刻（秒）
   let smoothed = 0;

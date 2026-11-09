@@ -83,6 +83,10 @@ test('look 能从合成源出图并交给 attachments', async (t) => {
   assert.ok(host.saved[0].bytes > 1000, 'PNG 太小说明出的是空图');
   assert.equal(out.images.length, 1);
   assert.match(out.text, /画面变化|帧/, '通用模式应当给画面变化说明，不是导盲话术');
+  // 默认读者必须是"看得见的人"：0.2.x 把盲人写死了，用户点「看一眼」就被当盲人接话
+  assert.equal(out.meta.mode, 'normal', '默认模式必须是 normal');
+  assert.doesNotMatch(out.text, /用户看不见/, 'normal 模式不许说用户看不见');
+  assert.match(out.text, /用户自己看得见/, 'normal 模式要明确告诉模型读者看得见');
 });
 
 test('mode:"guide" 仍保留导盲读图规范（后续定制用）', async (t) => {
@@ -90,6 +94,14 @@ test('mode:"guide" 仍保留导盲读图规范（后续定制用）', async (t) 
   const out = await host.tools[0].execute({ action: 'look', mode: 'guide', wait: 6 });
   assert.equal(out.meta.ok, true, `look 失败：${out.text}`);
   assert.match(out.text, /正前|风险/, '导盲模式必须给出方位与风险约束');
+  assert.equal(out.meta.mode, 'guide');
+});
+
+test('旧值 mode:"general" 仍然当作 normal（存量配置不能炸）', async (t) => {
+  const host = await boot(t);
+  const out = await host.tools[0].execute({ action: 'look', mode: 'general', wait: 6 });
+  assert.equal(out.meta.mode, 'normal');
+  assert.doesNotMatch(out.text, /用户看不见/);
 });
 
 test('stop 之后 status 说没在跑', async (t) => {

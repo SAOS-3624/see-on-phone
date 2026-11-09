@@ -19,7 +19,7 @@
 
 import { SCAN_H, SCAN_W, bgBorderChanged, bgKeep, createScorer, scorePair } from './cuts.js';
 import { createTiers, applyStrategy } from './tiers.js';
-import { solve, toRects, splitOneBin } from './pack.js';
+import { packTiers, toRects, splitOneBin } from './pack.js';
 import { composePacked, drawAudioStrip, stripHeight } from './sheet.js';
 import { encodePng } from './png.js';
 import { gridRects } from './layout.js';
@@ -251,6 +251,33 @@ export const DEFAULTS = Object.freeze({
   // 档位
   dtFrames: 12,
   smoothFrames: 6,
+  /**
+   * 档位阈值表：`docx`（默认，照抄 docx 的七道 × 30）或 `perceptual`
+   * （按人眼瞬时记忆 / 主观现在的实测时长重排，见 `tiers.js` 的 `PERCEPTUAL_THRESHOLDS`）。
+   * 只影响"密度 → 档位"这一段，切点和拼图不动。
+   */
+  tierCurve: 'docx',
+  /**
+   * 七道阈值自己填（帧/秒，严格递增）。**填了就以它为准**，`tierCurve` 只当名字用 ——
+   * 设置页选「自定义」时走这条路。非法值在 `tuning.js` 那边就被挡掉了，这层不重复校验。
+   */
+  tierThresholds: null,
+  /**
+   * 档位怎么算：
+   * - `density`（默认）：看过去 1 秒**平均每秒几帧**（邻域密度，走 EMA）；
+   * - `weight`：出图时按这一帧的变化分切面积（见 `seqOf`）—— 才有"同一张图里大小对比"。
+   *
+   * 两者都是"尺寸 = 重要性"的近似：模型没有瞬时视觉，格子大小是唯一能说
+   * "这一刻值得端详 / 只是扫过去"的通道。
+   */
+  tierMode: 'density',
+  /**
+   * 排布算法：`rows`（默认，按行流式 + DP）或 `skyline`（天幕，按最低可放位置塞）。
+   *
+   * 行式在**尺寸均匀**时最优；一旦尺寸混排（`tierMode:'weight'` 就是），一行凑不满
+   * 就整块留空。天幕把小的叠在大的旁边，洞没了，代价是布局不再是整齐的行。
+   */
+  packMode: 'rows',
   strategy: 'native',
   /**
    * `strategy: 'custom'` 时的查表（档位 1..8 → 目标档位）。
@@ -359,7 +386,13 @@ export function createPipeline(opts = {}) {
       : o.cutFutureMinScore,
   });
   const tiers = createTiers({
-    fps, dtFrames: o.dtFrames, smoothFrames: o.smoothFrames,
+    fps,
+    dtFrames: o.dtFrames,
+    smoothFrames: o.smoothFrames,
+    curve: o.tierCurve,
+    thresholds: Array.isArray(o.tierThresholds) && o.tierThresholds.length === 7
+      ? o.tierThresholds.map(Number)
+      : undefined,
   });
 
   let q = [];                  // 待判的帧（未来帧确认时最多 ~delay*fps 帧）
@@ -468,6 +501,12 @@ export function createPipeline(opts = {}) {
       return false;
     }
     tiers.mark(entry.t);
+    /**
+     * `tierMode: 'density'` —— 档位只由**邻域密度**决定，`keep` 这一层不再看别的信号。
+     *
+     * （这里删掉过 `dwell`：按"这一段在屏幕上停了多久"给尺寸。五段素材零次胜出，
+     * 因为采样间隔是我们自己定的、不携带内容信息。详见 `tiers.js` 里那段注释。）
+     */
     const lv = tiers.levelAt();
     // 这里**只按密度给档位**，不加假切点加成 —— 加成要等出图时按最终帧数决定
     // （见 DEFAULTS.markBoost 的实测表）。keep 阶段用它判断"装不装得下"，
@@ -522,7 +561,7 @@ export function createPipeline(opts = {}) {
    * 实测帧密场景还是 4 帧/张、token/分一点没省。
    */
   function plan() {
-    return solve(seqOf(frames), { binCost: o.binCost });
+    return packTiers(seqOf(frames), { binCost: o.binCost, packMode: o.packMode });
   }
 
   function checkFlush(t) {
@@ -559,7 +598,7 @@ export function createPipeline(opts = {}) {
     // "4 个 1 档装得进一张"刚好咬住（见 `splitOneBin` 的注释）。这里换成显式规则：
     // 不依赖那两个数字，改加成参数也不会静默交出一张糊图。
     if (p.bins > 1) {
-      const segs = splitOneBin(seqOf(frames), { binCost: o.binCost });
+      const segs = splitOneBin(seqOf(frames), { binCost: o.binCost, packMode: o.packMode });
       const keep = segs[0].length;
       const carry = frames.slice(keep);
       if (carry.length === 0) { flush(t, 'full'); return; }   // 兜底：不该发生
@@ -694,7 +733,7 @@ export function createPipeline(opts = {}) {
     // 清空了 sheets 却交不出图（插话时用户什么都看不到）。
     if (regionAspect) return flushRegion(batch, t, why);
     const seq = seqOf(batch);
-    const p = solve(seq, { binCost: o.binCost });
+    const p = packTiers(seq, { binCost: o.binCost, packMode: o.packMode });
     if (!p.cells.length) return;
     /**
      * **一张图只画一个箱子**。`solve` 允许跨箱（DP 里封箱是要付 `binCost` 的），
@@ -762,6 +801,44 @@ export function createPipeline(opts = {}) {
    * 帧多时压档才真的省 token（每张固定 216，5 帧比 4 帧便宜 26%）。
    */
   function seqOf(batch) {
+    /**
+     * **按重要性分配面积**（`tierMode:'weight'`）—— 这才是"尺寸 = 重要性"的正解。
+     *
+     * 模型没有瞬时视觉，格子大小是唯一能告诉它"这一刻值不值得端详"的通道。但面积是零和
+     * 的（Σ 1/k² ≤ 1），所以不能给"重要的帧"无条件大格 —— 只能把这一张图的总面积
+     * **按权重切开**：
+     *
+     *     area_i ∝ weight_i        k_i = ceil(1 / sqrt(area_i))，再夹到 1..8
+     *
+     * 取 `ceil` 而不是 `round`：宁可小半档，也不能让 Σ 1/k² 超过 1（超了包不下）。
+     * 权重用 `score`（这一帧比上一帧变了多少）—— 变化越大越是"一幕"，越值得占地方。
+     * 帧多的时候每份面积自然变小，所以张数多寡仍然自动生效，不需要另立密度判据。
+     *
+     * **积分帧 / 兜底帧要折进权重里**：它们本来就不是"一幕"，是"这一段一直在变"或
+     * "实在没东西可看"的采样。行式那套是用 `markBoost` 压档表达的，这里换成把权重打下去
+     * —— 同一个意思，只是表达在面积上而不是档位上。不折的话游戏素材会多花 29% 的 token
+     * （实测：同样 60 秒，7 张 → 9 张）。
+     */
+    if (o.tierMode === 'weight') {
+      const on = batch.length >= Math.max(1, Number(o.boostMinFrames) || 4);
+      const dampen = (via) => {
+        if (!on) return 1;
+        if (via === 'mark') return 1 / (1 + Math.max(0, Number(o.markBoost) || 0));
+        if (via === 'floor') return 1 / (1 + Math.max(0, Number(o.floorBoost) || 0));
+        return 1;
+      };
+      const w = batch.map((f) => {
+        const s = Number(f.score);
+        const base = Number.isFinite(s) && s > 0 ? s : 4;
+        return Math.max(0.5, base * dampen(f.via));
+      });
+      const sum = w.reduce((a, b) => a + b, 0) || 1;
+      return batch.map((f, i) => {
+        const area = Math.max(w[i] / sum, 1e-6);
+        const k = Math.ceil(1 / Math.sqrt(area));
+        return applyStrategy([Math.min(8, Math.max(1, k))], o.strategy, o.tierMap)[0];
+      });
+    }
     const on = batch.length >= Math.max(1, Number(o.boostMinFrames) || 4);
     // `Number(raw) || 0` 不是多余的：命令行 `--markBoost=0` 传进来是字符串 "0"，
     // `lv + "0"` 会变成 "10" 再被 clamp 成 8 档（实测把整张图打成 64 格碎格）。
@@ -967,7 +1044,7 @@ export function createPipeline(opts = {}) {
       let guard = 0;
       while (frames.length && guard < 64) {
         guard += 1;
-        const segs = splitOneBin(seqOf(frames), { binCost: o.binCost });
+        const segs = splitOneBin(seqOf(frames), { binCost: o.binCost, packMode: o.packMode });
         if (segs.length <= 1) { flush(lastBound, 'end'); break; }
         const keep = segs[0].length;
         const carry = frames.slice(keep);

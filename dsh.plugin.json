@@ -1,7 +1,7 @@
 {
   "name": "dsh-see-now-phone",
-  "description": "SeeNow Phone Version — let DSH look through the phone's camera and describe what is in front of a blind user.",
-  "version": "0.1.4",
+  "description": "SeeNow Phone Version — let DSH look through the phone's camera: frame scoring, change detection, multi-frame sheets. Two readers, picked explicitly: normal (the user can see it) or guide (blind navigation).",
+  "version": "0.3.0",
   "entry": {
     "name": "dsh-see-now-phone",
     "inject": [

@@ -3,19 +3,16 @@
  *
  * ============================ 它和 see-now 是什么关系 ============================
  *
- * 同一套「帧 → 打分 → 拼图 → PNG」引擎（`src/engine/` 整块从 dsh-see-now vendor 过来），
- * **采集层整个换掉**：PC 版截屏幕（ddagrab/gdigrab/portal），手机版开摄像头
- * （termux-camera-photo 抓拍 / MJPEG / RTSP）。
+ * 同一套「帧 → 打分 → 拼图 → PNG」引擎（`src/engine/` 整块从 dsh-see-now vendor 过来，
+ * 拼图/取帧算法跟着桌面版一起升级），**采集层整个换掉**：PC 版截屏幕
+ * （ddagrab/gdigrab/portal），手机版开摄像头（MJPEG / 抓拍 / RTSP）。
  *
- * 但真正变的不只是采集 —— 是**读者**：
- *   - `see_now` 的读者是"能看见屏幕的人"，图是给他自己确认用的辅助；
- *   - `see_phone` 的读者是**看不见的盲人**，图只给模型，模型说什么他就信什么。
+ * 真正要注意的是**读者**，而且有两位，由 `mode` 选（见 src/mode.js）：
+ *   - `normal`（默认）：用户自己看得见画面。宫格按时间线摊开，回答按普通会话说。
+ *   - `guide`：用户看不见（导盲）。单帧「此刻」、先风险后动作、可以直接念。
  *
- * 所以这里刻意不做 see-now 的那些东西：没有宫格时间线（要的是"此刻"）、
- * 没有浮窗（他看不见）、没有字幕/ASR（说的是他身边，不是视频里）、没有 region。
- * 反过来多做了 see-now 不会做的一件事：**每次出图都强制走一次系统 TTS**。
- *
- * 设计取舍记在 README 的「为什么不是 see-now 加个 --camera」。
+ * 0.2.x 把导盲当成唯一定位写死在工具描述里，于是"看一眼"这种中性请求也会被接成
+ * 导盲口吻 —— 0.3.0 起默认 normal，导盲是显式的第二档。
  * ============================================================================
  */
 import { readFileSync } from 'node:fs';
@@ -25,13 +22,12 @@ import { createPipeline } from './engine/pipeline.js';
 import { openCamera } from './cam/camera.js';
 import { seePhoneToolSpec, TOOL_NAME, DEFAULT_WAIT_SEC } from './tool-spec.js';
 import { buildLookText, buildGuideText, buildStatusText, gradeView } from './guide.js';
+import { resolveMode, readAppMode, sizesFor, describeMode } from './mode.js';
 import { speak, ttsState, stopSpeaking } from './tts.js';
 import { loadDefineTool } from './define-tool.js';
+import { startInbox } from './inbox.js';
 
 export const inject = ['tools', 'attachments'];
-
-/** 竖持手机，4:3 竖构图。够看清两三米内的台阶和门框，单张 ≈ 130 token。 */
-const DEFAULT_SIZE = Object.freeze({ width: 336, height: 448 });
 
 /**
  * 取帧间隔。
@@ -112,12 +108,10 @@ function buildPreset(cfg) {
  * 摄像头会话：采集 + 管线 + 最近一帧。
  *
  * 单例。手机上只有一个摄像头，两个会话必然互相抢。
+ * `mode` 只影响**画布尺寸**（见 mode.js 的 MODE_SIZES），管线/打分/拼图完全一样。
  */
-function createSession(cfg) {
-  const size = {
-    width: Number(cfg.width) || DEFAULT_SIZE.width,
-    height: Number(cfg.height) || DEFAULT_SIZE.height,
-  };
+function createSession(cfg, mode) {
+  const size = sizesFor(mode, cfg);
   const camBackend = cfg.backend ?? 'http-mjpeg';
   const camOpts = {
     backend: camBackend,
@@ -148,6 +142,7 @@ function createSession(cfg) {
 
   const state = {
     size, camOpts, pipeline,
+    mode,
     cam: null,
     startedAt: 0,
     lastWall: 0,
@@ -223,15 +218,27 @@ export async function apply(ctx) {
 
   const log = (...a) => { try { ctx.logger?.info?.('[see-phone]', ...a); } catch { /* 无 logger */ } };
 
-  /** 拿会话；没有就建。任何 action（除 help/status 未启动）都要先过这里。 */
-  async function ensure() {
-    if (session?.cam) return session;
+  /**
+   * 拿会话；没有就建。任何 action（除 help/status 未启动）都要先过这里。
+   *
+   * 换模式 = 换画布尺寸。管线在 `createPipeline()` 时就把 width/height 定死了，
+   * 所以尺寸变了只能整个重建（摄像头也是单例，本来就只能有一个）。
+   */
+  async function ensure(mode) {
+    const want = sizesFor(mode, cfg);
+    if (session?.cam) {
+      if (session.size.width === want.width && session.size.height === want.height) return session;
+      log('画布尺寸变了', `${session.size.width}×${session.size.height}`, '→', `${want.width}×${want.height}`);
+      await session.stop();
+      session = null;
+    }
     if (!session) {
-      session = activeCamera ? createSession({ ...cfg, camera: activeCamera }) : createSession(cfg);
+      const base = activeCamera ? { ...cfg, camera: activeCamera } : cfg;
+      session = createSession(base, mode);
     }
     try {
       await session.start();
-      log('摄像头已启动', session.camOpts.backend ?? 'auto', session.size);
+      log('摄像头已启动', session.camOpts.backend ?? 'auto', session.size, mode);
     } catch (err) {
       // 起不来不是致命错：把原因留在 session 上，工具返回里说清楚
       session.lastError = err.message;
@@ -254,8 +261,8 @@ export async function apply(ctx) {
     return { images: [ref], text, meta: { ...meta, ok: true } };
   }
 
-  async function doLook(args) {
-    const s = await ensure();
+  async function doLook(args, mode) {
+    const s = await ensure(mode);
     const waitSec = Number.isFinite(Number(args.wait)) && Number(args.wait) > 0
       ? Math.min(Number(args.wait), 30)
       : DEFAULT_WAIT_SEC;
@@ -281,7 +288,6 @@ export async function apply(ctx) {
     s.sheets += 1;
     const ageSec = (Date.now() - s.lastWall) / 1000;
     const quality = gradeView({ meanLuma: s.lastLuma, frames: s.frames, firstFrameMs: null });
-    const mode = String(args.mode ?? cfg.mode ?? 'general').toLowerCase();
     const note = args.note ? String(args.note).slice(0, 300) : null;
     const backend = s.snapshot().backend;
     const text = mode === 'guide'
@@ -290,20 +296,19 @@ export async function apply(ctx) {
     return attach(ctx, sheet, text, {
       ageSec: +ageSec.toFixed(2),
       quality,
+      mode,
       luma: s.lastLuma == null ? null : Math.round(s.lastLuma),
       sheets: s.sheets,
       backend: s.snapshot().backend,
     });
   }
 
-  async function doWatch(args) {
-    const s = await ensure();
+  async function doWatch(args, mode) {
+    const s = await ensure(mode);
     const waitSec = Number.isFinite(Number(args.wait)) && Number(args.wait) > 0
       ? Math.min(Number(args.wait), 120)
       : DEFAULT_WAIT_SEC * 4;
     const note = args.note ? String(args.note).slice(0, 300) : null;
-    const mode = String(args.mode ?? cfg.mode ?? 'general').toLowerCase();
-    const quality = gradeView({ meanLuma: s.lastLuma, frames: s.frames });
     const backend = s.snapshot().backend;
     const t0 = Date.now();
 
@@ -314,12 +319,15 @@ export async function apply(ctx) {
       if (sheet) {
         s.sheets += 1;
         const ageSec = (Date.now() - s.lastWall) / 1000;
+        // 画面质量要**拿到图之后**再判：进来时刚建会话、frames 还是 0，
+        // 提前算会把一张 17 帧的宫格标成"没有输出任何帧"（实测踩到）。
+        const quality = gradeView({ meanLuma: s.lastLuma, frames: s.frames });
         const text = mode === 'guide'
           ? buildGuideText({ note, ageSec, quality })
           : buildLookText({ note, ageSec, frames: sheet.frames.length, quality, backend });
         return attach(ctx, sheet, text, {
           ok: true, sheets: s.sheets, frames: sheet.frames.length,
-          why: sheet.why, backend,
+          why: sheet.why, backend, mode, quality,
         });
       }
       await sleep(150);
@@ -338,7 +346,7 @@ export async function apply(ctx) {
    * 把"已经攒出来的"取走，一帧都不等。插件叫醒模型时（"有新画面了"）用它，
    * 免得又一次 8 秒阻塞。
    */
-  async function doPeek(args) {
+  async function doPeek(args, mode) {
     if (!session?.cam) {
       return {
         text: '摄像头还没启动过，没有攒着的图。先 `see_phone({action:"look"})` 或 `watch` 一次。',
@@ -356,7 +364,6 @@ export async function apply(ctx) {
     session.sheets += 1;
     const ageSec = (Date.now() - session.lastWall) / 1000;
     const quality = gradeView({ meanLuma: session.lastLuma, frames: session.frames });
-    const mode = String(args.mode ?? cfg.mode ?? 'general').toLowerCase();
     const note = args.note ? String(args.note).slice(0, 300) : null;
     const backend = session.snapshot().backend;
     const text = mode === 'guide'
@@ -364,24 +371,32 @@ export async function apply(ctx) {
       : buildLookText({ note, ageSec, frames: sheet.frames.length, quality, backend });
     return attach(ctx, sheet, text, {
       ageSec: +ageSec.toFixed(2), quality, frames: sheet.frames.length,
-      why: sheet.why, backend, sheets: session.sheets,
+      why: sheet.why, backend, mode, sheets: session.sheets,
     });
   }
 
-  async function doStatus() {
+  async function doStatus(mode) {
     if (!session) {
       return {
         text: `还没启动过摄像头。配置：${JSON.stringify(cfg)}\n`
+          + `模式：${describeMode(mode)}\n`
           + '调一次 `see_phone({action:"look"})` 就会按配置文件启动。',
-        meta: { ok: true, running: false },
+        meta: { ok: true, running: false, mode },
       };
     }
     const snap = session.snapshot();
     const quality = gradeView({ meanLuma: session.lastLuma, frames: session.frames });
     const t = buildStatusText({ cam: snap, pipeline: session.pipeline, quality });
+    const ib = inbox.state();
+    // 会话的画布是建会话那一刻的模式定的：`status` 不重建采集，
+    // 所以这里报会话的模式，两者不一致时把"下次会换"说清楚。
+    const sessMode = session.mode ?? mode;
+    const modeLine = `模式：${describeMode(sessMode)}　画布：${session.size.width}×${session.size.height}`
+      + (sessMode === mode ? '' : `\n（本次调用解析为 ${mode}，下次取帧会按它重建画布）`);
     return {
-      text: `${t}\n声音：${JSON.stringify(ttsState())}`,
-      meta: { ok: true, running: snap.running, backend: snap.backend, tts: ttsState() },
+      text: `${t}\n${modeLine}\n`
+        + `声音：${JSON.stringify(ttsState())}\n收件箱：${JSON.stringify(ib)}`,
+      meta: { ok: true, running: snap.running, backend: snap.backend, mode, sessionMode: sessMode, tts: ttsState(), inbox: ib },
     };
   }
 
@@ -402,6 +417,14 @@ export async function apply(ctx) {
     // help/status/stop 也要过这里：改了配置后第一次调用就该生效
     await refreshConfig();
 
+    /**
+     * 模式三级回退（见 src/mode.js）：参数 > App 开关文件 > 配置文件 > normal。
+     * **每次调用都重算**：用户在 App 上点一下开关，下一次工具调用就该换口吻，
+     * 不能等到重启插件。
+     */
+    const picked = resolveMode({ arg: args.mode, app: readAppMode(), cfg: cfg.mode });
+    const mode = picked.mode;
+
     // 换摄像头：args.camera 和当前不一致就重建（摄像头单例，只能整个换）
     const wantCam = String(args.camera ?? '').toLowerCase();
     if (wantCam === 'front' || wantCam === 'back') {
@@ -419,35 +442,36 @@ export async function apply(ctx) {
 
     switch (action) {
       case 'help':
-        return { text: HELP, meta: { action } };
+        return { text: HELP, meta: { action, mode } };
       case 'reload': {
         cfgSnapshot = '__force__';   // 强制走一次重建
         await refreshConfig();
-        return { text: '配置已重载，下次取帧会用新参数重启采集。', meta: { ok: true } };
+        return { text: '配置已重载，下次取帧会用新参数重启采集。', meta: { ok: true, mode } };
       }
       case 'status':
-        return doStatus();
+        return doStatus(mode);
       case 'stop': {
         stopSpeaking();
         if (session) await session.stop();
         const had = Boolean(session);
         session = null;
-        return { text: had ? '摄像头已关，不再耗电。' : '本来就没在跑。', meta: { ok: true } };
+        return { text: had ? '摄像头已关，不再耗电。' : '本来就没在跑。', meta: { ok: true, mode } };
       }
       case 'watch':
-        return doWatch(args);
+        return doWatch(args, mode);
       case 'peek':
-        return doPeek(args);
+        return doPeek(args, mode);
       case 'look':
       default: {
-        const out = await doLook(args);
+        const out = await doLook(args, mode);
         // 说了但没出声，等于没说 —— 必须把原因亮出来，让模型改用文字回复
         if (speakResult && !speakResult.ok && said) {
+          const fallback = mode === 'guide'
+            ? '把内容直接写进回复给用户，让他用系统读屏听；并提醒他检查「看见」App 的语音是否还活着。'
+            : '把内容直接写进回复（用户看得见屏幕）。要念的话检查「看见」App 的语音是否还活着。';
           return {
             ...out,
-            text: `${out.text}\n\n⚠ 这句话没说出口（${speakResult.reason ?? 'unknown'}）：`
-              + '把内容直接写进回复给用户，让他用系统读屏听；'
-              + '并提醒他检查 DSH TTS Bridge 是否还在。',
+            text: `${out.text}\n\n⚠ 这句话没说出口（${speakResult.reason ?? 'unknown'}）：${fallback}`,
           };
         }
         return out;
@@ -455,18 +479,43 @@ export async function apply(ctx) {
     }
   }
 
+  /**
+   * 记住"上一次工具调用发生在哪个会话里"。
+   *
+   * 收件箱是后台轮询，没有 invocation，只能靠这里顺手抓一个 —— 宿主在
+   * `execute(args, exec)` 里给的 `exec.agent.session.id` 就是它。
+   * 计策：拿不到也不报错，等下一次调用再补（UI 上会显示 no-session-id）。
+   */
+  let lastSessionId = null;
+  function rememberSession(exec) {
+    try {
+      const sid = exec?.agent?.session?.id
+        ?? exec?.session?.id
+        ?? exec?.sessionId
+        ?? exec?.agent?.sessionId
+        ?? null;
+      if (sid) lastSessionId = String(sid);
+    } catch { /* 宿主形状变了也不能炸 */ }
+  }
+
   const tool = {
     ...seePhoneToolSpec(),
-    async execute(args = {}) {
+    async execute(args = {}, exec) {
+      rememberSession(exec);
       const out = await route(args);
       return toLosslessJson(out);
     },
   };
 
   disposers.push(ctx.tools.register(defineTool(tool)));
+
+  // 收件箱：手机「看见」App 里打的字 → steer 进这个会话
+  const inbox = startInbox(ctx, { getSessionId: () => lastSessionId });
+  disposers.push(() => { try { inbox.stop(); } catch { /* ignore */ } });
   log(`${TOOL_NAME} 已注册`);
 
   ctx.on?.('dispose', () => {
+    try { inbox.stop(); } catch { /* ignore */ }
     try { stopSpeaking(); } catch { /* ignore */ }
     session?.stop?.().catch?.(() => {});
     for (const d of disposers) { try { d?.(); } catch { /* ignore */ } }
@@ -479,35 +528,50 @@ export async function apply(ctx) {
  *
  * 判据同 see-now：**删掉这句，模型会不会用错？** 会 → 进契约；不会 → 进这里。
  */
-const HELP = `SeeNow Phone Version · 手机摄像头导盲
+const HELP = `SeeNow Phone Version · 手机摄像头
 
 ## 它在做什么
-手机摄像头 → 手机侧缩放成 rgb24 → 打分/切点 → 装箱 DP 拼图 → 图片附件交给宿主。\n与桌面 \`see_now\` 同一套引擎，只是采集源从屏幕换成摄像头。
+手机摄像头 → 缩放成 rgb24 → 打分/切点 → 装箱 DP 拼图 → 图片附件交给宿主。
+与桌面 \`see_now\` 同一套引擎（拼图/取帧算法随桌面版一起升级），只是采集源换成摄像头。
+
+## 两种模式（mode）
+- \`normal\`（**默认**）：用户自己看得见画面。按普通会话回答，宫格按时间线摊开，
+  不假设用户看不见、不强制念出来。
+- \`guide\`：用户看不见（导盲）。单帧「此刻」、先风险后通路、一句到两句，可以直接念。
+旧值 \`general\` 等同 \`normal\`。优先顺序：调用参数 > 手机 App 的开关 > 配置文件 > normal。
+「看见」App 顶栏一点就切，写在 /sdcard/Download/DSH-Go/mode.txt ，下一次工具调用即生效。
+
+画布随模式变：normal 420×560、guide 336×448 —— 两者计费都是 197 token（小于 544²
+会被地板放大到同一网格），所以正常模式白得 56% 像素。
 
 ## 采集后端（配置文件 ~/.dsh/see-phone.json 的 backend）
-- \`http-mjpeg\`（**手机默认**）：插件直连 IP Camera App 的 MJPEG 流，内置 jpeg-js 解码。
-  实测 nova 11 上 8.7fps、单帧解码 31.6ms。要求 App 在后台跑着。
+- \`http-mjpeg\`（**手机默认**）：插件直连「看见」App 的 MJPEG 流，内置 jpeg-js 解码。
+  实测 nova 11 上 8.7fps、单帧解码 25~32ms。要求 App 在跑（它自己是前台服务）。
   配置项 \`url\`（默认 \`http://127.0.0.1:4444/video/mjpeg\`）、\`rotate\`（默认 90，
-  画面上下颠倒就改 0/180/270）、\`camera\`（back/front）、\`resolution\`（low/medium/high）。
+  画面歪了就改 0/180/270）、\`camera\`（back/front）、\`resolution\`（low/medium/high）。
 - \`http-raw\`：Termux 侧 cam_server.py 出 rgb24（旧链路，留作回退）
 - \`termux\`：Termux:API 抓拍，~1fps（camera2 每次 open/close 800ms，物理上限）
-- \`mjpeg\` / \`rtsp\`：外部 App（IP Webcam / DroidCam），需要 url
-- \`v4l2\` / \`avfoundation\` / \`dshow\`：桌面调试用（PC 上的摄像头）
+- \`mjpeg\` / \`rtsp\`：外部 App，需要 url
+- \`v4l2\` / \`avfoundation\` / \`dshow\`：桌面调试用
 - \`file\` / \`testsrc\`：回归测试用
 
 ## 声音
-\`say\` 参数会真的念出来 —— 插件发一条显式广播给 **DSH TTS Bridge**（自制 13KB App），
-由它调 Android 的 TextToSpeech（华为 hiai 引擎）。**PRoot 里没有别的通道**：
-碰不到 TextToSpeech、\`am start\` 被 SecurityException 拒、\`cmd texttospeech\` 没有实现。
-桥 App 没装或被杀时返回 \`no-sound\`，这时把话直接写进回复，让用户用读屏听。
-\`status\` 里 \`tts.channel\` 会显示当前走的是 \`bridge\` 还是 \`termux\`。
+\`say\` 参数会念出来：插件发一条显式广播给「看见」App，由它调 Android 的 TextToSpeech。
+桥不在时返回 \`no-sound\` —— 这时把话直接写进回复。
+**normal 模式下 App 只显示字幕、不自动朗读**；guide 模式才默认念（省得吓到正常用户）。
+\`status\` 里 \`tts.channel\` 会显示当前通道。
+
+## 收件箱（手机端打字 → 直接进会话）
+App 里打的字落到 /sdcard/Download/DSH-Go/inbox.txt ，插件每 400ms 轮询一次，
+把**最后一条**用 agent.steer() 塞进当前会话（next-step，正在跑的轮次立刻看得见）。
+⚠️ 需要先有过一次工具调用（这样插件才知道 sessionId）。没拿到时 status 的
+inbox.lastError 会是 no-session-id，先 look 一次即可。
 
 ## 成本
-一张 ${DEFAULT_SIZE.width}×${DEFAULT_SIZE.height} 单帧图 ≈ 130 token，且**会留在会话历史里每轮重发**。
-连续导盲 10 分钟（每 3 秒一次）= 200 张 ≈ 2.6 万 token 的常驻负担。
-所以：只在用户真的要"看"的时候 \`look\`，别拿它当轮询。
+一张图 ≈ 197 token，且**会留在会话历史里每轮重发**。连续看 10 分钟（每 3 秒一张）
+= 200 张 ≈ 4 万 token 的常驻负担。所以：只在真的要"看"的时候 \`look\`/\`watch\`，别轮询。
 
 ## 已知限制
-- termux 抓拍是"一次一张"，走路时画面会比人慢半拍；说方位时用"刚才"而不是"现在"
+- 抓拍后端是"一次一张"，走路时画面会比人慢半拍；说方位时用"刚才"而不是"现在"
 - 全黑/太暗时**不会**出图（gradeView 拦掉了），只会告诉你请用户调整
 - 单摄像头：\`look\` 和 \`watch\` 不能真正并发`;

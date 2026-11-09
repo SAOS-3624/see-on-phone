@@ -3,12 +3,13 @@
 > **手机版 see-now**：保留桌面版原有的「打分 → 挑帧 → 多帧宫格 → 时间线」能力，
 > 只把采集源从电脑屏幕换成手机摄像头。
 >
-> 导盲是**可选模式**（`mode:"guide"`），后续再定制；默认 `mode:"general"`，
-> 行为和桌面 `see_now` 一致 —— 其他用户装上去就是原来那套东西。
+> **两种读者，显式选**：默认 `mode:"normal"` —— 用户自己看得见画面，按普通会话说；
+> `mode:"guide"` 才是导盲（看不见 → 只给结论和动作）。0.2.x 把导盲当成唯一定位写死，
+> 于是点一下「看一眼」也被当盲人接话 —— 0.3.0 修的就是这个。
 
 - npm：`dsh-see-now-phone`
 - 工具名：`see_phone`
-- 依赖：Node ≥ 20；手机场景另需 Termux + Termux:API
+- 依赖：Node ≥ 20；手机场景另需「看见」App（`phone/dsh-eye`，一个 App 顶摄像头 + TTS）
 
 ---
 
@@ -18,18 +19,20 @@
 
 | | `dsh-see-now`（桌面） | `dsh-see-now-phone` |
 |---|---|---|
-| 采集 | 屏幕：ddagrab / gdigrab / portal / PipeWire | **摄像头**：Termux 抓拍 / MJPEG / RTSP |
-| 引擎 | 打分、切点、装箱 DP、拼图、PNG、token 换算 | **整块 vendor 过来，一行没改** |
+| 采集 | 屏幕：ddagrab / gdigrab / portal / PipeWire | **摄像头**：MJPEG / 抓拍 / RTSP |
+| 引擎 | 打分、切点、装箱 DP、拼图、PNG、token 换算 | **整块 vendor 过来**，随桌面版一起升级 |
 | 输出 | 多帧宫格（按画面变化挑帧） | **一样** |
 | 动作 | watch / peek / status / stop | **一样**（另有 `look` 取单帧） |
 | 语音 | 可选 `say` | 可选 `say`（有 TTS 就念） |
+| 读者 | 看得见屏幕的人 | `normal` 看得见 / `guide` 看不见 |
 
-引擎 `src/engine/` 的 9 个文件来自 `dsh-see-now` 0.1.5，零宿主依赖（只用 `node:zlib`）。
+引擎 `src/engine/` 的 9 个文件来自 `dsh-see-now` **0.2.1**（0.3.0 同步了
+`pack.solveSkyline` / `packTiers` / `tierCurve` / `tierMode` 那批改进），零宿主依赖（只用 `node:zlib`）。
 **采集层整个重写**：Android 上普通进程看不到 `/dev/video*`，桌面那套 ffmpeg 设备枚举一个都用不了。
 
 ### 为什么独立成包而不是给 see-now 加 `--camera`
 
-采集配置、默认值、发版节奏都不同；导盲那套后续还要按真机反馈反复调阈值，
+采集配置、默认值、发版节奏都不同；导盲那套还要按真机反馈反复调阈值，
 不该带着"看视频"的用户一起发版。
 
 ---
@@ -71,15 +74,16 @@ PC 侧也有 `phone/revive.sh` 一键拉起。
 {
   "backend": "http-mjpeg",
   "url": "http://127.0.0.1:4444/video/mjpeg",
-  "width": 336,
-  "height": 448,
   "fps": 8,
   "grabIntervalMs": 70,
   "rotate": 90,
   "camera": "back",
-  "mode": "general"
+  "mode": "normal"
 }
 ```
+
+> `width` / `height` 不写就按模式取默认（normal 420×560、guide 336×448，**两者都是 197 token**）；
+> 写死了就以你的为准，模式不再改画布。
 
 ### `rotate` 必须是 90（否则画面是歪的）
 
@@ -101,10 +105,24 @@ IP Camera App（`GET /?camera=back&rotate=90`，App 侧持久化），再开始�
 see_phone({ action: "watch" })                    // 默认：等多帧宫格（和桌面 see_now 一样）
 see_phone({ action: "peek" })                     // 不等待，领走已攒好的图
 see_phone({ action: "look" })                     // 单帧「此刻」，用户插话时用
-see_phone({ action: "status" })                   // 后端、帧率、抓拍成功/失败数、上次错误
+see_phone({ action: "status" })                   // 后端、帧率、抓拍成功/失败数、模式、上次错误
 see_phone({ action: "stop" })                     // 放掉摄像头，别一直耗电
-see_phone({ action: "look", mode: "guide" })      // 导盲话术（后续定制，默认不用）
+see_phone({ action: "look", mode: "guide" })      // 导盲话术（用户看不见时才用）
 ```
+
+### 两种模式（0.3.0）
+
+| | `normal`（默认） | `guide` |
+|---|---|---|
+| 读者 | 用户自己看得见画面 | 用户看不见（导盲） |
+| 附文 | 宫格时间线 + 「你自己看得见，别替他描述」 | 先风险、再通路、最后动作，一两句 |
+| 画布 | 420×560 | 336×448 |
+| App 朗读 | 只上字幕 | 默认念出来 |
+
+优先级：**调用参数 > App 顶栏开关 > `see-phone.json` 的 `mode` > normal**。
+App 的开关写在 `/sdcard/Download/DSH-Go/mode.txt`，插件每次工具调用都读一次 ——
+点一下开关，下一次调用就换口吻，不用重启插件、也不用重连 dsh-go。
+旧值 `general` 等同 `normal`（存量配置不会炸）。
 
 `watch` 的阻塞就是"暂停"，回完话再调一次；静止画面会一直攒着不打扰你（省 token 的设计）。
 配置改了不用再重载插件：每次调用会比对 `see-phone.json`，变了就自动重建采集会话；

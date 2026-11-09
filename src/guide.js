@@ -1,9 +1,13 @@
 /**
- * guide.js — 交给模型的「这是给盲人看的画面」说明。
+ * guide.js — 出图时附在文本里的那段说明。**按模式两套。**
  *
  * 为什么单独一个文件：这段文字**每次出图都要重发一遍**，而不是只写在工具描述里。
  * 工具描述会被长会话滚远，模型看到图的那一刻手上只有这段。所以它必须短、必须是
  * 祈使句、必须直接约束输出格式。
+ *
+ * `buildLookText`  = normal（默认）：用户自己看得见，别替他下结论；
+ * `buildGuideText` = guide：用户看不见，只说他需要的。
+ * 两套都**不许**写"你看"以外的假设 —— 说错读者比说错画面更贵。
  */
 
 /**
@@ -41,11 +45,17 @@ const QUALITY_LINE = {
  * @param {string} p.quality          gradeView 的结果
  * @param {number} p.spokenPacingSec  上次说话到现在过了多久（怕把用户念烦）
  */
-/** 出图时附在文本里的一段话（general 模式：与桌面 see_now 一致）。 */
+/**
+ * 出图时附在文本里的一段话（normal 模式：和桌面 `see_now` 一样说话）。
+ *
+ * 这里刻意**不提"用户看不见"** —— 0.2.x 的版本写了，结果模型不管用户说什么都用
+ * 导盲口吻回答。默认读者的画像必须写对：他能看见画面，图是给他自己确认/讨论用的。
+ */
 export function buildLookText({ note = null, ageSec = 0, frames = 1, quality = 'good', backend = 'http-raw' } = {}) {
   const parts = [];
-  parts.push(`这是手机摄像头/屏幕的画面，共 ${frames} 帧，按「画面变化」挑出来的 —— `
+  parts.push(`手机摄像头的画面，共 ${frames} 帧，按「画面变化」挑出来的 —— `
     + '静止时帧少、变化多时帧多。编号按时间先后。');
+  parts.push('用户自己看得见这块画面；这是给他确认、或者跟你一起看的图，别替他描述他已经知道的东西。');
   if (note) parts.push(`用户刚说：「${note}」。按这句话决定重点。`);
   const q = QUALITY_LINE[quality] ?? '';
   if (q) parts.push(q);
@@ -57,7 +67,7 @@ export function buildLookText({ note = null, ageSec = 0, frames = 1, quality = '
 }
 
 /**
- * 导盲模式的读图规范。**后续定制用，general 模式不走这里。**
+ * 导盲模式的读图规范。**只有 `mode:"guide"` 走这里。**
  * 这段每次出图都要重发，而不是只写在工具描述里 —— 工具描述会被长会话滚远，
  * 模型看到图的那一刻手上只有它。所以必须短、必须是祈使句、必须直接约束输出格式。
  */
