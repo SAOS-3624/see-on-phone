@@ -1,5 +1,5 @@
 /**
- * SeeNow Phone Version — 手机摄像头版的 SeeNow。
+ * See on Phone — 手机摄像头版的 SeeNow。
  *
  * ============================ 它和 see-now 是什么关系 ============================
  *
@@ -687,7 +687,7 @@ export async function apply(ctx) {
  *
  * 判据同 see-now：**删掉这句，模型会不会用错？** 会 → 进契约；不会 → 进这里。
  */
-const HELP = `SeeNow Phone Version · 手机摄像头
+const HELP = `See on Phone · 手机摄像头
 
 ## 它在做什么
 手机摄像头 → 缩放成 rgb24 → 打分/切点 → 装箱 DP 拼图 → 图片附件交给宿主。
