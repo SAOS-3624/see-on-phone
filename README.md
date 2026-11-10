@@ -1,4 +1,4 @@
-# SeeNow Phone Version
+# See on Phone
 
 > **手机版 see-now**：保留桌面版原有的「打分 → 挑帧 → 多帧宫格 → 时间线」能力，
 > 只把采集源从电脑屏幕换成手机摄像头。
