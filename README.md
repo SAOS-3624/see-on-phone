@@ -27,7 +27,8 @@
 | 读者 | 看得见屏幕的人 | `normal` 看得见 / `guide` 看不见 |
 
 引擎 `src/engine/` 的 9 个文件来自 `dsh-see-now` **0.2.1**（0.3.0 同步了
-`pack.solveSkyline` / `packTiers` / `tierCurve` / `tierMode` 那批改进），零宿主依赖（只用 `node:zlib`）。
+`pack.solveSkyline` / `packTiers` / `tierCurve` / `tierMode` 那批改进；0.3.1 补了
+`tuning.js` / `pace.js`，把**设置与节奏档**也接上，见第 4 节），零宿主依赖（只用 `node:zlib`）。
 **采集层整个重写**：Android 上普通进程看不到 `/dev/video*`，桌面那套 ffmpeg 设备枚举一个都用不了。
 
 ### 为什么独立成包而不是给 see-now 加 `--camera`
@@ -117,6 +118,7 @@ see_phone({ action: "look", mode: "guide" })      // 导盲话术（用户看不
 | 读者 | 用户自己看得见画面 | 用户看不见（导盲） |
 | 附文 | 宫格时间线 + 「你自己看得见，别替他描述」 | 先风险、再通路、最后动作，一两句 |
 | 画布 | 420×560 | 336×448 |
+| 出图口径 | 攒多帧宫格（同桌面 `normal`） | **逐帧**：一张图一个画面、格子撑满 |
 | App 朗读 | 只上字幕 | 默认念出来 |
 
 优先级：**调用参数 > App 顶栏开关 > `see-phone.json` 的 `mode` > normal**。
@@ -127,6 +129,52 @@ App 的开关写在 `/sdcard/Download/DSH-Go/mode.txt`，插件每次工具调�
 `watch` 的阻塞就是"暂停"，回完话再调一次；静止画面会一直攒着不打扰你（省 token 的设计）。
 配置改了不用再重载插件：每次调用会比对 `see-phone.json`，变了就自动重建采集会话；
 也可以显式 `see_phone({action:"reload"})`。（0.1.x 早期版本只在启动时读一次配置，已修。）
+
+### 出图算法与设置（0.3.1 起与桌面版同源）
+
+引擎文件一直是同一份，但**参数是在调用侧拼的** —— 0.3.0 之前这里只传了
+`{width, height, fps, queueDepth}`，其余全部退回 `pipeline.js::DEFAULTS`，于是：
+
+| 键 | 0.3.0 实际值（DEFAULTS） | 桌面版口径 | 后果 |
+|---|---|---|---|
+| `strategy` | `native`（1 档也占满整幅） | `standard`（1 档压成 2 档） | 单帧图吃满画布、多帧时张数变多 |
+| `floorGapK` | `0`（关掉自适应兜底） | `2`（兜底 = 2×近期出帧间隔，夹 2~20s） | 半动的画面长时间不给图 |
+| `tierThresholds` | `null` | 用户配的 7 道（默认同 `docx`） | 自定义阈值不生效 |
+
+0.3.1 起这些键**全部按桌面版 `runner.js::start()` 传**，并且设置文件用**同一套键名**
+（`~/.dsh/see-phone.json`，与 `~/.dsh/see-now.json` 一份文档管两个插件）：
+
+```json
+{
+  "tierStyle": "standard",
+  "tierMode": "density",
+  "tierCurve": "docx",
+  "tierThresholds": [0.26, 0.6, 0.9, 1.2, 1.8, 2.4, 3.0],
+  "tierMap": [1, 2, 3, 4, 5, 6, 7, 8],
+  "defaultPace": "normal",
+  "scoreNormalize": true,
+  "changeLog": false,
+  "audioStrip": false
+}
+```
+
+上面就是全部默认值。改任意一项 → 下一次工具调用生效（重开一次摄像头，约 1 秒）；
+写错了退回默认并在 `status` 里报原因。
+
+节奏档 `pace`（工具参数，粘性）：`calm` / `normal` / `dense` / `game-economic`，
+切点门槛 20 / 12 / 7 / 80，兜底间隔跟着换一张 —— 表在 `src/engine/pace.js`，
+与桌面版逐字一致。
+
+两处**手机特有**、桌面版没有对应的：
+
+- `audioStrip` **默认关**。桌面版默认开是因为它手里真有 RMS 音量；手机没有听声音那条链，
+  开着只会画一条恒定静音条（占 3% 高度，还会让模型以为"这段时间没声音"）。
+  桌面版自己在 `region` 模式（同样拿不到音量）也是关的，同一个判断。
+- `guide` 走桌面版的**逐帧模式**（`SCENE_OPTS`：`maxFrames:1` + `strategy:"single"`）。
+  `standard` 会把 1 档压成 2 档，而 `look` 的图里只有一帧 —— 不钉住整幅，导盲用户
+  看到的就是"四分之一是画面、其余全是灰"。
+
+这层约束有回归测试守着：`test/pipeline-parity.test.mjs`（改期望值 = 改桌面版口径，先去改 `dsh-see-now`）。
 
 ---
 

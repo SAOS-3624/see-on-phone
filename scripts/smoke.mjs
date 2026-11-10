@@ -9,6 +9,8 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createPipeline } from '../src/engine/pipeline.js';
+import { readTuning } from '../src/engine/tuning.js';
+import { pipelineOptions } from '../src/index.js';
 import { openCamera } from '../src/cam/camera.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -23,8 +25,18 @@ const filePath = process.argv[4] ?? null;
 const W = 336;
 const H = 448;
 
+/**
+ * **走生产路径的参数**（`pipelineOptions`），不是手搓一份 —— 冒烟的意义就是
+ * "装上去之后跑的那一套到底通不通"，手搓参数会漏掉移植进来的档位/节奏设置。
+ */
 const pipeline = createPipeline({
-  width: W, height: H, fps: 8,
+  ...pipelineOptions({
+    size: { width: W, height: H },
+    fps: 8,
+    mode: 'guide',
+    tune: readTuning(),
+    pace: 'normal',
+  }),
   // 导盲先按"持续观察"跑：不做长时差，越新鲜越好
   queueDepth: 4,
 });

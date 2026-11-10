@@ -19,6 +19,8 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createPipeline } from './engine/pipeline.js';
+import { readTuning } from './engine/tuning.js';
+import { PACES, SCENE_OPTS, DEFAULT_PACE } from './engine/pace.js';
 import { openCamera } from './cam/camera.js';
 import { seePhoneToolSpec, TOOL_NAME, DEFAULT_WAIT_SEC } from './tool-spec.js';
 import { buildLookText, buildGuideText, buildStatusText, gradeView } from './guide.js';
@@ -53,6 +55,17 @@ function serviceOf(ctx, key) {
 function toLosslessJson(value) {
   if (value === undefined) return null;
   return JSON.parse(JSON.stringify(value));
+}
+
+/**
+ * 出图相关设置的签名。只看**会影响管线输出的那几个键** —— `listen` 段和
+ * `imageTrigger` 这些手机上根本没接，它们变了不该白白重开一次摄像头。
+ */
+export function tuningSignature(t) {
+  return JSON.stringify([
+    t?.tierStyle, t?.tierMap, t?.tierMode, t?.tierCurve, t?.tierThresholds,
+    t?.scoreNormalize, t?.changeLog, t?.defaultPace,
+  ]);
 }
 
 function loadConfig() {
@@ -105,12 +118,95 @@ function buildPreset(cfg) {
 }
 
 /**
+ * 建管线用的参数 —— **这一份就是 see-now 的口径，一个字都不许自己发挥**。
+ *
+ * 桌面版 `see-now/src/runner.js::start()` 建 `createPipeline` 时传的就是这几组：
+ * `PACES[pace].pipeline` → `strategy`（=设置页的 tierStyle）→ `tierMap` / `tierMode` /
+ * `tierCurve` / `tierThresholds` → `scoreNormalize` → `changeLog` → `cutAbs`。
+ *
+ * 0.3.0 之前这里只有 `{width, height, fps, queueDepth}`，等于把上面那一整套
+ * **全部退回 `pipeline.js::DEFAULTS`**。后果不是"略差"，是三处会真出错：
+ *
+ * - `strategy` 落到 `native`（而 see-now 的默认是 `standard` = 1 档压成 2 档）：
+ *   单帧图会占满整幅、多帧时张数爆炸 —— see-now 改成 standard 就是为了这个。
+ * - `floorGapK` 落到 0：自适应兜底整个关掉，只剩固定的 `silentFloorSec: 20`，
+ *   半动的画面（出帧间隔 2~10 秒）会长时间不给图。
+ * - `tierThresholds` 落到 null：阈值表跟着 `tierCurve` 走，用户配的自定义七道不生效。
+ *
+ * @param {{size:{width:number,height:number}, fps:number, mode:string,
+ *          tune:object, pace:string, audioStrip:boolean}} p
+ */
+export function pipelineOptions({ size, fps, mode, tune, pace, audioStrip = false }) {
+  const paceName = PACES[pace] ? pace : DEFAULT_PACE;
+  const p = PACES[paceName];
+
+  /**
+   * 导盲 = 桌面版的「逐帧模式」（`scene:true`）：一张图一个画面，格子必须撑满。
+   *
+   * 为什么非这样不可：`standard` 会把 1 档压成 2 档，而 `look` 的宫格里**只有一帧** ——
+   * 不压的话这一帧只占 1/4 画布，导盲用户看到的就是一张"四分之一是画面、其余是灰"的图。
+   * `SCENE_OPTS` 的 `strategy:'single'` 正是为这种情况准备的（见 pace.js 的注释），
+   * 两个键**必须成对**出现。
+   */
+  if (mode === 'guide') {
+    return {
+      width: size.width, height: size.height, fps,
+      // 导盲不排队：手上有一张够新就够，攒着没意义
+      queueDepth: 1,
+      ...SCENE_OPTS,
+      // 逐帧模式的切点门槛跟 `dense` 走（同 see-now 的 `sceneMode ? PACES.dense : ...`）
+      cutAbs: PACES.dense.cutAbs,
+      // 档位映射由 SCENE_OPTS 钉成 single，但**怎么算档位**仍然听设置的
+      tierMode: tune.tierMode,
+      tierCurve: tune.tierCurve,
+      tierThresholds: tune.tierThresholds,
+      scoreNormalize: tune.scoreNormalize,
+      changeLog: tune.changeLog,
+      audioStrip,
+      /**
+       * 帧率归一化：手机的实际 fps 是 6~17 档（配置默认 8），和电脑版的 12fps 基准差得远 ——
+       * 不折算的话 `smoothFrames` / `BAR_WINDOW` / `cutBgWindow` 这三处"按帧的窗口"
+       * 在 8fps 下会变成 0.75s / 3s / 0.75s（12fps 是 0.5 / 2 / 0.5）。
+       * 详见 `engine/pipeline.js` 的 `timeNormalizeFrames`。
+       */
+      timeNormalizeFrames: true,
+    };
+  }
+
+  return {
+    width: size.width, height: size.height, fps,
+    queueDepth: 1,
+    // 节奏档自带的管线覆盖（积分阈值、每张帧数、兜底间隔…）
+    ...(p.pipeline ?? {}),
+      /**
+       * 帧率归一化：手机的实际 fps 是 6~17 档（配置默认 8），和电脑版的 12fps 基准差得远 ——
+       * 不折算的话 `smoothFrames` / `BAR_WINDOW` / `cutBgWindow` 这三处"按帧的窗口"
+       * 在 8fps 下会变成 0.75s / 3s / 0.75s（12fps 是 0.5 / 2 / 0.5）。
+       * 详见 `engine/pipeline.js` 的 `timeNormalizeFrames`。
+       */
+      timeNormalizeFrames: true,
+    strategy: tune.tierStyle,
+    ...(tune.tierStyle === 'custom' ? { tierMap: tune.tierMap } : {}),
+    tierMode: tune.tierMode,
+    tierCurve: tune.tierCurve,
+    tierThresholds: tune.tierThresholds,
+    scoreNormalize: tune.scoreNormalize,
+    changeLog: tune.changeLog,
+    // 切点门槛跟当前节奏档走。（see-now 特有的一条：回放本地视频时**不传 pace 就用 dense**，
+    // 因为 12fps 采样会吃掉快切；手机只有实时摄像头，没有这条分支。）
+    cutAbs: p.cutAbs,
+    audioStrip,
+  };
+}
+
+/**
  * 摄像头会话：采集 + 管线 + 最近一帧。
  *
  * 单例。手机上只有一个摄像头，两个会话必然互相抢。
- * `mode` 只影响**画布尺寸**（见 mode.js 的 MODE_SIZES），管线/打分/拼图完全一样。
+ * `mode` 只影响**画布尺寸**（见 mode.js 的 MODE_SIZES）与逐帧/攒图口径；
+ * 打分、切点、拼图仍是 see-now 那一份。
  */
-function createSession(cfg, mode) {
+function createSession(cfg, mode, tune, pace) {
   const size = sizesFor(mode, cfg);
   const camBackend = cfg.backend ?? 'http-mjpeg';
   const camOpts = {
@@ -132,17 +228,24 @@ function createSession(cfg, mode) {
     ffmpegPath: cfg.ffmpegPath ?? 'ffmpeg',
   };
 
-  const pipeline = createPipeline({
-    width: size.width,
-    height: size.height,
-    fps: camOpts.fps,
-    // 导盲不排队：手上有一张够新就够，攒着没意义
-    queueDepth: 1,
-  });
+  /**
+   * 音轨条默认**关**（`cfg.audioStrip === true` 才开）。
+   *
+   * 桌面版默认开，因为那条链手里真有 RMS 音量（`listen.levelsBetween`）。手机没有
+   * 听声音那条链，`audio: null` 会让 `drawAudioStrip` 画一条**恒定静音条** ——
+   * 白占 3% 高度（336 宽时 14px），还会让模型以为"这段时间没声音"。
+   * see-now 自己在 region 模式（也是拿不到音量）就是这么关的，同一个判断。
+   */
+  const pipeline = createPipeline(pipelineOptions({
+    size, fps: camOpts.fps, mode, tune, pace, audioStrip: cfg.audioStrip === true,
+  }));
 
   const state = {
     size, camOpts, pipeline,
     mode,
+    // 记下这条管线是「按哪一档节奏、哪一版设置」建的：ensure() 靠它发现该不该重建
+    pace,
+    tuneSig: tuningSignature(tune),
     cam: null,
     startedAt: 0,
     lastWall: 0,
@@ -210,6 +313,20 @@ export async function apply(ctx) {
   // 插件原来只在启动时读一次配置，改完 see-phone.json 必须重载插件才生效
   // （dsh-go 上真踩过）。改成每次调用比对，变了就重建会话。
   let cfgSnapshot = JSON.stringify(cfg);
+  /**
+   * 出图设置（`~/.dsh/see-phone.json` 的 `tierStyle` / `tierCurve` / `defaultPace` …）。
+   * 键名与桌面版 `~/.dsh/see-now.json` **完全一样**，一份文档管两个插件。
+   *
+   * 每轮重读 + 签名比对：改完文件下一次工具调用就生效，不用重启插件
+   * （`readTuning` 只读一个几百字节的文件，比维护 mtime 缓存更不容易出错）。
+   */
+  let tune = readTuning({ env: process.env });
+  let tuneSnapshot = tuningSignature(tune);
+  /**
+   * 当前节奏档。和 see-now 一样是**粘性**的：`args.pace` 改一次就一直生效，
+   * 直到设置文件里的 `defaultPace` 变了（那次以文件为准）。
+   */
+  let paceMode = PACES[tune.defaultPace] ? tune.defaultPace : DEFAULT_PACE;
   let session = null;
   // `args.camera` 覆盖配置里的 camera；null = 跟配置走。
   // 摄像头是单例资源，换摄像头只能整个会话重建。
@@ -221,20 +338,28 @@ export async function apply(ctx) {
   /**
    * 拿会话；没有就建。任何 action（除 help/status 未启动）都要先过这里。
    *
-   * 换模式 = 换画布尺寸。管线在 `createPipeline()` 时就把 width/height 定死了，
-   * 所以尺寸变了只能整个重建（摄像头也是单例，本来就只能有一个）。
+   * 换模式 / 换节奏 / 改设置 = 换一套管线参数。管线在 `createPipeline()` 时就把
+   * width/height/strategy/cutAbs 全定死了，所以只能整个重建（摄像头也是单例，
+   * 本来就只能有一个）。
    */
-  async function ensure(mode) {
+  async function ensure(mode, pace) {
     const want = sizesFor(mode, cfg);
+    const wantPace = PACES[pace] ? pace : DEFAULT_PACE;
     if (session?.cam) {
-      if (session.size.width === want.width && session.size.height === want.height) return session;
-      log('画布尺寸变了', `${session.size.width}×${session.size.height}`, '→', `${want.width}×${want.height}`);
+      const sameShape = session.size.width === want.width
+        && session.size.height === want.height
+        && session.mode === mode
+        && session.pace === wantPace
+        && session.tuneSig === tuneSnapshot;
+      if (sameShape) return session;
+      log('管线参数变了', `${session.size.width}×${session.size.height}/${session.mode}/${session.pace}`,
+        '→', `${want.width}×${want.height}/${mode}/${wantPace}`);
       await session.stop();
       session = null;
     }
     if (!session) {
       const base = activeCamera ? { ...cfg, camera: activeCamera } : cfg;
-      session = createSession(base, mode);
+      session = createSession(base, mode, tune, wantPace);
     }
     try {
       await session.start();
@@ -262,7 +387,7 @@ export async function apply(ctx) {
   }
 
   async function doLook(args, mode) {
-    const s = await ensure(mode);
+    const s = await ensure(mode, paceMode);
     const waitSec = Number.isFinite(Number(args.wait)) && Number(args.wait) > 0
       ? Math.min(Number(args.wait), 30)
       : DEFAULT_WAIT_SEC;
@@ -304,7 +429,7 @@ export async function apply(ctx) {
   }
 
   async function doWatch(args, mode) {
-    const s = await ensure(mode);
+    const s = await ensure(mode, paceMode);
     const waitSec = Number.isFinite(Number(args.wait)) && Number(args.wait) > 0
       ? Math.min(Number(args.wait), 120)
       : DEFAULT_WAIT_SEC * 4;
@@ -376,12 +501,20 @@ export async function apply(ctx) {
   }
 
   async function doStatus(mode) {
+    const tuneLine = `设置：档位 ${tune.tierStyle}　节奏 ${paceMode}（切点 ${PACES[paceMode].cutAbs}）`
+      + `　曲线 ${tune.tierCurve}　归一 ${tune.scoreNormalize ? '开' : '关'}`
+      + `　变化日志 ${tune.changeLog ? '开' : '关'}`
+      + `${tune.path ? `\n设置文件：${tune.path}` : ''}`
+      + `${tune.warnings?.length ? `\n⚠ ${tune.warnings.join('；')}` : ''}`;
     if (!session) {
       return {
         text: `还没启动过摄像头。配置：${JSON.stringify(cfg)}\n`
-          + `模式：${describeMode(mode)}\n`
+          + `模式：${describeMode(mode)}\n${tuneLine}\n`
           + '调一次 `see_phone({action:"look"})` 就会按配置文件启动。',
-        meta: { ok: true, running: false, mode },
+        meta: {
+          ok: true, running: false, mode, pace: paceMode,
+          tierStyle: tune.tierStyle, tierCurve: tune.tierCurve,
+        },
       };
     }
     const snap = session.snapshot();
@@ -394,20 +527,38 @@ export async function apply(ctx) {
     const modeLine = `模式：${describeMode(sessMode)}　画布：${session.size.width}×${session.size.height}`
       + (sessMode === mode ? '' : `\n（本次调用解析为 ${mode}，下次取帧会按它重建画布）`);
     return {
-      text: `${t}\n${modeLine}\n`
+      text: `${t}\n${modeLine}\n${tuneLine}\n`
         + `声音：${JSON.stringify(ttsState())}\n收件箱：${JSON.stringify(ib)}`,
-      meta: { ok: true, running: snap.running, backend: snap.backend, mode, sessionMode: sessMode, tts: ttsState(), inbox: ib },
+      meta: {
+        ok: true, running: snap.running, backend: snap.backend, mode,
+        sessionMode: sessMode, pace: session.pace ?? paceMode,
+        tierStyle: tune.tierStyle, tierCurve: tune.tierCurve,
+        tts: ttsState(), inbox: ib,
+      },
     };
   }
 
-  /** 配置变了就重建会话；返回是否重建过，供 status 提示 */
+  /**
+   * 两张配置都重读：`see-phone.json` 里既有采集项（backend/url/rotate…），
+   * 也有出图设置（tierStyle/defaultPace…）。任一张变了就重建会话。
+   *
+   * @returns {boolean} 是否重建过（status 用它提示"下次取帧用新参数"）
+   */
   async function refreshConfig() {
     const fresh = loadConfig();
     const snap = JSON.stringify(fresh);
-    if (snap === cfgSnapshot) return false;
+    const freshTune = readTuning({ env: process.env });
+    const tuneSnap = tuningSignature(freshTune);
+    const cfgDirty = snap !== cfgSnapshot;
+    const tuneDirty = tuneSnap !== tuneSnapshot;
+    if (!cfgDirty && !tuneDirty) return false;
     cfg = fresh;
     cfgSnapshot = snap;
-    activeCamera = null;          // 文件改了，camera 覆盖作废，回到配置值
+    tune = freshTune;
+    tuneSnapshot = tuneSnap;
+    if (cfgDirty) activeCamera = null;          // 文件改了，camera 覆盖作废，回到配置值
+    // 设置文件改了就以它为准（同 see-now：启动时从 tuning 取默认档）
+    if (tuneDirty) paceMode = PACES[tune.defaultPace] ? tune.defaultPace : DEFAULT_PACE;
     if (session) { await session.stop(); session = null; }
     return true;
   }
@@ -424,6 +575,14 @@ export async function apply(ctx) {
      */
     const picked = resolveMode({ arg: args.mode, app: readAppMode(), cfg: cfg.mode });
     const mode = picked.mode;
+
+    /**
+     * 节奏档（同 see-now）：`args.pace` 传一次就**粘住**，之后每次调用都沿用，
+     * 直到再传一个新值或设置文件的 `defaultPace` 变了。
+     * 换档 = 换一套管线参数，`ensure()` 发现 `session.pace` 不一致会自己重建。
+     */
+    const wantPace = String(args.pace ?? '').trim().toLowerCase();
+    if (PACES[wantPace]) paceMode = wantPace;
 
     // 换摄像头：args.camera 和当前不一致就重建（摄像头单例，只能整个换）
     const wantCam = String(args.camera ?? '').toLowerCase();
@@ -538,11 +697,30 @@ const HELP = `SeeNow Phone Version · 手机摄像头
 - \`normal\`（**默认**）：用户自己看得见画面。按普通会话回答，宫格按时间线摊开，
   不假设用户看不见、不强制念出来。
 - \`guide\`：用户看不见（导盲）。单帧「此刻」、先风险后通路、一句到两句，可以直接念。
+  出图走**逐帧模式**（一张图一个画面、格子撑满画布），不做多帧宫格。
 旧值 \`general\` 等同 \`normal\`。优先顺序：调用参数 > 手机 App 的开关 > 配置文件 > normal。
 「看见」App 顶栏一点就切，写在 /sdcard/Download/DSH-Go/mode.txt ，下一次工具调用即生效。
 
 画布随模式变：normal 420×560、guide 336×448 —— 两者计费都是 197 token（小于 544²
 会被地板放大到同一网格），所以正常模式白得 56% 像素。
+
+## 节奏档（pace）与设置
+出图频率由 \`pace\` 定，粘性：\`calm\` / \`normal\`（默认）/ \`dense\` / \`game-economic\`。
+切点门槛分别是 20 / 12 / 7 / 80，兜底间隔（floorGapK）也跟着换一张。
+
+设置写在 \`~/.dsh/see-phone.json\`，**键名与桌面版 \`~/.dsh/see-now.json\` 完全一样**
+（一份文档管两个插件）。只列会影响出图的：
+- \`tierStyle\`：\`standard\`（默认，1 档压成 2 档）/ \`native\`（1 档也占满整幅）/ \`full\` / \`compact\` / \`custom\`
+- \`tierMap\`：\`tierStyle:"custom"\` 时的逐档映射（8 个数，1~8）
+- \`tierMode\`：\`density\`（默认）/ \`weight\`
+- \`tierCurve\`：\`docx\`（默认）/ \`perceptual\` / \`custom\`
+- \`tierThresholds\`：7 个「帧/秒」阈值，必须严格递增
+- \`defaultPace\`：\`calm\` / \`normal\` / \`dense\` / \`game-economic\`
+- \`scoreNormalize\`：亮度归一 + 黑边补偿，默认 **开**
+- \`changeLog\`：交付时附「这段时间画面怎么动」，默认关
+- \`audioStrip\`：手机没有音频通道，默认 **关**（置 true 会画一条恒定静音条，占 3% 高度，不推荐）
+
+改完下一次工具调用就生效（会重开一次摄像头，约 1 秒）；写错了会退回默认并在 \`status\` 里报原因。
 
 ## 采集后端（配置文件 ~/.dsh/see-phone.json 的 backend）
 - \`http-mjpeg\`（**手机默认**）：插件直连「看见」App 的 MJPEG 流，内置 jpeg-js 解码。

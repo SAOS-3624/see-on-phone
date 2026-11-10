@@ -1,6 +1,6 @@
 {
   "name": "dsh-see-now-phone",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "SeeNow Phone Version — 手机版 see-now：保留桌面版多帧宫格能力，采集源换成手机摄像头；normal / guide 两种读者显式选。",
   "keywords": [
     "dsh",

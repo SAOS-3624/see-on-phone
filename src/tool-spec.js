@@ -72,6 +72,22 @@ export function seePhoneToolSpec() {
         type: 'number',
         description: `Seconds to wait for a usable frame before giving up (default ${DEFAULT_WAIT_SEC}).`,
       },
+      /**
+       * 节奏档。与桌面版 `see_now` 的 `pace` 是**同一张表**（见 engine/pace.js），
+       * 只有一处口径不同：手机没有自动叫醒那条链，所以它控制的是"多久算一次画面变了"。
+       */
+      pace: {
+        type: 'string',
+        description: '"calm" | "normal" (default) | "dense" | "game-economic" — how often the picture '
+          + 'counts as "changed" (cut threshold) and how often a still scene still gets a frame.\n'
+          + 'User says **"太密了 / 太频繁 / 省点电 / 慢一点 / 别老说话"** → `pace:"calm"`. '
+          + 'This is the only switch that actually lowers how many images you get; promising to talk '
+          + 'less changes nothing.\n'
+          + 'User complains **"漏了 / 不灵敏 / 太迟钝 / 没抓到"** → `pace:"dense"` (costlier).\n'
+          + 'Handheld shake or fast motion where the image "糊得看不清 / 全是运动" → `pace:"game-economic"`; '
+          + 'it is only for fast motion — static scenes will lose most frames.\n'
+          + 'Sticky: it stays until you change it again. Changing it restarts the camera (~1s).',
+      },
       camera: {
         type: 'string',
         description: '"back" (default) | "front". Back camera sees the way ahead.',

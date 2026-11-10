@@ -112,3 +112,25 @@ test('stop 之后 status 说没在跑', async (t) => {
   const st = await host.tools[0].execute({ action: 'status' });
   assert.equal(st.meta.running, false);
 });
+
+/**
+ * `HELP` 是模板字符串 —— 正文里塞一个**裸反引号**就会把整个字符串截断，
+ * 表现是 `help` 只回半句话（或者直接语法错）。这条测试钉住"它还是完整的"。
+ */
+test('help 是完整的（模板字符串没被反引号截断）', async (t) => {
+  const host = await boot(t);
+  const out = await host.tools[0].execute({ action: 'help' });
+  assert.match(out.text, /^SeeNow Phone Version/);
+  assert.ok(out.text.length > 900, `help 只有 ${out.text.length} 字，多半被截断了`);
+  assert.match(out.text, /节奏档（pace）/);
+  assert.match(out.text, /tierStyle/);
+  assert.match(out.text, /已知限制/);
+});
+
+test('status 报当前档位与设置（改了文件要看得出改没改到）', async (t) => {
+  const host = await boot(t);
+  const st = await host.tools[0].execute({ action: 'status' });
+  assert.equal(st.meta.tierStyle, 'standard');
+  assert.equal(st.meta.pace, 'normal');
+  assert.match(st.text, /档位 standard/);
+});
