@@ -7,7 +7,7 @@
 > `mode:"guide"` 才是导盲（看不见 → 只给结论和动作）。0.2.x 把导盲当成唯一定位写死，
 > 于是点一下「看一眼」也被当盲人接话 —— 0.3.0 修的就是这个。
 
-- npm：`dsh-see-now-phone`
+- npm：`dsh-see-on-phone`
 - 工具名：`see_phone`
 - 依赖：Node ≥ 20；手机场景另需「看见」App（`phone/dsh-eye`，一个 App 顶摄像头 + TTS）
 
@@ -17,7 +17,7 @@
 
 **同一套引擎，两个采集源。**
 
-| | `dsh-see-now`（桌面） | `dsh-see-now-phone` |
+| | `dsh-see-now`（桌面） | `dsh-see-on-phone` |
 |---|---|---|
 | 采集 | 屏幕：ddagrab / gdigrab / portal / PipeWire | **摄像头**：MJPEG / 抓拍 / RTSP |
 | 引擎 | 打分、切点、装箱 DP、拼图、PNG、token 换算 | **整块 vendor 过来**，随桌面版一起升级 |

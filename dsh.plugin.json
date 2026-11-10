@@ -1,9 +1,9 @@
 {
-  "name": "dsh-see-now-phone",
+  "name": "dsh-see-on-phone",
   "description": "See on Phone — let DSH look through the phone's camera: frame scoring, change detection, multi-frame sheets. Two readers, picked explicitly: normal (the user can see it) or guide (blind navigation).",
   "version": "0.3.1",
   "entry": {
-    "name": "dsh-see-now-phone",
+    "name": "dsh-see-on-phone",
     "inject": [
       "tools",
       "attachments"
