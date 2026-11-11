@@ -3,8 +3,9 @@
  *
  * 为什么要有它：早期版本把「拉流 → 解码 → rgb24」放在 Termux 的一个 python
  * 进程里（外加 ffmpeg 子进程 + watchdog）。华为锁屏会把这几个后台进程一次性
- * 全清掉，整条链就断。现在把解码器 vendor 进插件（jpeg-js，BSD-3-Clause，
- * 40KB，纯 JS），采集链只剩 IP Camera 一个外部程序，插件跟着 dsh-go 活。
+ * 全清掉，整条链就断。现在把解码器 vendor 进插件（jpeg-js 0.4.4，纯 JS，40KB：
+ * 封装 BSD-3-Clause，`lib/decoder.js` 是 notmasteryet 的 Apache-2.0，
+ * 两份许可见 `vendor/jpeg-js/NOTICE.md`），采集链只剩 IP Camera 一个外部程序。
  *
  * 帧从字节流里按 SOI/EOI 抠：JPEG 熵编码里 0xFF 会转义成 0xFF00，
  * 所以 0xFFD9 只可能是真的帧结束符，不用解析 multipart boundary。
@@ -52,7 +53,7 @@ function coverToRgb(rgb, sw, sh, W, H) {
  * （华为 nova 11 实测），不转的话：
  *   - 600×800 的竖构图会被当成 800×600 横图，`cover` 缩放要横向裁掉 44% 画面；
  *   - 模型描述的"左/右/前"全部错位，导盲直接失效。
- * 转 90° 之后源是 600×800 = 3:4，和 336×448 完全同比例，`cover` 零裁切。
+ * 转 90° 之后源是 600×800 = 3:4，和 471×628 完全同比例，`cover` 零裁切。
  */
 function controlEndpoint(url) {
   try {

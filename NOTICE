@@ -1,0 +1,59 @@
+# NOTICE
+
+Copyright 2026 SAOS-3624
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+## What this project does NOT do
+
+The Apache-2.0 grant above covers **the source code of this package**, and nothing else.
+
+- **It does not upload frames anywhere.** The camera stream is decoded on the phone, inside the
+  plugin process. No server, no relay, no analytics.
+- **It does not record audio.** The phone build has no audio path; `audioStrip` is off by default
+  and there is no audio source to put in it.
+- **It does not open the camera by itself.** It reads whatever MJPEG/RTSP endpoint or frame source
+  you point it at, from an app you installed and started.
+- **It does not host, mirror or redistribute any video.** Nothing is bundled.
+- **You are responsible for what you point it at** — including whether photographing a given
+  place or person is lawful where you are.
+
+## Third-party components
+
+Two licences cover different files of the one vendored component. Both allow commercial use.
+
+| Component | Files | Licence | Copyright |
+|---|---|---|---|
+| `jpeg-js` 0.4.4 | `src/cam/vendor/jpeg-js/index.js`, `package.json`, wrapper | BSD-3-Clause | © 2014 Eugene Ware — full text in `src/cam/vendor/jpeg-js/LICENSE` |
+| `jpeg-js` 0.4.4 | `src/cam/vendor/jpeg-js/lib/decoder.js` | **Apache-2.0** | © 2011 notmasteryet — full text in `src/cam/vendor/jpeg-js/LICENSE-APACHE.txt` |
+
+`lib/decoder.js` is not byte-identical to upstream: the JPEG **encoder** was removed and the export
+changed from `{decode, encode}` to a bare `decode`. Those changes are stated in the file header, as
+Apache-2.0 §4(b) requires. Details: `src/cam/vendor/jpeg-js/NOTICE.md`.
+
+The upstream npm package ships only the BSD-3 `LICENSE`; the Apache-2.0 half has no licence text in
+it, so `LICENSE-APACHE.txt` is added here to satisfy §4(a).
+
+Used at runtime, **not** redistributed:
+
+| Component | How it is used | Licence |
+|---|---|---|
+| 「看见」App (`com.dsh.eye`) | provides `:4444/video/mjpeg`; the plugin is just an HTTP client | part of this project |
+| Android IP Camera App (`DigitallyRefined/android-ip-camera`) | optional alternative MJPEG source, installed by the user | MIT |
+| FFmpeg / ffprobe | optional backends, spawned as an external process on `PATH` | LGPL/GPL (your build) |
+| `dsh-see-now` | source of `src/engine/` (same author, same licence) | Apache-2.0 |
+
+## Documentation media
+
+Screenshots and sample sheets were produced by the author on his own devices, from synthetic or
+author-owned material. No third-party footage is redistributed.

@@ -83,14 +83,14 @@ PC 侧也有 `phone/revive.sh` 一键拉起。
 }
 ```
 
-> `width` / `height` 不写就按模式取默认（normal 420×560、guide 336×448，**两者都是 197 token**）；
+> `width` / `height` 不写就按模式取默认 **471×628**（3:4，与摄像头同比例，**197 token**）；
 > 写死了就以你的为准，模式不再改画布。
 
 ### `rotate` 必须是 90（否则画面是歪的）
 
 Camera2 的 sensor 成像相对手机自然方向转了 90°。不转的话 IP Camera App 输出
-800×600 横图，`cover` 缩到 336×448 会**横向裁掉 44%** 的画面，而且图里的
-"左右前后"全是错的。转 90° 后源是 600×800 = 3:4，和 336×448 **同比例，零裁切**。
+800×600 横图，`cover` 缩到 471×628 会**横向裁掉 44%** 的画面，而且图里的
+"左右前后"全是错的。转 90° 后源是 480×640 = 3:4，和 471×628 **同比例，零裁切**。
 
 插件启动时会把 `rotate` / `camera` / `resolution` / `torch` 拼成查询串发给
 IP Camera App（`GET /?camera=back&rotate=90`，App 侧持久化），再开始取流。
@@ -117,7 +117,7 @@ see_phone({ action: "look", mode: "guide" })      // 导盲话术（用户看不
 |---|---|---|
 | 读者 | 用户自己看得见画面 | 用户看不见（导盲） |
 | 附文 | 宫格时间线 + 「你自己看得见，别替他描述」 | 先风险、再通路、最后动作，一两句 |
-| 画布 | 420×560 | 336×448 |
+| 画布 | 471×628 | 471×628 |
 | 出图口径 | 攒多帧宫格（同桌面 `normal`） | **逐帧**：一张图一个画面、格子撑满 |
 | App 朗读 | 只上字幕 | 默认念出来 |
 
@@ -199,7 +199,7 @@ App 的开关写在 `/sdcard/Download/DSH-Go/mode.txt`，插件每次工具调�
 或从最近任务把浏览器切成小窗/悬浮窗，不用编译原生 overlay App。
 
 其他边界：
-- 单帧 336×448 ≈ 130 token，**图会留在会话历史里每轮重发**；长时间看要留意
+- 单帧 471×628 = 197 token，**图会留在会话历史里每轮重发**；长时间看要留意
 - 保持 IP Camera App 在跑（别从最近任务划掉），断流时插件会自动重连
 - 用完记得 `stop`；持续采集会耗电发热
 
@@ -224,8 +224,10 @@ App 的开关写在 `/sdcard/Download/DSH-Go/mode.txt`，插件每次工具调�
 从[官方 GitHub Releases](https://github.com/DigitallyRefined/android-ip-camera/releases) 下载，
 校验 SHA-256 `0e9d5fb859b9dc2d77f401f31964c412b22d6d787b88556a3001ea3b79f099fc`。
 插件本体 Apache-2.0，引擎同 `dsh-see-now`；内置
-[jpeg-js](https://github.com/jpeg-js/jpeg-js) 0.4.4 为 BSD-3-Clause
-（版权声明保留在 `src/cam/vendor/jpeg-js/LICENSE`）。三者均允许商用。
+[jpeg-js](https://github.com/jpeg-js/jpeg-js) 0.4.4 —— 封装层是 BSD-3-Clause，
+`lib/decoder.js` 是 notmasteryet 的 **Apache-2.0**（上游 npm 包没附这一半的全文，
+本仓库补在 `src/cam/vendor/jpeg-js/LICENSE-APACHE.txt`，两份许可与版权行均逐字保留，
+说明见 `src/cam/vendor/jpeg-js/NOTICE.md`）。三者均允许商用。
 
 ## 7. 开发
 
@@ -239,3 +241,4 @@ DSH_SEE_PHONE_CONFIG='{"backend":"http-raw","url":"http://127.0.0.1:8123/frame"}
 ## License
 
 Apache-2.0。`src/engine/` 来自 [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now)，同一许可证。
+第三方代码与许可全文见 [CREDITS.md](CREDITS.md)。

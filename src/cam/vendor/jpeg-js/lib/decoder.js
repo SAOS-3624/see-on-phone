@@ -16,6 +16,19 @@
    limitations under the License.
 */
 
+/*
+   Modified 2026-11 by SAOS-3624 for dsh-see-on-phone (Apache-2.0), as required
+   by Apache-2.0 section 4(b):
+
+     - removed the JPEG encoder (encode / encodeImage and the tables only it
+       used) -- this vendored copy decodes only;
+     - changed the export from `{ decode, encode }` to the bare `decode`
+       function, which ../index.js re-exports.
+
+   The decoding logic itself is unchanged. Upstream:
+   https://github.com/jpeg-js/jpeg-js/blob/master/lib/decoder.js (0.4.4)
+*/
+
 // - The JPEG specification can be found in the ITU CCITT Recommendation T.81
 //   (www.w3.org/Graphics/JPEG/itu-t81.pdf)
 // - The JFIF specification can be found in the JPEG File Interchange Format

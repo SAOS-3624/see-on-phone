@@ -29,6 +29,8 @@
     "dsh.plugin.json",
     "cordis.patch.yml",
     "README.md",
+    "CREDITS.md",
+    "NOTICE",
     "LICENSE"
   ],
   "engines": {
