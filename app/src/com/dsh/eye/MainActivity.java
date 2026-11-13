@@ -600,10 +600,6 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         });
     }
 
-    /** 通话页的缓冲进度：会话页不显示，忽略。 */
-    @Override
-    public void onFrames(int have, int need) { }
-
     /** 顶栏第二行：`模型 · 思考档 · 上下文`。 */
     private String subLine() {
         try {

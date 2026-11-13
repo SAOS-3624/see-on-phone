@@ -170,14 +170,21 @@ public class SettingsActivity extends AppActivity {
             } });
 
         head("通话");
-        row("fisheye", "攒帧张数", "攒满几张发一次", cfg.callFrames() + " 张",
-            new Runnable() { public void run() {
-                cfg.setCallFrames(cfg.nextCallFrames());
-                apply();
-            } });
         row("video", "自动看", "开着它自己开口；关着只在你说话时发", cfg.autoWatch() ? "开" : "关",
             new Runnable() { public void run() {
                 cfg.setAutoWatch(!cfg.autoWatch());
+                apply();
+            } });
+        /**
+         * 攒批 = see-now 的 `wakeBatch`（`tuning.js:56`）。**不是手机端新发明的旋钮**：
+         * 省的不是图的钱，是"每一轮都要把整个上下文重过一遍"那笔。
+         *
+         * 改了要**重开通话页**才生效（`queueDepth` 在建管线时定），所以文案只描述它是什么，
+         * 不加"立刻生效"这种它会做不到的承诺。
+         */
+        row("fisheye", "攒批", "攒够几张图才一起交给模型", cfg.wakeBatch() + " 张",
+            new Runnable() { public void run() {
+                cfg.setWakeBatch(cfg.nextWakeBatch());
                 apply();
             } });
 
@@ -225,7 +232,7 @@ public class SettingsActivity extends AppActivity {
         head("关于");
         row("gear", "接口", null, shortModel() + " · " + (cfg.direct() ? "key 已填" : "还没填 key"),
             new Runnable() { public void run() { apiDialog(); } });
-        row("check", "版本", "端口 4444", BuildConfig.VERSION, null);
+        row("check", "版本", "端口 4444", BuildConfig.version(this), null);
         row("folder", "目录", "DSH-Go/conv · memory · eye.log", null, new Runnable() {
             public void run() {
                 toast("/sdcard/Download/DSH-Go/\n"
@@ -259,7 +266,7 @@ public class SettingsActivity extends AppActivity {
     /** 页面最底下那行：品牌 + 版本。**用户能看到的必须写「鱼眼」**。 */
     private void footer() {
         TextView t = new TextView(this);
-        t.setText("鱼眼 " + BuildConfig.VERSION + " · 端口 4444");
+        t.setText("鱼眼 " + BuildConfig.version(this) + " · 端口 4444");
         t.setTextColor(Theme.TEXT_DIM);
         t.setTextSize(Theme.T_TINY);
         t.setGravity(Gravity.CENTER);

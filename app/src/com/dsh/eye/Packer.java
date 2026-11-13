@@ -501,6 +501,171 @@ final class Packer {
     }
 
     /**
+     * 按 `packMode` 分派 —— **所有需要"装得下吗"的地方都必须走它**。
+     *
+     * 这是 `pack.js::packTiers` 的移植：`splitOneBin`（切箱判据）和出图（真实几何）
+     * 必须用同一个排布器，否则"判它装得下"和"画出来"就对不上。
+     */
+    static Result pack(int[] tiers, double stretch, double binCost, String packMode) {
+        return pack(tiers, stretch, DEFAULT_CROP[0], DEFAULT_CROP[1], binCost, packMode);
+    }
+
+    /** 带裁切预算的版本（`pipeline.js` 的 `cropBudget`，见 `Opts.maxCrop`）。 */
+    static Result pack(int[] tiers, double stretch, double cropX, double cropY,
+                       double binCost, String packMode) {
+        return "skyline".equals(packMode) ? solveSkyline(tiers)
+                                          : solve(tiers, stretch, cropX, cropY, binCost);
+    }
+
+    /**
+     * **天幕排布**（`pack.js::solveSkyline` 的逐行移植）。
+     *
+     * ## 它解决什么问题
+     *
+     * 行式 DP（{@link #solve}）只能一行一行排：一行由最高的那格定高，矮的格子**头顶对齐**、
+     * 下面留空 —— 混合档位下这些洞是几何决定的（手机画布 3:4、4 格 2 大 2 小时，
+     * 小格那一行只占 1/2 宽，右上角整块是灰的）。用户的话是"拼得和屎一样"。
+     *
+     * 天幕的做法：维护一条**地平线**（每个 x 位置当前堆到多高），每格找"放上去之后
+     * 天际线最低"的位置（同高取最左）。小的可以叠在大的旁边，洞就没了。
+     *
+     * 代价：布局不再是整齐的行，读起来要靠格子上的编号（`Sheet` 一直在画）。
+     * 所以电脑版默认仍是行式，这条要显式打开（`packMode: "skyline"`）。
+     *
+     * @return 与 {@link #solve} 同形状：`{bins, fill, area, cells}`
+     */
+    static Result solveSkyline(int[] tiers) {
+        Result res = new Result();
+        // 天幕的格子是正方形 ⇒ 画布也得是方的，否则马赛克永远有一条边填不满（见 Tokens.CANVAS_SQUARE）
+        res.canvasW = Tokens.CANVAS_SQUARE[0];
+        res.canvasH = Tokens.CANVAS_SQUARE[1];
+        if (tiers == null || tiers.length == 0) { res.bins = 0; return res; }
+        Sky sky = new Sky();
+        for (int seq = 0; seq < tiers.length; seq += 1) {
+            if (sky.place(tiers[seq], seq)) continue;
+            // 这一张塞不下了：开下一张（按原尺寸重放，绝不丢帧）
+            sky.nextBin();
+            sky.place(tiers[seq], seq);
+        }
+        res.cells = sky.cells;
+        res.bins = sky.bin + 1;
+        res.area = sky.area;
+        res.fill = sky.area / Math.max(1, res.bins);
+        return res;
+    }
+
+    /** 天幕的状态机（JS 那边是一组闭包，这里收成一个对象，逐行对应）。 */
+    private static final class Sky {
+        final List<Cell> cells = new ArrayList<>();
+        /** 地平线，按 UNIT 精度存（k ≤ 8 时所有 1/k 都是整数倍，不会有小数格）。 */
+        double[] sky = new double[UNIT];
+        int bin = 0;
+        double area = 0;
+        /** 本张当前的天花板。**选尺寸要按"会不会把这张图压高"算**，不是按格子自己的顶边。 */
+        double binTop = 0;
+
+        void nextBin() {
+            bin += 1;
+            sky = new double[UNIT];
+            binTop = 0;
+        }
+
+        /** 只探位置，不改地平线 —— 尺寸还没定下来，得先比较几个候选。 */
+        int[] probe(int side) {
+            int bestX = -1;
+            double bestY = Double.MAX_VALUE;
+            for (int x = 0; x + side <= UNIT; x += 1) {
+                double y = 0;
+                for (int i = x; i < x + side; i += 1) {
+                    if (sky[i] > y) y = sky[i];
+                    if (y >= bestY) break;          // 已经不比当前最优好，别白扫
+                }
+                if (y < bestY) {
+                    bestY = y;
+                    bestX = x;
+                    if (y == 0) break;
+                }
+            }
+            return (bestX >= 0 && bestY + side <= UNIT + 1e-9) ? new int[] { bestX, (int) bestY } : null;
+        }
+
+        void commit(int side, int atX, int atY, int t, int seq) {
+            for (int i = atX; i < atX + side; i += 1) sky[i] = atY + side;
+            Cell c = new Cell();
+            c.x = atX / (double) UNIT;
+            c.y = atY / (double) UNIT;
+            c.w = side / (double) UNIT;
+            c.h = side / (double) UNIT;
+            c.s = side / (double) UNIT;
+            c.stretch = 1;
+            c.t = t;
+            c.f = side / (double) UNIT;
+            c.bin = bin;
+            c.seq = seq;
+            cells.add(c);
+            area += (side / (double) UNIT) * (side / (double) UNIT);
+            if (atY + side > binTop) binTop = atY + side;
+        }
+
+        /**
+         * 在一格里找尺寸。**范围和行式完全一样**（{@link #bounds}）：k=1 只能缩到 1/2、
+         * k=2 只能缩到 1/3、k≥3 上下各一档都能靠 —— 不另立一套。
+         *
+         * 为什么要缩：天幕的洞集中在"大格旁边剩一条"，把邻居靠到相邻档位就能填上。
+         * 为什么只能靠一档：靠过去之后它还是那一档的"邻居"，不是变成一个无关的小格子 ——
+         * 尺寸表达的是重要性，跨两档就等于改语义了。
+         *
+         * **先试原尺寸，放得下就用它** —— 缩放只是"放不下时的退路"，不是优化手段
+         * （JS 注释里踩过：让缩放参与择优会一路挑小的，四个 1/2 被排成 1/2+1/2+1/3+1/3）。
+         */
+        boolean place(int t, int seq) {
+            int k = Math.max(1, Math.min(8, Math.round(t)));
+            double base = UNIT / (double) k;
+            double[] b = bounds(k);
+            double lo = b[0];
+            double hi = b[1];
+            int bs = (int) Math.round(base);
+
+            int[] bestAt = null;
+            double bestSide = 0;
+            double bestTop = Double.MAX_VALUE;
+
+            int[] exact = probe(bs);
+            if (exact != null) {
+                bestAt = exact;
+                bestSide = bs;
+                bestTop = Math.max(binTop, exact[1] + (double) bs);
+            }
+            if (bestAt == null || bestTop > UNIT) {
+                // 按"离原尺寸由近到远"试几个，取**顶边最低**的那个（同高取大的，宁可大一点也不留缝）
+                for (int i = 1; i <= 4; i += 1) {
+                    double up = base + (hi - base) * i / 4.0;
+                    double dn = base - (base - lo) * i / 4.0;
+                    for (int pick = 0; pick < 2; pick += 1) {
+                        double raw = pick == 0 ? up : dn;
+                        if (raw < lo) continue;
+                        int side = Math.max(1, (int) Math.round(raw));
+                        if (side == bs) continue;
+                        int[] at = probe(side);
+                        if (at == null) continue;
+                        double top = Math.max(binTop, at[1] + (double) side);
+                        if (bestAt == null
+                            || top < bestTop - 1e-9
+                            || (Math.abs(top - bestTop) <= 1e-9 && side > bestSide)) {
+                            bestAt = at;
+                            bestSide = side;
+                            bestTop = top;
+                        }
+                    }
+                }
+            }
+            if (bestAt == null) return false;
+            commit((int) Math.round(bestSide), bestAt[0], bestAt[1], t, seq);
+            return true;
+        }
+    }
+
+    /**
      * 取**一张图**（某个 bin）的最终排布：只留这个 bin 的格子，并落好画布。
      *
      * 为什么要有这个函数，而不是让调用方自己"先取子集、再 lay 一次"两步：

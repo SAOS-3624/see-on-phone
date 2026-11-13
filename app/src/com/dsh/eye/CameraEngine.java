@@ -77,6 +77,11 @@ final class CameraEngine {
     private boolean front;
     private int sensorOrientation = 90;
     private boolean hasFlash;
+    /** 对焦模式：-1 = 设备没报能力表，不设（用默认）。见 {@link #pickAfMode}。 */
+    private int afMode = -1;
+    /** 降噪 / 锐化能不能用 FAST 档（`false` = 这台机器不支持，不下发）。 */
+    private boolean nrFast;
+    private boolean edgeFast;
     private String res = "low";
     /** [0]=后摄 [1]=前摄；-1 = 自动（按 sensorOrientation 算） */
     private final int[] rotHint = { -1, -1 };
@@ -107,8 +112,15 @@ final class CameraEngine {
     CameraEngine(Context ctx, Sink sink) {
         this.app = ctx.getApplicationContext();
         this.sink = sink;
-        // RGB_565：面板上要的是"看得清台阶"，不是相册画质。内存减半、旋转更快。
-        decodeOpts.inPreferredConfig = Bitmap.Config.RGB_565;
+        /**
+         * **必须 ARGB_8888**，这里曾经是 RGB_565（"面板要看得清台阶、内存减半"）。
+         *
+         * 565 只有 5/6/5 位色深，解出来的图再压一次 JPEG，等于先量化再压缩：暗部色带、
+         * 细线条边缘被抹平。而 `Looker.toRgb24` 打分那条路特意写了"必须 ARGB_8888，
+         * 不然静态画面分数一格一格跳" —— 同一个色深问题，两头标准不能相反。
+         * 代价是 768×1024 每帧 3MB（vs 1.5MB），12fps 下靠 GC 扛得住，先要清楚。
+         */
+        decodeOpts.inPreferredConfig = Bitmap.Config.ARGB_8888;
     }
 
     // ---------------------------------------------------------------- 对外
@@ -220,6 +232,18 @@ final class CameraEngine {
             sensorOrientation = so == null ? 90 : so.intValue();
             Boolean flash = cc.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
             hasFlash = flash != null && flash.booleanValue();
+            /**
+             * 三个"原生默认值害人"的开关，open 时查一次能力表，applyRepeating 里按需下发。
+             *
+             * 为什么必须查：往 `CaptureRequest` 里塞设备不支持的模式会在 `set()` 抛
+             * `IllegalArgumentException`，整条 request 建不出来 → 相机直接黑屏。
+             * **不支持就不设**，退回系统默认。
+             */
+            afMode = pickAfMode(cc.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES));
+            nrFast = has(cc.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES),
+                CaptureRequest.NOISE_REDUCTION_MODE_FAST);
+            edgeFast = has(cc.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES),
+                CaptureRequest.EDGE_MODE_FAST);
 
             StreamConfigurationMap map = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             Size size = pickSize(map == null ? null : map.getOutputSizes(ImageFormat.JPEG));
@@ -353,6 +377,23 @@ final class CameraEngine {
             Surface pv = previewSurface;
             if (pv != null && pv.isValid()) b.addTarget(pv);
             b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
+            /**
+             * 对焦：**必须显式要连续对焦**。
+             *
+             * 不设 `CONTROL_AF_MODE` 就等于交给设备默认值 —— 大多数机器给的是
+             * `CONTINUOUS_PICTURE`（拍照语义：每次都要"对准"，来回拉），少数给 `OFF`（定焦）。
+             * 5fps 采样正好抽中它拉到一半的那几张，出来就是"老是取到模糊帧"。
+             * `CONTINUOUS_VIDEO` 是视频语义：连续对焦但**不反复找**，正是我们要的。
+             */
+            if (afMode >= 0) b.set(CaptureRequest.CONTROL_AF_MODE, Integer.valueOf(afMode));
+            /**
+             * 降噪 / 锐化：预览流默认按"省电、少噪点"配，降噪开得很重 → 细节被磨平。
+             * `FAST` = 轻量算法，保留边缘和纹理；`OFF` 在暗光下噪点会失控，不选。
+             */
+            if (nrFast) b.set(CaptureRequest.NOISE_REDUCTION_MODE,
+                Integer.valueOf(CaptureRequest.NOISE_REDUCTION_MODE_FAST));
+            if (edgeFast) b.set(CaptureRequest.EDGE_MODE,
+                Integer.valueOf(CaptureRequest.EDGE_MODE_FAST));
             // 旋转由我们自己转像素，EXIF 保持"正常"，免得下游二次旋转
             b.set(CaptureRequest.JPEG_ORIENTATION, Integer.valueOf(0));
             b.set(CaptureRequest.JPEG_QUALITY, Byte.valueOf((byte) 72));
@@ -369,6 +410,31 @@ final class CameraEngine {
         } catch (Throwable e) {
             fail("下发采集请求失败：" + e);
         }
+    }
+
+    /**
+     * 挑对焦模式：`CONTINUOUS_VIDEO` → `CONTINUOUS_PICTURE` → `AUTO` → `-1`（不设）。
+     *
+     * 为什么不直接写死 `CONTINUOUS_VIDEO`：定焦模组（很多前摄、部分低端后摄）的能力表里
+     * 只有 `OFF`，硬塞会抛 `IllegalArgumentException` 把整条 request 打死。
+     * 返回 `-1` 表示"这台机器连能力表都没报"，交回系统默认。
+     */
+    private static int pickAfMode(int[] avail) {
+        if (avail == null || avail.length == 0) return -1;
+        if (has(avail, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO))
+            return CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+        if (has(avail, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE))
+            return CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE;
+        if (has(avail, CaptureRequest.CONTROL_AF_MODE_AUTO))
+            return CaptureRequest.CONTROL_AF_MODE_AUTO;
+        // 只有 OFF = 定焦模组：显式 OFF 和默认等价，不下发更省事
+        return -1;
+    }
+
+    private static boolean has(int[] avail, int v) {
+        if (avail == null) return false;
+        for (int x : avail) if (x == v) return true;
+        return false;
     }
 
     /**
@@ -489,13 +555,24 @@ final class CameraEngine {
             src = BitmapFactory.decodeByteArray(jpg, 0, jpg.length, decodeOpts);
             if (src == null) return jpg;
             if (deg == 0) {
+                /**
+                 * 不用转：**原始 JPEG 原样给下游**，跳过 decode→rotate→encode 里的 encode。
+                 *
+                 * 以前这条分支也走 `compress(72)`，等于把相机已经压过一遍的图再压一遍：
+                 * 多花 ~20ms/帧，画质白掉一层。界面要的是 Bitmap，所以还得解一张，
+                 * 但**不再压回 JPEG**。
+                 */
                 rot = src;
                 src = null;
-            } else {
-                Matrix m = new Matrix();
-                m.postRotate(deg);
-                rot = Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), m, false);
+                try {
+                    sink.onPreviewBitmap(rot);
+                    handed = true;
+                } catch (Throwable ignored) { }
+                return jpg;
             }
+            Matrix m = new Matrix();
+            m.postRotate(deg);
+            rot = Bitmap.createBitmap(src, 0, 0, src.getWidth(), src.getHeight(), m, false);
             encodeBuf.reset();
             rot.compress(Bitmap.CompressFormat.JPEG, 72, encodeBuf);
             byte[] out = encodeBuf.toByteArray();

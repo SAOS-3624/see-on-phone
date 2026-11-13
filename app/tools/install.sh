@@ -51,8 +51,9 @@ cur_code() { AS "dumpsys package $PKG | grep -m1 versionCode" | grep -o '[0-9]*'
 
 # 抓一次 UI，返回「继续安装」按钮中心坐标（没有就空）。**硬超 6 秒**，卡住就算了。
 button_center() {
-  timeout 6 "$ADB" shell "uiautomator dump /sdcard/_inst.xml" >/dev/null 2>&1
-  timeout 6 "$ADB" exec-out cat /sdcard/_inst.xml > "$WORK/ui.xml" 2>/dev/null
+  # 这台机器 dump 一次要 20 秒以上（界面在动画时会卡更久），20 秒是**必然失败**的值。
+  timeout 30 "$ADB" shell "uiautomator dump /sdcard/_inst.xml" >/dev/null 2>&1
+  timeout 10 "$ADB" exec-out cat /sdcard/_inst.xml > "$WORK/ui.xml" 2>/dev/null
   [ -s "$WORK/ui.xml" ] || return 0
   python - "$WORK/ui.xml" <<'PY'
 import re, sys
@@ -67,11 +68,23 @@ for m in re.finditer(r'text="继续安装"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(
 PY
 }
 
-# 点一次「继续安装」：有坐标就用坐标；dump 不出来就退回已知位置（这台机器一直是这两个）
+# 点一次「继续安装」。**只有第 1 次允许盲点**（弹窗刚出来时 dump 常常来不及）。
+#
+# ⚠️ 后面的轮次必须 dump 到按钮才点：弹窗一消失，同一个坐标就落到别的按钮上 ——
+#    实测盲点第二次直接点到「取消」，adb 报 `INSTALL_FAILED_ABORTED: User rejected permissions`。
 tap_continue() {
   local c
   c=$(button_center)
   if [ -z "$c" ]; then
+    # dump 不出来才走这里。**这台机器有两道形状完全不同的弹窗，按钮位置差得很远**：
+    #
+    #   弹窗                         「继续安装」bounds        中心          出现时机
+    #   风险提示（标题+说明+取消/继续） [555,2128][1000,2186]   (777,2157)   正常情况
+    #   纯净模式（图标+三行大按钮）      [72,1936][1012,2056]    (542,1996)   市场被启用时，它伪造的
+    #
+    # 所以第 1 次猜风险提示，第 2 次猜纯净模式 —— 而不是两次都点同一个地方
+    # （以前两次都点 (777,2157)，在纯净模式页面上会落到「取消」，
+    #   报 INSTALL_FAILED_ABORTED: User rejected permissions）。
     case "${1:-0}" in
       1) c="777 2157" ;;
       2) c="542 1996" ;;
@@ -120,24 +133,34 @@ timeout 45 "$ADB" push "$APK_WIN" /data/local/tmp/_dsh.apk >/dev/null 2>&1 \
 AS "am force-stop $PKG" >/dev/null
 
 say "安装…"
-( timeout 55 "$ADB" shell "pm install -r -d /data/local/tmp/_dsh.apk" >"$WORK/pm.log" 2>&1 & )
+# ⚠️ 用 `adb install` 而不是 `pm install`：
+#   `pm install` 在设备上自建 session 后 shell 立刻返回，adb 断开 —— 华为的
+#   "风险提示"一拦，session 就成了没人接收的空壳，界面永远停在"正在准备安装应用"，
+#   版本号一直不变（点对按钮也没用，因为背后没有活着的 session 了）。
+#   `adb install` 会一直守着这条 session 等确认，点完就能落地。
+( timeout 150 "$ADB" install -r -d "$APK_WIN" >"$WORK/pm.log" 2>&1 & )
 
 sleep 4
 tap_continue 1
-sleep 3
+sleep 4
+# 第二次**带 dump 保护**：dump 到按钮就点它的真实坐标（纯净模式弹窗靠这一步），
+# dump 不到才退回猜坐标；弹窗已经不在了就什么都不做（不会误点「取消」）。
 tap_continue 2
 
 ok=0
-for i in $(seq 1 8); do
+for i in $(seq 1 14); do
   if [ "$(cur_code)" = "$WANT_CODE" ]; then ok=1; break; fi
   sleep 2
-  # 第 3、5 轮再补点一次（有些机器弹窗出现得慢）
-  if [ "$i" = "3" ] || [ "$i" = "5" ]; then tap_continue "$i" >/dev/null 2>&1; fi
+  # 第 6、9、12 轮再试：tap_continue 会先 dump，**只有按钮真的还在**才会点
+  if [ "$i" = "6" ] || [ "$i" = "9" ] || [ "$i" = "12" ]; then tap_continue "$i" >/dev/null 2>&1; fi
 done
 
 if [ "$ok" = "1" ]; then
   name=$(AS "dumpsys package $PKG | grep -m1 versionName" | sed 's/.*=//')
-  # 装完可能停在"安装完成"页，按一次返回离开它
+  # 装完可能停在「安装完成」页（一屏应用推荐 + 完成/探索更多）：点「完成」(300,2161) 离开，
+  # 点不中也无所谓，后面再按一次返回
+  AS "input tap 300 2161"
+  sleep 1
   AS "input keyevent 4"
   cleanup_dialog
   # ⚠️ 刻意**不**把应用市场 enable 回来：启用状态下那道"纯净模式"弹窗是它伪造的
@@ -151,5 +174,7 @@ echo "--- pm install 输出 ---" >&2
 tail -5 "$WORK/pm.log" >&2 2>/dev/null
 say "✗ 没装上（设备上还是 $(cur_code)）"
 cleanup_dialog
-AS "pm enable com.huawei.appmarket" >/dev/null
+# ⚠️ 失败时**也不要** enable 应用市场。以前这里是 `pm enable`，结果下一次安装
+#    又会多出一道"纯净模式"（市场伪造的），按钮位置还不一样 —— 越失败越难装。
+#    想恢复自己敲：adb shell pm enable com.huawei.appmarket
 exit 1

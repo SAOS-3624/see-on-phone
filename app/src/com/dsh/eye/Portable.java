@@ -102,7 +102,7 @@ final class Portable {
             String stamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.ROOT)
                 .format(new java.util.Date());
             Files.writeText(new File(dir, "manifest.json"),
-                "{\"app\":\"dsh-eye\",\"version\":\"" + BuildConfig.VERSION + "\","
+                "{\"app\":\"dsh-eye\",\"version\":\"" + BuildConfig.version() + "\","
                 + "\"time\":" + System.currentTimeMillis() + ","
                 + "\"convs\":" + convs + ",\"memory\":" + mems + "}\n", false);
 
@@ -189,7 +189,7 @@ final class Portable {
 
             org.json.JSONObject meta = new org.json.JSONObject();
             meta.put("app", "dsh-eye");
-            meta.put("version", BuildConfig.VERSION);
+            meta.put("version", BuildConfig.version());
             meta.put("convId", convId);
             meta.put("title", ConvStore.readTitle(convId));
             meta.put("at", lastAt);

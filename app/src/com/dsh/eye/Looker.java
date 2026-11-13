@@ -56,15 +56,6 @@ final class Looker {
         slotAt = SystemClock.elapsedRealtime();
     }
 
-    /** 现在有画面吗（`/frame.jpg` 判断"要不要等"）。 */
-    boolean hasFrame(long withinMs) {
-        byte[] s = slot;
-        return s != null && SystemClock.elapsedRealtime() - slotAt < withinMs;
-    }
-
-    /** 最近一帧的字节（没有就 null）。 */
-    byte[] lastJpeg() { return slot; }
-
     /**
      * 抓一张宫格。**阻塞**，必须在后台线程调。
      *
@@ -84,7 +75,8 @@ final class Looker {
         }
 
         // ② 喂 seconds 秒
-        Pipeline pipe = new Pipeline(opts());
+        Pipeline.Opts o = opts();
+        Pipeline pipe = new Pipeline(o);
         long t0 = SystemClock.elapsedRealtime();
         long end = t0 + (long) (Math.max(1, Math.min(5, seconds)) * 1000);
         byte[] last = null;
@@ -107,10 +99,12 @@ final class Looker {
         // ③ 封箱
         double now = (SystemClock.elapsedRealtime() - t0) / 1000.0;
         Pipeline.Sheet s;
+        int[] tiers = null;
         synchronized (pipe) {
             s = pipe.flushNow(now, "time");
             // **必须取走**：flushNow 会把这张推进交付队列，不取走就等于白拼（还会被下一次 take 当一轮）
             pipe.take();
+            if (s != null) tiers = pipe.tiersOf(s.frames);
         }
         if (s == null || s.frames.isEmpty()) {
             // 一帧都没留下（画面从头到尾一样）：退回"当前帧"，至少让它看见东西
@@ -125,6 +119,9 @@ final class Looker {
             return l;
         }
 
+        // 和通话页同一套版面（主次拉开 + 小格抬亮）：管线给的档位 → 手机版面
+        Pipeline.Sheet phone = CallSheet.layout(s.frames, tiers, s.why, o.packMode, o.maxCrop);
+        if (phone != null) s = phone;
         byte[] sheet = Sheet.compose(s);
         if (sheet == null) return null;
         Tools.Look l = new Tools.Look();
@@ -139,89 +136,57 @@ final class Looker {
     }
 
     /**
-     * 把**已经攒在缓冲里**的几帧拼成一张宫格：不碰相机、不等待。
+     * 一张宫格 → JPEG（**发给模型的就是这一张**）。
      *
-     * 通话页的"滚动缓冲"要的就是这个 —— 相机早就开着、帧一直在来，再走
-     * {@link #grab} 那套"等第一帧 + 喂两秒"纯属白等，而且抓到的是**又一个两秒**，
-     * 不是用户刚刚那几眼。这里直接拿缓冲里的帧过一遍同一套管线（切点/档位/装箱/拼图），
-     * 所以出图口径和 grab 完全一致，只是时间轴是"过去这几秒"。
-     *
-     * @param jpgs 由旧到新的原始 JPEG（1~8 张）
+     * 挑帧/档位/排布全在 `Pipeline` + `CallStream`，这一层只剩"画"。
      */
-    Tools.Look compose(java.util.List<byte[]> jpgs, String why, double stepSeconds) {
-        if (jpgs == null || jpgs.isEmpty()) return null;
-        /**
-         * ⚠️ **这套参数必须是"我喂什么就留什么"**，不能用默认的切点那一套。
-         *
-         * 默认 `cutAbs=12 / integralSeconds=3 / silentFloorSec=20` 是给"几十秒连续帧流"
-         * 设计的：判据负责从一大堆帧里挑出有信息的那几张。但这里**调用方已经按时间挑好了**
-         * （每 `interval` 秒一张、覆盖上一个发送窗口），再让切点算法筛一遍的结果就是
-         * 中间那帧被判"变化不够大"丢掉 —— 真机日志里 `fed=3 frames=2`，用户看到的就是
-         * "一次只抓很近的两帧，其余的都抓不到"。
-         *
-         * 所以：`cutAbs = 0` ⇒ 只要和上一帧不一样就算数；积分/兜底/跳变那几个"会自己加帧"
-         * 的判据全部关掉；`dupMin = 1` 只挡完全一致的两帧（画面真没动时 1 帧就够，
-         * 别为了凑数把同一张图摆三格）。
-         */
-        Pipeline.Opts o = opts();
-        o.cutAbs = 0;
-        o.cutIsolatedAbs = 0;
-        o.cutMcAbs = 0;
-        o.cutJumpAbs = 0;
-        o.cutSpikeAbs = 0;
-        o.floorGapK = 0;
-        o.integralSeconds = 9999;
-        o.silentFloorSec = 9999;
-        o.dupMin = 1;
-        o.maxFrames = Math.max(8, jpgs.size());
-        Pipeline pipe = new Pipeline(o);
-        // 等间隔喂：缓冲是"每隔 interval 秒取一张"，相邻帧就是等距的
-        final double step = stepSeconds > 0 ? stepSeconds : 1.0;
-        int fed = 0;
-        for (int i = 0; i < jpgs.size(); i += 1) {
-            byte[] jpg = jpgs.get(i);
-            if (jpg == null || jpg.length == 0) continue;
-            byte[] rgb = toRgb24(jpg);
-            if (rgb == null) continue;
-            synchronized (pipe) {
-                pipe.push((i + 1) * step, rgb, jpg);
-            }
-            fed += 1;
-        }
-        Pipeline.Sheet s;
-        synchronized (pipe) {
-            s = pipe.flushNow((jpgs.size() + 1) * step, why == null ? "buffer" : why);
-            pipe.take();                       // 必须取走，见 grab() 里的注释
-        }
-        if (s == null || s.frames.isEmpty()) {
-            // 一帧都没留住（画面从头到尾一样）：退回最新那一帧，至少让它看见东西
-            byte[] jpg = jpgs.get(jpgs.size() - 1);
-            if (jpg == null) return null;
-            Tools.Look l = new Tools.Look();
-            l.jpeg = jpg;
-            l.frames = 1;
-            l.tokens = Tokens.imageTokens(480, 640);
-            l.why = "still";
-            return l;
-        }
-        byte[] sheet = Sheet.compose(s);
-        if (sheet == null) return null;
+    Tools.Look lookOf(Pipeline.Sheet s) {
+        if (s == null) return null;
+        byte[] jpg = Sheet.compose(s);
+        if (jpg == null) return null;
         Tools.Look l = new Tools.Look();
-        l.jpeg = sheet;
+        l.jpeg = jpg;
         l.frames = s.frames.size();
         l.tokens = s.layout == null ? Tokens.SHEET_TOKENS : s.layout.tokens();
-        l.why = s.why == null ? "buffer" : s.why;
-        EyeLog.w("look", "compose fed=" + fed + " frames=" + l.frames
-            + String.format(java.util.Locale.ROOT, " span=%.1fs", (jpgs.size() - 1) * step)
-            + " why=" + l.why + " tokens=" + l.tokens + " jpeg=" + sheet.length);
+        l.why = s.why == null ? "call" : s.why;
+        // 每 30 秒落一份**整张**（不是缩略图）到 Download：真机排障直接 pull 它看编号/版面
+        long nowMs = System.currentTimeMillis();
+        if (nowMs - lastSheetDump > 30_000) {
+            lastSheetDump = nowMs;
+            try { Files.write(new java.io.File("/sdcard/Download/DSH-Go/sheet.jpg"), jpg, false); }
+            catch (Throwable ignored) { }
+        }
+        EyeLog.w("look", "sheet cells=" + s.frames.size()
+            + String.format(java.util.Locale.ROOT, " span=%.1fs", s.to - s.from)
+            + " why=" + l.why + " canvas=" + s.layout.canvasW + "x" + s.layout.canvasH
+            + " tiers=" + java.util.Arrays.toString(s.tiers)
+            + " tokens=" + l.tokens + " jpeg=" + jpg.length);
         return l;
     }
+
+    /** 缩略图（通话页左下角预览；宽 260，够看清版面）。 */
+    byte[] thumb(Pipeline.Sheet s) {
+        if (s == null) return null;
+        byte[] jpg = Sheet.compose(s, 260, 70);
+        // 每 30 秒落一份到 Download：真机上说"版面不对"时，直接 pull 这张来看，
+        // 不用装调试环境（`/sdcard/Download/DSH-Go/preview.jpg`）
+        long now = System.currentTimeMillis();
+        if (jpg != null && now - lastPreviewDump > 30_000) {
+            lastPreviewDump = now;
+            try { Files.write(new java.io.File("/sdcard/Download/DSH-Go/preview.jpg"), jpg, false); }
+            catch (Throwable ignored) { }
+        }
+        return jpg;
+    }
+
+    private long lastPreviewDump;
+    private long lastSheetDump;
 
     /**
      * 建管线参数。**优先级：tuning.json > 设置页 > `Pipeline.Opts` 默认值**，
      * 和 0.13.x 完全一致（`tune` 改的就是前两级里的值）。
      */
-    private Pipeline.Opts opts() {
+    Pipeline.Opts opts() {
         Pipeline.Opts o = new Pipeline.Opts();
         o.width = SCORE_W;
         o.height = SCORE_H;
@@ -237,6 +202,23 @@ final class Looker {
         String pace = tuning.str("defaultPace", cfg.pace());
         applyPace(o, pace);
         o.strategy = tuning.str("tierStyle", cfg.tierStyle());
+        /**
+         * **档位判据 = see-now 的 `tierMode`**，默认 **`density`**，和 `pipeline.js:290` 一致。
+         *
+         * | 值 | 判据 | 电脑版出处 |
+         * |---|---|---|
+         * | `density`（默认） | 过去 1 秒**平均每秒几帧**（邻域密度，走 EMA；`Tiers.Tracker`） | `pipeline.js:290` |
+         * | `weight` | 出图时按这一帧的**变化量**切面积（`area_i ∝ score_i`） | `pipeline.js:897` |
+         *
+         * 两者都是"尺寸 = 重要性"的近似，`weight` 才有"同一张图里大小对比"。
+         *
+         * ⚠️ **默认必须是 `density`**：那是 see-now 的原生默认。手机端擅自把默认换成
+         * `weight`，就等于和电脑版对不上（2026-11-14 干过一次，用户当场指出来）。
+         * `weight` 只能由 `tuning.json` 显式指定（模型 `tune` / 真机排障）。
+         *
+         * ⚠️ 也别把 `density` 叫"等分" —— 它判的是**密度**，匀速采样下才恰好同档。
+         */
+        o.tierMode = tuning.str("tierMode", "density");
         o.queueDepth = 1;
         tuning.applyTo(o);
         if (cfg.maxFrames() > 0) o.maxFrames = cfg.maxFrames();
@@ -277,7 +259,13 @@ final class Looker {
      * **必须用 ARGB_8888**：RGB_565 只有 5/6/5 位色深，而打分是 HSV 三通道差，
      * 色深一降，静态画面的分数就变成一格一格地跳。
      */
-    private byte[] toRgb24(byte[] jpg) {
+    /**
+     * JPEG → 240×320 rgb24。
+     *
+     * ⚠️ **`synchronized`**：实时预览（预览线程）和发送（对话线程）会同时调它，
+     * 而里面 `scoreBuf/pixelBuf` 是复用的 —— 不串行化就会互踩，出来是花屏。
+     */
+    synchronized byte[] toRgb24(byte[] jpg) {
         Bitmap b = null;
         Bitmap scaled = null;
         try {

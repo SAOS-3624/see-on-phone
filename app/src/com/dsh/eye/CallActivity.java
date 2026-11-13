@@ -4,6 +4,7 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
@@ -55,18 +56,35 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
     private TextView subtitle;
     private TextView mine;
     private EditText input;
-    private View strip;
     private View dot;
     private LinearLayout topBar;
-    private LinearLayout bottomBar;
     /** 顶部那行字：在看 / 在想 / 在听。 */
     private TextView status;
     private TextView autoBtn;
-    /** 缓冲进度：当前几张 / 攒满需要几张（显示在"自动 · 开/关"后面）。 */
-    private int bufHave;
-    private int bufNeed;
+    /** 取帧进度：窗口里几帧 / 覆盖几秒 / 最多几格（显示在"自动 · 开"和宫格标题里）。 */
+    /** 当前显示的预览图里有几格 / 覆盖多少秒（**跟着图一起来**，不再去问"攒了几帧"）。 */
+    private int shownCells;
+    private double shownSpan;
+
     /** 点一下画面把上下两条栏收起来（沉浸看）。再点一下回来。 */
     private boolean chromeHidden;
+
+    // ---- 宫格预览：**拼好的那张图本身**（和发出去的那张同一个函数算出来的） ----
+    /** "宫格 · 12.4s · 4 格" 那行小字。 */
+    private TextView gridLabel;
+    /** 显示/隐藏预览的小按钮（右侧）。 */
+    private TextView gridToggle;
+    /** 预览开不开（跟服务里的设置同步）。 */
+    private boolean previewOn = true;
+    /** 拼好的预览图（3:4，132dp 宽）。 */
+    private ImageView gridView;
+    /** 预览位图。换新的时候**先挂后回收**，不能反。 */
+    private Bitmap gridBmp;
+    /** 解码只在这一条线程上做（主线程解码 JPEG 会掉帧）。 */
+    private final java.util.concurrent.ExecutorService thumbPool =
+        java.util.concurrent.Executors.newSingleThreadExecutor();
+    /** 第几代请求：解码慢于新请求时，旧结果直接扔掉（否则预览会倒退回上一张）。 */
+    private int thumbGen;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     /** 当前显示中的位图。换下一张时回收它（一帧 600KB，不能等 GC）。 */
@@ -94,6 +112,8 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
         }
         s.setUi(this);
         s.setPreviewSink(this);
+        previewOn = s.previewOn();
+        applyPreview();
         s.callOpen();
         paintAuto(s.autoWatch());
         String last = s.lastLine();
@@ -113,6 +133,10 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
             if (pending != null) { try { pending.recycle(); } catch (Throwable ignored) { } }
             pending = null;
         }
+        // 缩略图同理：**同时把代次号打掉**，让已经排队的解码结果自己作废
+        synchronized (this) { thumbGen += 1; }
+        recycleGrid();
+        if (gridLabel != null) gridLabel.setText("宫格 · 还没抓到");
         super.onPause();
     }
 
@@ -121,6 +145,8 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
         destroyed = true;
         ui.removeCallbacksAndMessages(null);
         releaseShowing();
+        recycleGrid();
+        try { thumbPool.shutdownNow(); } catch (Throwable ignored) { }
         super.onDestroy();
     }
 
@@ -205,7 +231,6 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
         bottom.setOrientation(LinearLayout.VERTICAL);
         bottom.setPadding(dp(Theme.S4), dp(Theme.S3), dp(Theme.S4),
             dp(Theme.S4) + navigationBarHeight());
-        bottomBar = bottom;
 
         mine = new TextView(this);
         mine.setTextColor(Theme.TEXT_GLASS);
@@ -226,6 +251,63 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
         subtitle.setVisibility(View.GONE);     // 没话说的时候不留一个空盒子
         bottom.addView(subtitle, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // ---- 宫格预览：它正在攒哪几张 ----
+        // 放在字幕和输入行中间：竖着排所以永远不会挡输入框，也不会被键盘压住。
+        LinearLayout gridWrap = new LinearLayout(this);
+        gridWrap.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        glp.topMargin = dp(Theme.S3);
+        gridWrap.setLayoutParams(glp);
+
+        /**
+         * 标题行 = 「宫格 · 7.9s · 4 格」 + 右侧「隐藏 / 显示」。
+         *
+         * 为什么要这个开关：预览现在**每抓一帧就重排一次**（5fps ⇒ 200ms，拼图 + 解码 ~40ms），
+         * 有人只想听声音/看字幕时就该能关掉 —— 关掉之后后台**连拼图都不算**（见 `schedulePreview`）。
+         */
+        LinearLayout gridHead = new LinearLayout(this);
+        gridHead.setOrientation(LinearLayout.HORIZONTAL);
+        gridHead.setGravity(Gravity.CENTER_VERTICAL);
+        gridWrap.addView(gridHead);
+
+        gridLabel = new TextView(this);
+        gridLabel.setText("宫格 · 还没抓到");
+        gridLabel.setTextColor(Theme.TEXT_GLASS);
+        gridLabel.setTextSize(Theme.T_TINY);
+        gridHead.addView(gridLabel, new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        gridToggle = new TextView(this);
+        gridToggle.setText("隐藏");
+        gridToggle.setTextColor(Theme.TEXT_DIM);
+        gridToggle.setTextSize(Theme.T_TINY);
+        gridToggle.setPadding(dp(10), dp(3), dp(10), dp(3));
+        gridToggle.setBackground(Theme.pillStroke(Theme.SURFACE_GLASS_2, Theme.RIPPLE, dp(1)));
+        gridToggle.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                EyeService s = EyeService.peek();
+                boolean on = !previewOn;
+                previewOn = on;
+                if (s != null) s.setPreviewOn(on);
+                applyPreview();
+            }
+        });
+        gridHead.addView(gridToggle);
+
+        // 拼好的预览：3:4、宽 132dp，和发出去的那张同比例 —— 一眼能看出"现在发出去长什么样"
+        gridView = new ImageView(this);
+        gridView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        gridView.setBackground(Theme.roundStroke(Theme.SURFACE_GLASS_2, dp(10), Theme.LINE, dp(1)));
+        gridView.setClipToOutline(true);
+        gridView.setPadding(dp(2), dp(2), dp(2), dp(2));
+        gridView.setVisibility(View.GONE);
+        LinearLayout.LayoutParams grp = new LinearLayout.LayoutParams(dp(132), dp(176));
+        grp.topMargin = dp(6);
+        gridWrap.addView(gridView, grp);
+
+        bottom.addView(gridWrap);
 
         // 输入行：说 | 输入框 | 发送 | 挂断
         LinearLayout row = new LinearLayout(this);
@@ -308,42 +390,142 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
         keepAboveKeyboard(root);
     }
 
-    /** 点画面：收起/放回上下两条栏。字幕留着（不然就成纯相机了）。 */
+    /**
+     * 点画面：收起/放回上下两条栏。
+     *
+     * ⚠️ **宫格预览不跟着收**。它回答的是"它到底抓到没有、抓到的是哪几张"，
+     * 收起来用户就又只能猜了（而且以前那个 `2/3` 就是被这一步连坐隐藏的）。
+     */
     private void toggleChrome() {
         chromeHidden = !chromeHidden;
         int v = chromeHidden ? View.GONE : View.VISIBLE;
         if (topBar != null) topBar.setVisibility(v);
-        if (bottomBar != null) bottomBar.setVisibility(chromeHidden ? View.INVISIBLE : View.VISIBLE);
+        if (mine != null) mine.setVisibility(chromeHidden ? View.GONE
+            : (mine.getText().length() > 0 ? View.VISIBLE : View.GONE));
+        if (input != null && input.getParent() instanceof View) {
+            ((View) input.getParent()).setVisibility(chromeHidden ? View.INVISIBLE : View.VISIBLE);
+        }
     }
 
+    /**
+     * 顶部胶囊上的"自动 · 开 · 74 帧"。
+     *
+     * **数字从服务读，不从界面自己的缓存读** —— 以前是界面自己记 `bufHave/bufNeed`，
+     * 重进通话页时它们被重置成 0，于是胶囊上那截 `2/3` 就"有时候有有时候没有"。
+     */
     private void paintAuto(boolean on) {
         if (autoBtn == null) return;
-        // 把缓冲进度挂在开关后面：**这是"它到底有没有在抓帧"的唯一证据**
-        String tail = bufNeed > 0 ? " · " + bufHave + "/" + bufNeed : "";
-        autoBtn.setText((on ? "自动 · 开" : "自动 · 关") + tail);
+        // 胶囊只说开/关：帧数在下面"宫格 · N 格"那行，量纲不同别混着显示
+        autoBtn.setText(on ? "自动 · 开" : "自动 · 关");
         autoBtn.setTextColor(on ? Theme.OK : Theme.TEXT_DIM);
     }
 
-    /** 缓冲进度（采集线程调过来的）。 */
-    @Override
-    public void onFrames(final int have, final int need) {
-        ui.post(new Runnable() {
-            public void run() {
-                if (have == bufHave && need == bufNeed) return;
-                bufHave = have;
-                bufNeed = need;
-                EyeService s = EyeService.peek();
-                paintAuto(s != null && s.autoWatch());
-            }
-        });
-    }
-
+    /**
+     * 顶部那行字：在看 / 在想 / 在听 / 在说。
+     *
+     * 只动胶囊，**不动字幕** —— 字幕只放"它真说过的话"（以前这里同时刷字幕，
+     * 每调一次工具就把上一句顶掉，用户看到的是"话说出来了、字幕却没了"）。
+     */
     private void setStatus(String text, int color) {
         if (status == null) return;
         status.setText(text);
         if (dot != null) dot.setBackground(Theme.circle(color));
         if (Theme.ACCENT == color || Theme.OK == color) Anim.pulse(dot);
         else Anim.stopPulse(dot);
+    }
+
+    /** 取帧进度（采集线程调过来的）。 */
+    /** 预览的显示状态：**只在这一个地方**动 `gridView` 和按钮文案。 */
+    private void applyPreview() {
+        if (gridToggle != null) {
+            gridToggle.setText(previewOn ? "隐藏" : "显示");
+            gridToggle.setTextColor(previewOn ? Theme.TEXT_DIM : Theme.OK);
+        }
+        if (gridView != null) gridView.setVisibility(previewOn ? View.VISIBLE : View.GONE);
+        if (!previewOn) recycleGrid();
+        paintGridLabel();
+    }
+
+    /** "宫格 · 7.9s · 4 格"：一句话说清"这一张里有什么"（管线攒了多久、几格）。 */
+    private void paintGridLabel() {
+        if (gridLabel == null) return;
+        if (!previewOn) {
+            gridLabel.setText("宫格 · 预览已关（点右侧打开）");
+            gridLabel.setTextColor(Theme.TEXT_GLASS);
+            return;
+        }
+        if (shownCells <= 0) {
+            gridLabel.setText("宫格 · 攒着呢…");
+            gridLabel.setTextColor(Theme.TEXT_GLASS);
+            return;
+        }
+        gridLabel.setText(String.format(java.util.Locale.ROOT,
+            "宫格 · %.1fs · %d 格", shownSpan, shownCells));
+        gridLabel.setTextColor(Theme.OK);
+    }
+
+    /**
+     * **拼好的那张图**（服务端每 1.5 秒算一张，和真发出去的那张同一个函数）。
+     *
+     * 解码放到 {@link #thumbPool}；期间又来了新的一张就作废旧的（代次号），
+     * 免得"新图被旧图盖回去"。
+     */
+    @Override
+    public void onSheetPreview(byte[] jpeg, int cells, double spanSec) {
+        if (jpeg == null || jpeg.length == 0 || !previewOn) return;
+        shownCells = cells;
+        shownSpan = spanSec;
+        final byte[] src = jpeg;
+        final int gen;
+        synchronized (this) { gen = ++thumbGen; }
+        try {
+            thumbPool.submit(new Runnable() {
+                public void run() {
+                    // 已经有一张更新的在排队了：这一张解了也是白解（预览 5fps 刷新时才会撞上）
+                    synchronized (CallActivity.this) { if (gen != thumbGen) return; }
+                    final Bitmap bmp = decode(src);
+                    ui.post(new Runnable() {
+                        public void run() { applyGrid(gen, bmp); }
+                    });
+                }
+            });
+        } catch (Throwable ignored) { }
+    }
+
+    /** 预览图解码（260px 宽的小图，直接解原尺寸就够）。 */
+    private Bitmap decode(byte[] jpg) {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inPreferredConfig = Bitmap.Config.RGB_565;
+            return BitmapFactory.decodeByteArray(jpg, 0, jpg.length, o);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    /** 换上最新一张预览。**只有最新一代算数**。 */
+    private void applyGrid(int gen, Bitmap bmp) {
+        if (bmp == null) return;
+        if (destroyed) { try { bmp.recycle(); } catch (Throwable ignored) { } return; }
+        synchronized (this) {
+            if (gen != thumbGen) { try { bmp.recycle(); } catch (Throwable ignored) { } return; }
+        }
+        Bitmap old = gridBmp;
+        gridBmp = bmp;
+        if (gridView != null) {
+            gridView.setImageBitmap(bmp);
+            gridView.setVisibility(View.VISIBLE);
+        }
+        // 先挂新的，再回收旧的（反了会闪一下黑）
+        if (old != null && old != bmp) { try { old.recycle(); } catch (Throwable ignored) { } }
+        paintGridLabel();
+    }
+
+    private void recycleGrid() {
+        Bitmap b = gridBmp;
+        gridBmp = null;
+        if (b != null) { try { b.recycle(); } catch (Throwable ignored) { } }
+        if (gridView != null) gridView.setImageDrawable(null);
     }
 
     // ---------------------------------------------------------------- 实时画面

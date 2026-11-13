@@ -93,6 +93,13 @@ final class Pipeline {
         double[] tierThresholds = null;
         String tierMode = "density";
         String packMode = "rows";
+        /**
+         * 为凑行高最多裁掉多少画面（`pipeline.js::DEFAULTS.maxCrop`，**默认 0 = 一格不裁**）。
+         *
+         * 0 的时候行宽不满就留空（`Sheet` 铺灰块），这是电脑版的默认版面；
+         * 写 0.3 就是"宁可每格裁 30%，也要把行铺满"。
+         */
+        double maxCrop = 0;
         String strategy = "native";
         int[] tierMap = null;
         int markBoost = 2;
@@ -149,7 +156,8 @@ final class Pipeline {
             o.scoreMode = scoreMode; o.mcTau = mcTau; o.mcRadius = mcRadius;
             o.scoreNormalize = scoreNormalize; o.dtFrames = dtFrames; o.smoothFrames = smoothFrames;
             o.tierCurve = tierCurve; o.tierThresholds = tierThresholds;
-            o.tierMode = tierMode; o.packMode = packMode; o.strategy = strategy; o.tierMap = tierMap;
+            o.tierMode = tierMode; o.packMode = packMode; o.maxCrop = maxCrop;
+            o.strategy = strategy; o.tierMap = tierMap;
             o.markBoost = markBoost; o.floorBoost = floorBoost; o.boostMinFrames = boostMinFrames;
             o.maxWaitSec = maxWaitSec; o.flushGain = flushGain; o.maxFrames = maxFrames;
             o.binCost = binCost; o.queueDepth = queueDepth; o.oneShot = oneShot;
@@ -345,6 +353,18 @@ final class Pipeline {
     }
 
     /**
+     * 这一批帧的**最终档位序列** —— 和 {@link #flush} 里用的是同一个函数（{@code seqOf}）。
+     *
+     * 为什么要把这个读口开出来：通话页一次只发**一张**图，一窗可能留下十几帧，
+     * 必须先压到"最多几格"，压完还得知道"每帧该多大"。档位只有这一处口径
+     * （`strategy` + `markBoost/floorBoost` + `tierMode=weight` 的面积归一化全在里面），
+     * 外面自己从 `Entry.tier` 推会把这些**全部**丢掉 —— 1.1.3 就是这么退化成等分宫的。
+     */
+    int[] tiersOf(List<Entry> batch) {
+        return seqOf(batch);
+    }
+
+    /**
      * 当前这批帧的排布预案。**必须和 flush 用同一个档位口径**。
      */
     private Packer.Result plan() {
@@ -363,7 +383,9 @@ final class Pipeline {
     private Packer.Result solveFor(List<Entry> list) {
         // `lay` 在这里调、**只在这里调**：单帧铺满 + 裁掉整行空着的带子，一趟做完。
         // 预览（preview）和真正发出去的那张（flush）都从这拿，几何不可能分叉。
-        return Packer.lay(Packer.solve(seqOf(list), Packer.DEFAULT_STRETCH, o.binCost));
+        // 排布器按 `packMode` 分派（rows / skyline），和 `splitOneBin` 必须是同一个（见 `Packer.pack`）。
+        return Packer.lay(Packer.pack(seqOf(list), Packer.DEFAULT_STRETCH, o.maxCrop,
+            o.maxCrop, o.binCost, o.packMode));
     }
 
     /**
@@ -373,7 +395,7 @@ final class Pipeline {
      * `cells` 里只有 bin 0 的那几个时下标记号就对不上了。贴 `via` 是给画图用的
      * （积分假切点不编号，见 `Sheet`），漏了它图上就会多出几个"假镜头"的编号。
      */
-    private static void attachVia(Packer.Result p, List<Entry> batch) {
+    static void attachVia(Packer.Result p, List<Entry> batch) {
         for (Packer.Cell c : p.cells) {
             int i = c.seq;
             c.via = (i >= 0 && i < batch.size()) ? batch.get(i).via : null;
@@ -489,7 +511,8 @@ final class Pipeline {
             List<Integer> next = new ArrayList<>(cur);
             next.add(t);
             int[] na = toArr(next);
-            if (!cur.isEmpty() && Packer.solve(na, Packer.DEFAULT_STRETCH, o.binCost).bins > 1) {
+            if (!cur.isEmpty() && Packer.pack(na, Packer.DEFAULT_STRETCH, o.maxCrop, o.maxCrop,
+                o.binCost, o.packMode).bins > 1) {
                 segs.add(toArr(cur));
                 cur = new ArrayList<>();
                 cur.add(t);
@@ -784,23 +807,6 @@ final class Pipeline {
     }
 
     /**
-     * **一次性摘批**：不是"边发边摘"。
-     *
-     * 区别要紧：边查 `pending()` 边 `take()` 的写法，中途若有人插进来改队列，
-     * 摘到一半的状态谁都说清。这里在一把锁里一次摘完，调用方拿到的是**确定的**一批。
-     * 摘出去的**不再自动回队列** —— 要退回去必须显式 `restore()`，这样"重复发同一张"
-     * 就只能发生在明确写了退回的地方。
-     *
-     * @param n 最多几张；`n <= 0` 返回空表
-     */
-    List<Sheet> takeUpTo(int n) {
-        List<Sheet> out = new ArrayList<>();
-        if (n <= 0) return out;
-        while (out.size() < n && !sheets.isEmpty()) out.add(sheets.remove(0));
-        return out;
-    }
-
-    /**
      * **用完即废**：一轮发出去之后清掉 draft，下一轮从 0 帧长起。
      *
      * 三条"不要"——每一条都有具体后果，别顺手加上：
@@ -819,22 +825,18 @@ final class Pipeline {
         lastBound = lastSeen != null ? lastSeen.t : lastBound;
     }
 
-    /** 只读快照：当前待发的几箱（0~queueDepth 张），给界面画"待发条带"。 */
-    List<Sheet> snapshot() {
-        return new ArrayList<>(sheets);
-    }
-
     /** 正在攒的这一箱有几帧（`Watcher.hasDraft()` 用；0 = 没有 draft）。 */
     int draftFrames() {
         return frames.size();
     }
 
-    /** 把一张刚取出来、还没交付的图放回队首。 */
-    boolean restore(Sheet sheet) {
-        if (sheet == null) return false;
-        if (o.queueDepth > 0 && sheets.size() >= o.queueDepth) return false;
-        sheets.add(0, sheet);
-        return true;
+    /**
+     * 正在攒的这一箱（**copy**，可以安全地在锁外拿去排版/画图）。
+     *
+     * 通话页的"实时预览"靠它：预览必须是**这一箱**，不是"最近 N 秒的原始帧重跑一遍管线"。
+     */
+    List<Entry> draftList() {
+        return new ArrayList<>(frames);
     }
 
     Sheet peek() {
@@ -842,7 +844,6 @@ final class Pipeline {
     }
 
     int pending() { return sheets.size(); }
-    boolean hasFrame() { return lastSeen != null; }
 
     /**
      * 立刻截断出图（用户插话走这条：不等判据，也不排队）。

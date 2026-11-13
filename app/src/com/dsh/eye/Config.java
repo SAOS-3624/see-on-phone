@@ -60,7 +60,26 @@ final class Config {
     private static final String K_PACE = "pace";
     private static final String K_TIER = "tierStyle";
     private static final String K_MAXFRAMES = "maxFrames";
-    private static final String K_CALLN = "callN";
+    /**
+     * 「宫格张数」的旧键（`callN`），**已废**。
+     *
+     * see-now 没有"一张图放几帧"这个设置：几帧是 `checkFlush()` 判的
+     * （`cellArea < flushGain` 碎格 / `maxWaitSec` 时间到 / `maxFrames:40` 保险）。
+     * 手机端把它做成 2/4/6/8 的档位，等于让 `frames.length >= maxFrames`
+     * 抢在 `flushGain` 前面封箱 —— 两条真正的判据全被架空。
+     * 只保留常量用来在 migrate 里清掉旧值。
+     */
+    private static final String K_CALLN_DEAD = "callN";
+    /**
+     * 「宫格缩放」的旧键（`auto` / `even`），**已废**。
+     *
+     * 等分只在"匀速采样"下才等价于 2×2，而通话页采样本身就是匀速的 ——
+     * 等于把版面锁死成一模一样，看不到"哪里变了"这个最该看的信息。
+     * 现在 `tierMode` 固定 `weight`（面积 ∝ 变化量），只保留常量用来在 migrate 里清掉旧值。
+     */
+    private static final String K_GRID_DEAD = "gridScale";
+    /** 通话页左下角那张"拼好的预览图"要不要显示（关掉连拼图都不做，省 CPU）。 */
+    private static final String K_PREVIEW = "previewOn";
 
     private static final String K_MAXTOK = "maxTokens";
     private static final String K_TIMEOUT = "timeoutSec";
@@ -102,6 +121,16 @@ final class Config {
                 .remove("idleStopMin").remove("changeLog").remove("mode")
                 .putBoolean("v4clean", true)
                 .apply();
+        }
+        /**
+         * ①-2 「宫格缩放」已删（见 {@link #K_GRID_DEAD}）。
+         *
+         * 旧值留着虽然不再被读，但**同名键以后要是被复用**，就会变成"用户和模型都不知道的
+         * 暗配置" —— 和上面 `maxFrames` 的坑一模一样，趁现在清掉。
+         * 单独用 `gridClean` 记，因为 `v4clean` 早就跑过了，写在它里面等于永远不执行。
+         */
+        if (!sp.getBoolean("gridClean", false)) {
+            sp.edit().remove(K_GRID_DEAD).remove(K_CALLN_DEAD).putBoolean("gridClean", true).apply();
         }
         /**
          * ② 上下文预算：0.14.0 的默认是 16k（十轮就撞墙），0.14.1 提到 64k。
@@ -430,18 +459,39 @@ final class Config {
 
     // ---------------------------------------------------------------- 通话
 
-    /** 通话页滚动缓冲留几张（= 自动开着时"攒满几张发一次"，关着时"发字带几张"）。 */
-    int callFrames() {
-        int v = sp.getInt(K_CALLN, 3);
-        return v >= 2 && v <= 8 ? v : 3;
+    /**
+     * 通话页的拼图预览开不开（默认开）。关掉 = 不显示、也不算，省 ~2% CPU。
+     */
+    boolean previewOn() { return sp.getBoolean(K_PREVIEW, true); }
+
+    void setPreviewOn(boolean on) { sp.edit().putBoolean(K_PREVIEW, on).apply(); }
+
+    /**
+     * **攒够几张宫格才一起交给模型**（see-now 的 `wakeBatch`，1~4，默认 1）。
+     *
+     * ⚠️ 这是 see-now **自己就有的设置**（`dsh-see-now/src/tuning.js:56`），不是手机端
+     * 新发明的旋钮 —— 加它之前/之后都别顺手扩展成别的东西。
+     *
+     * 省的不是图的钱（一张 798×450 才 222 token，多带两张几乎不要钱），
+     * 省的是**每一轮请求都要把整个上下文重过一遍**的那笔。
+     *
+     * 光攒不交是不省的：叫醒了却还是一次只给一张，剩下两张它还得再 `peek` 两次，
+     * 等于又变回三轮。所以 `queueDepth`（队列压几张）和 `takeMany()`（一次交几张）
+     * 必须用同一个数 —— see-now `runner.js:226` 的原话，只改一个都不省。
+     */
+    private static final String K_BATCH = "wakeBatch";
+
+    int wakeBatch() {
+        int v = sp.getInt(K_BATCH, 1);
+        return v >= 1 && v <= 4 ? v : 1;
     }
 
-    void setCallFrames(int v) { sp.edit().putInt(K_CALLN, v >= 2 && v <= 8 ? v : 3).apply(); }
+    void setWakeBatch(int v) { sp.edit().putInt(K_BATCH, v >= 1 && v <= 4 ? v : 1).apply(); }
 
-    /** 2 → 3 → … → 6 → 2。设置页点一下转一格。 */
-    int nextCallFrames() {
-        int v = callFrames() + 1;
-        return v > 6 ? 2 : v;
+    /** 设置页点一下循环：1 → 2 → 3 → 4 → 1。 */
+    int nextWakeBatch() {
+        int v = wakeBatch() + 1;
+        return v > 4 ? 1 : v;
     }
 
     // ---------------------------------------------------------------- 请求

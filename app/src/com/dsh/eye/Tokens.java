@@ -41,6 +41,17 @@ final class Tokens {
      */
     static final int[] CANVAS = fit(3, 4);
 
+    /**
+     * **方形画布**（`packMode = skyline` 用）。
+     *
+     * 天幕的格子是**正方形**（`pack.js::solveSkyline` 只按一条边算），而手机拍的画面是 3:4。
+     * 画布若还按 3:4，方格子拼出来的马赛克必然有一条边填不满（实测灰洞 15~36%）。
+     * 改成方形画布后马赛克刚好铺满，格子里的画面按 cover 居中裁 —— 一格裁掉约 25% 高度。
+     *
+     * 面积仍压在计费地板（544²）上：画大一分钱不多花，画小反而亏像素（见 {@link #fit}）。
+     */
+    static final int[] CANVAS_SQUARE = fit(1, 1);
+
     /** 一张宫格的 token（= 197，见 `Tokens` 的类注释；改画布必须重新报这个数）。 */
     static final int SHEET_TOKENS = imageTokens(CANVAS[0], CANVAS[1]);
 

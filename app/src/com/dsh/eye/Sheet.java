@@ -102,7 +102,7 @@ final class Sheet {
             boolean[] mask = covered < (long) canvasW * canvasH - 1
                 ? new boolean[canvasW * canvasH] : null;
 
-            int[] drawn = new int[1];
+            int drawn = 0;
             for (int i = 0; i < n; i += 1) {
                 Packer.Rect r = rects.get(i);
                 // 右/下各少画 SEAM 像素，底色透出来就是分隔线（同电脑版 sheet.js）
@@ -112,14 +112,20 @@ final class Sheet {
                 Bitmap bmp = i < sheet.frames.size()
                     ? decode(sheet.frames.get(i).jpeg, maxTileW) : null;
                 if (bmp == null) {
-                    // 缺帧/解不出来：铺灰块 + 横杠，和"这里本来该有画面"是一致的读法
+                    /**
+                     * 缺帧/解不出来：铺灰块 + 横杠（"这里本来该有画面"）。
+                     * **一定留日志** —— 真机上出现过"一格灰块"，没有日志只能靠猜。
+                     */
+                    byte[] src = i < sheet.frames.size() ? sheet.frames.get(i).jpeg : null;
+                    EyeLog.w("sheet", "第 " + (i + 1) + " 格画不出来："
+                        + (src == null ? "jpeg=null" : src.length + "B（解码失败）"));
                     drawPad(c, pad, r.px, r.py, cw, ch);
                     continue;
                 }
                 Rect dst = new Rect(r.px, r.py, r.px + cw, r.py + ch);
                 c.drawBitmap(bmp, coverSrc(bmp, dst), dst, fill);
                 bmp.recycle();
-                drawn[0] += 1;
+                drawn += 1;
             }
 
             // 空洞铺灰：**扫掩码找连续未覆盖段**，不是"每行最后一格的右边 + 画布底部"。
@@ -147,7 +153,7 @@ final class Sheet {
                 c.drawText(num, left + p + 2, top + th + p + 2 - label.descent() * 0.2f, label);
             }
 
-            if (drawn[0] == 0) return null;
+            if (drawn == 0) return null;
             ByteArrayOutputStream out = new ByteArrayOutputStream(96 * 1024);
             canvas.compress(Bitmap.CompressFormat.JPEG, quality, out);
             return out.toByteArray();

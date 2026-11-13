@@ -211,10 +211,16 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         void onError(String msg);
         void onState();
         /**
-         * 通话页的缓冲进度（"2/3"）。**采集线程**调的，实现里自己 post 到主线程。
-         * 这个数字是"它到底有没有在抓帧"的唯一可见证据 —— 没有它，用户只能猜。
+         * **拼好的那张图**（实时预览）。和真发出去的那张走同一个函数、同一批帧，
+         * 所以"预览长什么样 = 发出去什么样"。跑在后台线程，**每抓一帧重排一次**（5fps ⇒ 200ms）。
+         *
+         * @param cells   这张里有几格（就是图上画的格子数，不是"窗口里采了多少帧"）
+         * @param spanSec 这张覆盖了多少秒
+         *
+         * 这两个数必须**跟着这张图一起来** —— 以前是界面自己去问"攒了几帧"，
+         * 于是标签写"1 格"、图上画着 4 格，两边对不上（用户当场就问过）。
          */
-        void onFrames(int have, int need);
+        default void onSheetPreview(byte[] jpeg, int cells, double spanSec) { }
     }
 
     private volatile Ui uiSink;
@@ -229,21 +235,19 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     String lastLine() { return lastLine; }
 
     /**
-     * 通话页的取帧：**一直采，只留最新 N 张**。
+     * 通话页的取帧：**一直采，只留最新 N 张**（实现在 {@link CallCapture}）。
      *
-     * 这是"自动/手动"共用的底座 —— 不管自动开还是关，只要通话页开着，
-     * 相机每出一帧就按 {@link #CALL_SAMPLE_MS} 抽一张进 {@link #callBuf}，
-     * 队列满就顶掉最旧的。所以"最新 N 张"永远是**刚刚发生的事**，不是几分钟前的。
+     * 这是"自动/手动"共用的底座 —— 不管自动开还是关，只要通话页开着，相机每出一帧就按
+     * 采样间隔（发送窗口 ÷ 张数）抽一张进缓冲，队列满就顶掉最旧的。所以"最新 N 张"
+     * 永远是**刚刚发生的这一段时间**，不是几分钟前的。
      *
      * 两种用法：
-     *   - **自动 · 开**：攒满 N 张（且都是上次之后的新帧）就拼成一张宫格发过去，
-     *     它自己看一眼、有话说就说一句。间隔至少 {@link #AUTO_MIN_GAP_MS}，
-     *     画面一直没变则最多憋 {@link #AUTO_SAME_GAP_MS} 再看一眼。
+     *   - **自动 · 开**：攒满 N 张就拼成一张宫格发过去，它自己看一眼、有话说就说一句。
      *   - **自动 · 关**：一个字节都不发。等你开口（打字或话筒）时，
-     *     把当前这 N 张拼成一张宫格**挂在你的话上**一起发出去 ——
+     *     把当前这几张拼成一张宫格**挂在你的话上**一起发出去 ——
      *     这样它回答的是"你现在看到的"，而不是历史里那张老图。
      *
-     * ⚠️ 0.29.x 的病根：自动关着的时候**根本不采帧**，自动开着又要 `frames >= 2`
+     * ⚠️ 0.29.x 的病根：自动关着的时候**根本不采帧**，自动开着又要求 `frames >= 2`
      * （静止画面永远只有 1 帧）才发 —— 两头都堵死，表现就是"它一直看着同一张老图"。
      */
     private volatile boolean autoWatch;
@@ -260,46 +264,33 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     /** 这一轮是"自己看一眼"发起的（回来太短就当没说话）。 */
     private volatile boolean pendingAuto;
     private volatile long lastAutoAt;
-    /** 上一次**真的发出去**的时间（和 lastAutoAt 不是一回事：那个是"尝试"的间隔）。 */
-    private volatile long lastAutoSentAt;
-    private volatile byte[] lastAutoSheet;
-
-    /** 兜底上限：连续"没变化"退避也不会超过这个。 */
-    private static final long AUTO_MAX_GAP_MS = 60_000;
     /** 看门狗用：这一轮是什么时候开的。 */
     private volatile long lastRoundAt;
     /** 上一次生效的灵敏度（变了就重置退避）。 */
     private String appliedPace;
-    /** 画面一直没变，最多憋这么久也要再看一眼（否则就是"它不动了"）。 */
-    private static final long AUTO_SAME_GAP_MS = 30_000;
-    /**
-     * 取样间隔**不再是常数**：见 {@link #sampleIntervalMs()}。
-     *
-     * 定死 900ms 的后果是"三帧只横跨 1.8 秒"，而发送窗口是 15 秒 ——
-     * 中间十几秒一帧都没采，用户看到的就是"只抓很近的两帧，其余的都抓不到"。
-     */
-    private static final long CALL_SAMPLE_MIN_MS = 1_000;
-    private static final long CALL_SAMPLE_MAX_MS = 6_000;
+    /** 发送间隔的硬上限（灵敏度那几档都在它之下，留着是防手改的配置把节奏拉到几分钟）。 */
+    private static final long AUTO_MAX_GAP_MS = 60_000;
 
     /** 通话页开着没有（决定要不要一直采帧）。 */
     private volatile boolean callActive;
-    /** 滚动缓冲：最新 N 张原始 JPEG，旧的在队首。 */
-    private final java.util.ArrayDeque<byte[]> callBuf = new java.util.ArrayDeque<byte[]>();
-    /** 已采样帧数 / 上一次交给模型的帧水位（差值 = 有几张是新的）。 */
-    private long callSeq;
-    private long callSentSeq;
-    private long lastCallSampleAt;
+    /** 相机是这一秒才开的（预热期内收到的都是黑帧，见 {@link CallCapture#WARMUP_MS}）。 */
+    private volatile long callOpenedAt;
+    /**
+     * 连续取帧窗口：最近"一个发送窗口"的连续帧（{@link CallCapture#FPS} 帧/秒）。
+     *
+     * ⚠️ 它是**连续**的，不是"隔几秒抽一张"。切点判据吃的是相邻帧差分，
+     * 抽稀成快照之后判据全废 —— 用户看到的就是"每格一个不相干的画面"。
+     */
+    private final CallCapture capture = new CallCapture();
 
-    /** 缓冲要几张 —— 跟着设置 · 通话 · 攒帧张数走（2~8，默认 3）。 */
-    int callN() {
-        int n = cfg == null ? 3 : cfg.callFrames();
-        return Math.max(2, Math.min(8, n));
-    }
-
-    /** 现在是几张（界面显示"2/3"用）。 */
-    int callBuffered() {
-        synchronized (callBuf) { return callBuf.size(); }
-    }
+    /**
+     * **一条通话会话 = 一条连续管线**（= 电脑版 `createPipeline` 只在开播时建一次）。
+     *
+     * 以前是"每次发图把最近 N 秒的帧重喂一遍新管线"，管线里 `gapEwma / Tiers / 去重 /
+     * 积分累积` 全部每窗清零 —— 出来就只有切点、没有兜底和积分帧，一窗 2 帧。
+     * 详见 {@link CallStream} 的类注释。
+     */
+    private final CallStream stream = new CallStream();
 
     /** 通话页开/关时借用相机（预览是要一直有帧的）。 */
     void callOpen() {
@@ -309,73 +300,161 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         try { if (engine != null) engine.setResolution("medium"); } catch (Throwable ignored) { }
         autoWatch = cfg == null || cfg.autoWatch();   // 用记住的那个选择，别每次硬置 true
         lastAutoAt = System.currentTimeMillis();
-        synchronized (callBuf) {
-            callBuf.clear();
-            callSeq = 0;
-            callSentSeq = 0;
+        capture.reset();
+        callOpenedAt = System.currentTimeMillis();
+        previewBusy = false;
+        lastPreviewAt = 0;
+        // 建这条会话唯一的管线：窗口 = 发送间隔。**张数不设** —— 几帧由 see-now 的
+        // `flushGain`（碎格）/ `maxWaitSec`（时间）/ `maxFrames:40`（保险）自己判。
+        // 队列深度 = 攒批（`wakeBatch`，默认 1 = 原来的行为）。
+        if (looker != null) {
+            stream.open(looker.opts(), autoGapMs() / 1000.0,
+                cfg == null ? 1 : cfg.wakeBatch());
         }
-        lastCallSampleAt = 0;
     }
 
     void callClose() {
         callActive = false;
         autoWatch = false;
-        synchronized (callBuf) {
-            callBuf.clear();
-            callSeq = 0;
-            callSentSeq = 0;
-        }
+        capture.reset();
+        stream.close();
         // 回到会话页那种"偶尔看一眼"的用法，640 够用也省电
         try { if (engine != null) engine.setResolution("low"); } catch (Throwable ignored) { }
         camRelease();
     }
 
     /**
-     * 采集线程每出一帧都走这里：按间隔抽一张进缓冲。
+     * 通话页唯一的后台线程：**喂帧**（JPEG→rgb24+打分，~15ms）和**画预览**（~40ms）都在这。
      *
-     * 只做"塞进队列"这一件事，**不拼图不发请求** —— 拼图要 30~60ms，放在采集线程上
-     * 会把预览拖卡。发送由 1 秒一次的 tick 去判（见 {@link #maybeAutoSend()}）。
+     * 为什么合成一条：两个单线程池（以前是 `scorePool` + `previewPool`）等于两个队列、
+     * 两套"忙不忙"的判断，还要担心互相插队 —— 而这两件事加起来在 5fps（200ms 预算）里
+     * 只占 55ms。一个线程 = 一个顺序 = 帧永远按时间进管线，不会因为预览插队乱序。
+     */
+    private final java.util.concurrent.ExecutorService workPool =
+        java.util.concurrent.Executors.newSingleThreadExecutor();
+    private volatile boolean previewBusy;
+    /** 左下角那张拼图预览显不显示（设置里记住；关掉连拼图都不算）。 */
+    private volatile boolean previewOn = true;
+    /**
+     * 两次拼图之间的最小间隔 = **0，每抓一帧就重排一次**（5fps ⇒ 200ms 一张）。
+     *
+     * 原来是 3000ms。那对"看热闹"够用，但**调试时是瞎的**：管线 5fps 在抓帧，
+     * 预览 3 秒才动一次，看不出哪一帧被留下、排成了什么档位。
+     * 2026-11-14 用户原话"我要看到每抓一帧都会变化那种"。
+     *
+     * 靠 `previewBusy` 防重入：上一次拼图还没完就跳过这一帧，绝不排队
+     * （排队会把 200ms 的采样节奏拖垮，得不偿失）。
+     */
+    private static final long PREVIEW_EVERY_MS = 0;
+
+    /**
+     * 安排一次"拼出来长什么样"的预览。
+     *
+     * 画的是**管线正在攒的那一箱**（`CallStream.preview()` → 同一个 `CallSheet.layout`），
+     * 所以预览就是"此刻发出去会是什么样"，而且不用重算任何帧的打分（帧进来时已经算过）。
+     */
+    private void schedulePreview() {
+        if (!previewOn) return;                     // 用户把预览关了：一次拼图都不做
+        long now = System.currentTimeMillis();
+        if (previewBusy || now - lastPreviewAt < PREVIEW_EVERY_MS || looker == null) return;
+        if (!callActive || stream.draftFrames() == 0) return;
+        previewBusy = true;
+        lastPreviewAt = now;
+        try {
+            workPool.submit(new Runnable() {
+                public void run() {
+                    try {
+                        Pipeline.Sheet s = stream.preview();
+                        if (s == null) return;
+                        /**
+                         * **这一箱的最后一帧还是上一张用的那一帧** = 内容没变，别重拼。
+                         *
+                         * 静止画面时管线不新增帧（`dupMin` 去重 + 兜底 20 秒），
+                         * 而 `schedulePreview` 是 5fps 进来的 —— 不判这一下就是每秒
+                         * 白拼 5 张一模一样的图。有变化时每帧都会走到下面，预览跟着变。
+                         */
+                        Pipeline.Entry tail = s.frames.isEmpty() ? null : s.frames.get(s.frames.size() - 1);
+                        if (tail != null && tail == lastPrevTail) return;
+                        lastPrevTail = tail;
+
+                        long t0 = System.currentTimeMillis();
+                        byte[] jpg = looker.thumb(s);
+                        prevCostMs += System.currentTimeMillis() - t0;
+                        prevN += 1;
+                        // 每 25 张报一次（5fps 下约 5 秒）：真机上核对"预览到底跟不跟得上"
+                        if (prevN % 25 == 0) {
+                            EyeLog.w("look", "preview " + prevN + " 张 · 平均 "
+                                + (prevCostMs / prevN) + "ms · 上张 " + s.frames.size() + " 格");
+                        }
+                        Ui u = uiSink;
+                        if (u != null && jpg != null) {
+                            u.onSheetPreview(jpg, s.frames.size(), s.to - s.from);
+                        }
+                    } catch (Throwable e) {
+                        EyeLog.w("look", "预览失败: " + e);
+                    } finally {
+                        previewBusy = false;
+                    }
+                }
+            });
+        } catch (Throwable e) {
+            previewBusy = false;
+        }
+    }
+    private volatile long lastPreviewAt;
+    /** 上一张预览用的最后一帧 —— 引用相同就说明这一箱没长，不必重拼。 */
+    private Pipeline.Entry lastPrevTail;
+    private int prevN;
+    private long prevCostMs;
+
+    /** 界面上的"显示/隐藏预览"按钮走这里：落盘 + 立刻生效。 */
+    void setPreviewOn(boolean on) {
+        previewOn = on;
+        lastPreviewAt = 0;                  // 重新打开：下一帧立刻重排
+        if (cfg != null) cfg.setPreviewOn(on);
+    }
+
+    boolean previewOn() { return previewOn; }
+
+    /**
+     * 采集线程每出一帧都走这里：够密就收进窗口。
+     *
+     * 只做"塞进队列"这一件事，**不拼图不发请求** —— 拼图要几十毫秒（还要解一整窗 JPEG），
+     * 放在采集线程上会把预览拖卡。发送由 1 秒一次的 tick 去判（见 {@link #maybeAutoSend()}）。
      */
     private void sampleCallFrame(byte[] jpg) {
         if (!callActive || jpg == null || jpg.length == 0) return;
-        long now = System.currentTimeMillis();
-        if (now - lastCallSampleAt < sampleIntervalMs()) return;
-        lastCallSampleAt = now;
-        int n = callN();
-        int have;
-        synchronized (callBuf) {
-            while (callBuf.size() >= n) callBuf.removeFirst();
-            callBuf.addLast(jpg);
-            callSeq += 1;
-            have = callBuf.size();
-        }
-        // 界面上的"2/3"：让用户看得见它确实在抓帧
-        Ui u = uiSink;
-        if (u != null) {
-            try { u.onFrames(have, n); } catch (Throwable ignored) { }
-        }
-    }
-
-    /**
-     * 多久取一张：**让 N 张正好覆盖上一个发送窗口**。
-     *
-     * 正常 15s / 3 张 ⇒ 每 5 秒一张，三帧横跨 10 秒（第一帧到第三帧），
-     * 正好是"上次发完到现在"这一段。夹在 1~6 秒，免得灵敏档糊成一片、平静档太稀。
-     * **每次现算**：灵敏度和攒帧张数都是运行中可改的。
-     */
-    private long sampleIntervalMs() {
-        int n = Math.max(1, callN());
-        long ms = autoGapMs() / n;
-        return Math.max(CALL_SAMPLE_MIN_MS, Math.min(CALL_SAMPLE_MAX_MS, ms));
+        /**
+         * 相机刚开（`callOpen` 里换到 medium 会 reopen）那 1 秒出的是**还没曝光好的黑帧**，
+         * 收进来就会在第一格留一块黑的（真机实测：4 格宫格里第 1 格全黑，模型以为镜头被挡）。
+         */
+        if (System.currentTimeMillis() - callOpenedAt < CallCapture.WARMUP_MS) return;
+        long at = System.currentTimeMillis();
+        if (!capture.offer(at)) return;
+        /**
+         * 解码 + 打分（~5ms/帧）放**后台单线程**：采集线程是相机的回调线程，
+         * 在那儿解 Bitmap 会把预览拖卡（真机实测掉帧）。
+         */
+        final byte[] frame = jpg;
+        final long atMs = at;
+        try {
+            workPool.submit(new Runnable() {
+                public void run() {
+                    Looker lk = looker;
+                    if (lk == null || !callActive) return;
+                    byte[] rgb = lk.toRgb24(frame);
+                    if (rgb == null) return;
+                    stream.push(atMs, rgb, frame);
+                }
+            });
+        } catch (Throwable ignored) { }
+        schedulePreview();
     }
 
     void setAutoWatch(boolean on) {
         autoWatch = on;
-        // 打开的那一刻就允许立刻发（否则要等 6 秒，用户会以为开关没生效）
+        // 打开的那一刻就允许立刻发（否则要等一整个窗口，用户会以为开关没生效）
         lastAutoAt = on ? 0 : System.currentTimeMillis();
-        if (on) {
-            synchronized (callBuf) { callSentSeq = 0; }   // 缓冲里现有的也算"新的"
-        }
         if (cfg != null) cfg.setAutoWatch(on);        // 记住
     }
 
@@ -385,8 +464,9 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      * 两次自动看之间隔多久 —— **跟着设置里的「灵敏度」走**。
      *
      * 平静 25s / 正常 15s / 灵敏 8s / 游戏 20s（画面一直在动，别一句接一句）。
-     * 连续"没什么变化"时再翻倍退避（最多 60s）：手上举着手机那种"轻微晃但没内容变化"的
-     * 场景，本来就会被 15 秒一次地追问，退避之后它自己就安静了。
+     *
+     * 这个数同时是**采样窗口**：{@link CallCapture#interval} 拿它除以张数，
+     * 所以 N 张正好铺满"上一次发完到现在"。改它 = 同时改采样密度和发送节奏，两者不会脱节。
      */
     private long autoGapMs() {
         String p = cfg == null ? "normal" : cfg.pace();
@@ -411,19 +491,22 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             }
         }
         if (!cfg.direct()) return;
-        int n = callN();
-        long seq;
-        int have;
-        synchronized (callBuf) {
-            seq = callSeq;
-            have = callBuf.size();
-        }
-        if (have < n) return;                              // 还没攒满
+        /**
+         * **等管线自己封箱**。什么时候封是 `Pipeline` 判的（`flushGain` 碎格 /
+         * `maxWaitSec` 时间 / `maxFrames:40` 保险 / 兜底 / 切点），App 不再拿
+         * "攒够几帧""隔了多少秒"再判一遍 —— 两处都判就会把管线刚攒好的节奏打乱
+         * （1.1.3 的 `have() < 3` 就是这么把图卡在 2 帧的）。
+         */
+        if (!stream.ready()) return;
         long now = System.currentTimeMillis();
-        if (now - lastAutoAt < autoGapMs()) return;        // 攒够了也等一等
-        if (seq - callSentSeq < n) return;                 // 这 N 张里没有新的
+        /**
+         * 发送节奏由**灵敏度**定（平静 25s / 正常 15s / 灵敏 8s / 游戏 20s），
+         * 不是"管线一封箱就发" —— 4 格在画面动的时候 2~3 秒就攒满，
+         * 照着发就是每 3 秒找模型说一句（真机实测过：23:02:47、23:02:50 连着两张）。
+         * 攒满的那张会待在队列里（`queueDepth = 1` 只留最新一张），到点了取最新的发。
+         */
+        if (now - lastAutoAt < autoGapMs()) return;
         lastAutoAt = now;
-        callSentSeq = seq;
         autoBusy = true;
         Ui u = uiSink;
         if (u != null) u.onTool("look", "running", "自己看一眼…");
@@ -443,53 +526,60 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         }
     }
 
-    /** 自动看：把缓冲里这几帧拼成一张，**连图带话**发过去。 */
+    /** 自动看：把管线封好的那一箱（攒批 > 1 时是那几箱）**连图带话**发过去。 */
     private void autoLookBuffered() {
-        Tools.Look l = callSheet("auto");
-        if (l == null || l.jpeg == null) return;
-        clearCallBuf();                       // 这一批看过了：0/3 重新攒
+        if (looker == null) return;
+        /**
+         * 一次取走**攒下的全部**（上限 = `wakeBatch`）。
+         *
+         * 只取一张的话队列压得住也没用 —— 模型还得为剩下两张各来一轮，
+         * 每轮都要把整个上下文重过一遍，那就是没省（see-now `runner.js:409`）。
+         */
+        java.util.List<Pipeline.Sheet> sheets =
+            stream.takeMany(cfg == null ? 1 : cfg.wakeBatch());
+        if (sheets.isEmpty()) return;
+        java.util.List<byte[]> jpegs = new java.util.ArrayList<>();
+        int frames = 0, tokens = 0;
+        for (Pipeline.Sheet s : sheets) {
+            Tools.Look l = looker.lookOf(s);
+            if (l == null || l.jpeg == null) continue;
+            jpegs.add(l.jpeg);
+            frames += l.frames;
+            tokens += l.tokens;
+        }
+        if (jpegs.isEmpty()) return;
+        // **不清窗口**：它是滑动的（永远"最近 window 秒"），清了就变成"只有发完这一秒"，
+        // 紧接着用户开口时就会拿到 2 帧、跨 1.7 秒 —— 正是他觉得"又变成两帧"的那种图。
         // 「攒满就发」就是攒满就发：不再拿"跟上一次像不像"去拦。
         // 用户的原话是这个，而拦一次的表现就是"它又不动了"。真没内容时模型会回一句
         // 「没什么变化」—— 那一轮不朗读不落盘（looksLikeNoop），体验上分得开。
-        EyeLog.w("auto", "攒满就发：frames=" + l.frames + " tokens=" + l.tokens);
+        // ⚠️ 攒批 = 1 时日志必须和改动前**逐字一致**（`看一张：…`），别为了统一格式改掉它。
+        EyeLog.w("auto", jpegs.size() == 1
+            ? "看一张：n=" + frames + " tokens=" + tokens
+            : "看 " + jpegs.size() + " 张：n=" + frames + " tokens=" + tokens);
         // ⚠️ 顺序：先 send（它会把 pendingAuto 清成 false），再立标记。
         //    反过来的话，`send` 开头那句清标记会把这次自动看标记掉。
-        sendWithSheet("（你自己看了一眼画面）有值得说的就一句话说；没变化就只回「嗯」。",
-            l.jpeg, l.frames);
+        sendWithSheets(jpegs, frames);
         pendingAuto = true;
     }
 
     /**
-     * 这几帧已经**交出去了**：清空、计数归零。
+     * 用户开口时**当场截断**出一张宫格（插话那条路，只有一张）。
      *
-     * 界面上的 `2/3` 读作"攒了几张还没发" —— 发完必须是 `0/3` 再从头攒。
-     * 不清的话计数器一直停在满格，用户会以为它把同一批图反复发（其实也确实会反复发）。
+     * 挑哪几帧、每帧多大**全交给管线**（`takeNow` → `flush`）—— 这一层只负责递过去。
+     * 「自动看」不走这里：它要取走队列里攒下的**全部**（见 {@link #autoLookBuffered}）。
      */
-    private void clearCallBuf() {
-        int n = callN();
-        synchronized (callBuf) {
-            callBuf.clear();
-            callSentSeq = callSeq;          // 水位推到当前：下一轮必须重新攒满 N 张
-        }
-        Ui u = uiSink;
-        if (u != null) {
-            try { u.onFrames(0, n); } catch (Throwable ignored) { }
-        }
+    private Tools.Look callSheet(String why) {
+        if (looker == null) return null;
+        // 插话：立刻截断出图（管线攒到哪算哪），用户问的是"现在"
+        return looker.lookOf(stream.takeNow(System.currentTimeMillis(), why));
     }
 
-    /** 拿缓冲里当前这几帧拼一张宫格（没有人开口时也能用：auto 和"发字带图"共用）。 */
-    private Tools.Look callSheet(String why) {
-        java.util.List<byte[]> frames = new java.util.ArrayList<byte[]>();
-        synchronized (callBuf) { frames.addAll(callBuf); }
-        if (frames.isEmpty() || looker == null) return null;
-        return looker.compose(frames, why, sampleIntervalMs() / 1000.0);
-    }
 
     /**
      * 用户开口（打字/话筒）时，把缓冲里的帧挂在这句话上。
      *
      * 自动开着也照样挂 —— 他既然开口问了，就该让他问的是"现在"。
-     * 发完把水位推到当前，免得紧接着自动那条又发一遍同样的内容。
      */
     private void sendWithBufferedFrames(final String text) {
         Tools.Look l = callSheet("user");
@@ -497,44 +587,14 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             send(text, (java.util.List<byte[]>) null, 0, false, null);
             return;
         }
-        clearCallBuf();                       // 这一批跟着话发出去了：0/3 重新攒
-        // 刚发过图：自动那条往后挪，而且以这张为"上一次看到的画面"
+        // 刚发过图：自动那条往后挪（窗口不动，见 autoLookBuffered 里的注释）
+        // 而且以这张为"上一次看到的画面"
         lastAutoAt = System.currentTimeMillis();
+        lastPreviewAt = 0;                    // 窗口已经交出去了：下一帧来了立刻重排预览
         EyeLog.w("send", "带通话帧 " + l.frames + " 张 tokens=" + l.tokens);
         send(text, java.util.Collections.singletonList(l.jpeg), l.frames, true,
             "这是手机摄像头**刚才这几秒**攒的 " + l.frames + " 帧拼成的一张宫格"
                 + "（按时间先后，左上角是编号）。直接看这张图回答，不要调用 look 工具。");
-    }
-
-    /**
-     * 判断"还是那个画面"。
-     *
-     * ⚠️ **不能逐字节相等**：画面一动不动的时候，JPEG 也会因为自动曝光/传感器噪声
-     * 差几十个字节。0.29.x 用的就是 `a[i] != b[i]`，于是"一模一样"永远判不出来，
-     * 自动看每 6 秒发一次同样的图、模型每 6 秒回一次"没变化" —— 白烧钱还吵。
-     *
-     * 这里抽 128 个点，只有**明显不同**（|差| > 16）的点超过 8% 才算"变了"。
-     */
-    private boolean sameSheet(byte[] a, byte[] b) {
-        if (a == null || b == null) return false;
-        if (a.length != b.length) return false;
-        int step = Math.max(1, a.length / 128);
-        int diff = 0;
-        int n = 0;
-        for (int i = 0; i < a.length; i += step) {
-            n += 1;
-            if (Math.abs((a[i] & 0xFF) - (b[i] & 0xFF)) > 16) diff += 1;
-        }
-        if (n == 0) return false;
-        int pct = diff * 100 / n;
-        // 「平静」要变很多才算变，「灵敏」动一点就算
-        String p = cfg == null ? "normal" : cfg.pace();
-        int need;
-        if ("calm".equals(p)) need = 25;
-        else if ("dense".equals(p)) need = 5;
-        else if ("game-economic".equals(p)) need = 35;
-        else need = 15;
-        return pct < need;
     }
 
     /** 「没什么可说的」—— 只认明确的否定词，不用长度猜（"地上有水"只有 4 个字但必须说）。 */
@@ -555,11 +615,13 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     public void onCreate() {
         super.onCreate();
         instance = this;
+        BuildConfig.attach(this);   // 给 Portable 那种没有 Context 的静态工具读版本号
         running = true;
         startForeground(NOTI_ID, buildNotification("就绪"));
 
         cfg = new Config(this);
-        cfg.migrate();          // 老版本存下的默认值升到 v4 口径（模型名 / 上下文轮数）
+        cfg.migrate();                        // 老版本存下的默认值升到 v4 口径（模型名 / 上下文轮数）
+        previewOn = cfg.previewOn();
         speaker = new Speaker(this);
         looker = new Looker(cfg);
         http = new HttpServer(this);
@@ -949,11 +1011,21 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         send(text, (java.util.List<byte[]>) null, 0, false, null);
     }
 
-    /** 自动看那条：图必须**真的进 API**（不然模型只能自己再拍一次，白等一轮）。 */
-    private void sendWithSheet(String text, byte[] sheet, int frames) {
-        send(text, java.util.Collections.singletonList(sheet), frames, true,
-            "这是手机摄像头**刚才这一会儿**攒的 " + frames + " 帧拼成的一张宫格"
-                + "（按时间先后，左上角是编号）。直接看它，不要调用 look 工具。");
+    /**
+     * 自动看那条：图必须**真的进 API**（不然模型只能自己再拍一次，白等一轮）。
+     *
+     * `frames` 是这一批的**合计**（多张时每张各用这个数落盘，和 see-now `attachAndReturn`
+     * 的口径一致：单张时它就是那张的帧数，多张时单张区间不进 `Shot`）。
+     */
+    private void sendWithSheets(java.util.List<byte[]> sheets, int frames) {
+        String note = sheets.size() == 1
+            ? "这是手机摄像头**刚才这一会儿**攒的 " + frames + " 帧拼成的一张宫格"
+                + "（按时间先后，左上角是编号）。直接看它，不要调用 look 工具。"
+            : "这是手机摄像头**刚才这几段时间**攒的 " + sheets.size() + " 张宫格、共 " + frames
+                + " 帧（每张内部按时间先后，左上角是编号；多张之间也是先后顺序）。"
+                + "直接看它们回答，不要调用 look 工具。";
+        send("（你自己看了一眼画面）有值得说的就一句话说；没变化就只回「嗯」。",
+            sheets, frames, true, note);
     }
 
     /**
@@ -1547,15 +1619,17 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             appliedPace = cfg.pace();
             lastAutoAt = 0;                 // 立刻按新节奏来
             EyeLog.w("auto", "灵敏度 → " + cfg.paceLabel()
-                + "（每 " + (sampleIntervalMs() / 1000.0) + "s 取一张，间隔 "
-                + (autoGapMs() / 1000) + "s）");
+                + "（窗口 " + (autoGapMs() / 1000) + "s · " + CallCapture.FPS + "fps）");
         }
+        // 攒批（wakeBatch）改了不会立刻生效：`queueDepth` 是 `CallStream.open()` 建管线时定的
+        // （see-now 也一样 —— `queueDepth` 在 `createPipeline` 时定）。下一次进通话页才用新值。
         notifyState();
         EyeLog.w("svc", "apply think=" + cfg.think() + " speak=" + cfg.speak()
             + " ctx=" + Config.ctxLabel(cfg.ctxTokens())
             + " imgw=" + cfg.imgWindow() + " sum=" + cfg.summary()
             + " mem=" + cfg.memInject() + "(" + Memory.count() + "份)"
-            + " tier=" + cfg.tierStyle() + " pace=" + cfg.pace());
+            + " tier=" + cfg.tierStyle() + " pace=" + cfg.pace()
+            + " wake=" + cfg.wakeBatch());
     }
 
     /** `/mode`：两种模式都删了，**恒返回 normal** —— 老脚本不会崩。 */
@@ -1785,7 +1859,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
 
     String statusJsonImpl() {
         StringBuilder b = new StringBuilder(400);
-        b.append("{\"app\":\"鱼眼\",\"version\":\"").append(BuildConfig.VERSION).append("\"")
+        b.append("{\"app\":\"鱼眼\",\"version\":\"").append(BuildConfig.version(this)).append("\"")
          .append(",\"streaming\":").append(streaming())
          .append(",\"cameraOpen\":").append(engine != null)
          .append(",\"camera\":\"").append(engine != null && engine.isFront() ? "front" : "back").append("\"")
@@ -1798,8 +1872,15 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
          .append(",\"speak\":").append(cfg == null || cfg.speak())
          .append(",\"tools\":").append(cfg != null && cfg.tools())
          .append(",\"tierStyle\":\"").append(cfg == null ? "standard" : cfg.tierStyle()).append("\"")
+         /**
+          * 档位判据。**默认必须是 `density`**（see-now `pipeline.js:290` 的默认）。
+          * 报出来是为了能一眼核对"手机端有没有偷偷跟电脑版分叉"——
+          * 2026-11-14 就是把默认改成 weight 没被发现，用户当场指出来的。
+          */
+         .append(",\"tierMode\":\"").append(Tuning.load().str("tierMode", "density")).append("\"")
          .append(",\"pace\":\"").append(cfg == null ? "normal" : cfg.pace()).append("\"")
          .append(",\"maxFrames\":").append(cfg == null ? 0 : cfg.maxFrames())
+         .append(",\"wakeBatch\":").append(cfg == null ? 1 : cfg.wakeBatch())
          .append(",\"conv\":\"").append(convId()).append("\"")
          .append(",\"convTitle\":\"").append(Json.esc(convTitle())).append("\"")
          .append(",\"convMsgs\":").append(history.size())

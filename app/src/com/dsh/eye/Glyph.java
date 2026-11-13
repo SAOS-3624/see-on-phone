@@ -63,6 +63,7 @@ public final class Glyph {
         "mic", "image", "send", "stop", "gear", "video", "menu", "back", "plus", "trash",
         "edit", "chevron", "chevronUp", "chevronRight", "eye", "check", "close", "copy",
         "refresh", "search", "fisheye", "sound", "folder", "wifi", "speed", "camera",
+        "grid",
     };
 
     private static int px(Context c, int sizeDp) {
@@ -183,6 +184,13 @@ public final class Glyph {
             s.lineTo(12.8f, 15.2f);
             s.lineTo(15.6f, 12.6f);
             s.lineTo(19.6f, 17.2f);
+
+        } else if ("grid".equals(name)) {
+            // 宫格缩放：一格大 + 两格小 + 底下一整条 —— 就是 `weight` 拼出来的样子
+            s.addRoundRect(new RectF(3f, 3.4f, 12.6f, 13.2f), 2f, 2f, Path.Direction.CW);
+            s.addRoundRect(new RectF(14.4f, 3.4f, 21f, 7.4f), 1.4f, 1.4f, Path.Direction.CW);
+            s.addRoundRect(new RectF(14.4f, 9.2f, 21f, 13.2f), 1.4f, 1.4f, Path.Direction.CW);
+            s.addRoundRect(new RectF(3f, 14.6f, 21f, 20.6f), 2f, 2f, Path.Direction.CW);
 
         } else if ("send".equals(name)) {
             // 向上的箭头：发送
