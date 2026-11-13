@@ -170,7 +170,7 @@ public class SettingsActivity extends AppActivity {
             } });
 
         head("通话");
-        row("fisheye", "攒帧张数", "自动开：攒满就发；自动关：发字时带上", cfg.callFrames() + " 张",
+        row("fisheye", "攒帧张数", "攒满几张发一次", cfg.callFrames() + " 张",
             new Runnable() { public void run() {
                 cfg.setCallFrames(cfg.nextCallFrames());
                 apply();
@@ -178,6 +178,25 @@ public class SettingsActivity extends AppActivity {
         row("video", "自动看", "开着它自己开口；关着只在你说话时发", cfg.autoWatch() ? "开" : "关",
             new Runnable() { public void run() {
                 cfg.setAutoWatch(!cfg.autoWatch());
+                apply();
+            } });
+
+        /**
+         * 采集两项：**和电脑版 see-now 的「灵敏度 / 档位映射」是同一个东西、同一个取值**
+         * （`pace` / `tierStyle`），所以电脑上调好的口径能原样搬过来。
+         *
+         * 之前这两项只活在 `tune` 工具里（模型自己调），设置页看不到 —— 用户的原话是
+         * "档位映射呢？灵敏度呢？怎么都没了"。**模型能调不等于用户能调**，这两件事要分开。
+         */
+        head("采集");
+        row("speed", "灵敏度", "画面变化多快算变化", cfg.paceLabel(),
+            new Runnable() { public void run() {
+                cfg.setPace(cfg.nextPace());
+                apply();
+            } });
+        row("image", "档位映射", cfg.tierHint(), cfg.tierLabel(),
+            new Runnable() { public void run() {
+                cfg.setTierStyle(cfg.nextTier());
                 apply();
             } });
 

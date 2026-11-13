@@ -8,6 +8,6 @@ package com.dsh.eye;
  * 这种查半天的问题（交接文档第 1 节记的就是这个坑）。
  */
 final class BuildConfig {
-    static final String VERSION = "1.0.1";
+    static final String VERSION = "1.0.2";
     private BuildConfig() { }
 }

@@ -264,8 +264,12 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     private volatile long lastAutoSentAt;
     private volatile byte[] lastAutoSheet;
 
-    /** 两次"自己看一眼"之间至少隔这么久（攒够了也等等，别一秒一句）。 */
-    private static final long AUTO_MIN_GAP_MS = 8_000;
+    /** 兜底上限：连续"没变化"退避也不会超过这个。 */
+    private static final long AUTO_MAX_GAP_MS = 60_000;
+    /** 连续几次"没什么变化"。整段没信息的时候自动翻倍退避 —— 这是"太灵敏"的正解。 */
+    private volatile int autoNoops;
+    /** 上一次生效的灵敏度（变了就重置退避）。 */
+    private String appliedPace;
     /** 画面一直没变，最多憋这么久也要再看一眼（否则就是"它不动了"）。 */
     private static final long AUTO_SAME_GAP_MS = 30_000;
     /** 通话页缓冲的取样间隔：900ms ⇒ 攒 3 张约 2.7 秒。 */
@@ -358,6 +362,24 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
 
     boolean autoWatch() { return autoWatch; }
 
+    /**
+     * 两次自动看之间隔多久 —— **跟着设置里的「灵敏度」走**。
+     *
+     * 平静 25s / 正常 15s / 灵敏 8s / 游戏 20s（画面一直在动，别一句接一句）。
+     * 连续"没什么变化"时再翻倍退避（最多 60s）：手上举着手机那种"轻微晃但没内容变化"的
+     * 场景，本来就会被 15 秒一次地追问，退避之后它自己就安静了。
+     */
+    private long autoGapMs() {
+        String p = cfg == null ? "normal" : cfg.pace();
+        long base;
+        if ("calm".equals(p)) base = 25_000;
+        else if ("dense".equals(p)) base = 8_000;
+        else if ("game-economic".equals(p)) base = 20_000;
+        else base = 15_000;
+        long g = base * (1 + Math.min(autoNoops, 3));
+        return Math.min(g, AUTO_MAX_GAP_MS);
+    }
+
     /** tick 每秒调一次：够不够"攒满就发"，够就发。 */
     private void maybeAutoSend() {
         if (!autoWatch || !callActive || !running || cfg == null || autoBusy) return;
@@ -372,7 +394,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         }
         if (have < n) return;                              // 还没攒满
         long now = System.currentTimeMillis();
-        if (now - lastAutoAt < AUTO_MIN_GAP_MS) return;    // 攒够了也等一等
+        if (now - lastAutoAt < autoGapMs()) return;        // 攒够了也等一等
         if (seq - callSentSeq < n) return;                 // 这 N 张里没有新的
         lastAutoAt = now;
         callSentSeq = seq;
@@ -474,7 +496,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      *
      * 这里抽 128 个点，只有**明显不同**（|差| > 16）的点超过 8% 才算"变了"。
      */
-    private static boolean sameSheet(byte[] a, byte[] b) {
+    private boolean sameSheet(byte[] a, byte[] b) {
         if (a == null || b == null) return false;
         if (a.length != b.length) return false;
         int step = Math.max(1, a.length / 128);
@@ -484,7 +506,16 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             n += 1;
             if (Math.abs((a[i] & 0xFF) - (b[i] & 0xFF)) > 16) diff += 1;
         }
-        return n > 0 && diff * 100 / n < 8;
+        if (n == 0) return false;
+        int pct = diff * 100 / n;
+        // 「平静」要变很多才算变，「灵敏」动一点就算
+        String p = cfg == null ? "normal" : cfg.pace();
+        int need;
+        if ("calm".equals(p)) need = 25;
+        else if ("dense".equals(p)) need = 5;
+        else if ("game-economic".equals(p)) need = 35;
+        else need = 15;
+        return pct < need;
     }
 
     /** 「没什么可说的」—— 只认明确的否定词，不用长度猜（"地上有水"只有 4 个字但必须说）。 */
@@ -1046,9 +1077,11 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
                         busyRound = false;
                         if (pendingAuto) {
                             pendingAuto = false;
+                            if (!looksLikeNoop(out)) autoNoops = 0;   // 有话说：恢复正常节奏
                             if (looksLikeNoop(out)) {
                                 // 自己看了一眼，没什么可说的：**不落盘也不念**
-                                EyeLog.w("auto", "没什么变化 → 这一轮丢弃");
+                                autoNoops += 1;                 // 下一次隔久一点
+                                EyeLog.w("auto", "没什么变化 → 这一轮丢弃（连续 " + autoNoops + " 次）");
                                 Ui u = uiSink;
                                 if (u != null) u.onQuiet();
                                 return;
@@ -1491,6 +1524,13 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         refreshMemory();
         // 设置里改了"自动看"，正在通话的页面要立刻跟着变（不然要点两次）
         if (callActive) autoWatch = cfg.autoWatch();
+        // 灵敏度改了：立刻按新节奏来。退避计数也要清零，否则得等一分钟才生效。
+        if (!cfg.pace().equals(appliedPace)) {
+            appliedPace = cfg.pace();
+            autoNoops = 0;
+            lastAutoAt = 0;
+            EyeLog.w("auto", "灵敏度 → " + cfg.paceLabel());
+        }
         notifyState();
         EyeLog.w("svc", "apply think=" + cfg.think() + " speak=" + cfg.speak()
             + " ctx=" + Config.ctxLabel(cfg.ctxTokens())

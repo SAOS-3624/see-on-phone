@@ -370,6 +370,56 @@ final class Config {
                 ? v : "standard").apply();
     }
 
+    // ---- 这两个的"人话"标签：设置页和模型 `tune` 用的是同一套取值 ----
+
+    /** 灵敏度（= pace）：平静 / 正常 / 灵敏 / 游戏。 */
+    String paceLabel() {
+        String v = pace();
+        if ("calm".equals(v)) return "平静";
+        if ("dense".equals(v)) return "灵敏";
+        if ("game-economic".equals(v)) return "游戏";
+        return "正常";
+    }
+
+    /** 平静 → 正常 → 灵敏 → 游戏 → 平静。 */
+    String nextPace() {
+        String v = pace();
+        if ("normal".equals(v)) return "dense";
+        if ("dense".equals(v)) return "game-economic";
+        if ("game-economic".equals(v)) return "calm";
+        return "normal";
+    }
+
+    /** 档位映射（= tierStyle）：每帧占画布多大。 */
+    String tierLabel() {
+        String v = tierStyle();
+        if ("native".equals(v)) return "原生";
+        if ("full".equals(v)) return "更大";
+        if ("compact".equals(v)) return "更小";
+        if ("single".equals(v)) return "逐帧";
+        return "标准";
+    }
+
+    /** 标准 → 原生 → 更大 → 更小 → 逐帧 → 标准。 */
+    String nextTier() {
+        String v = tierStyle();
+        if ("standard".equals(v)) return "native";
+        if ("native".equals(v)) return "full";
+        if ("full".equals(v)) return "compact";
+        if ("compact".equals(v)) return "single";
+        return "standard";
+    }
+
+    /** 档位映射的一句话解释（值会变，解释跟着变）。 */
+    String tierHint() {
+        String v = tierStyle();
+        if ("native".equals(v)) return "一格一张，最清楚也最贵";
+        if ("full".equals(v)) return "格子再放大一档";
+        if ("compact".equals(v)) return "格子更小，省 token";
+        if ("single".equals(v)) return "一张图只放一帧（整幅）";
+        return "每帧占多大格子";
+    }
+
     /** 一张宫格最多几帧。0 = 用 `Pipeline.Opts` 的默认（40）。 */
     int maxFrames() {
         int v = sp.getInt(K_MAXFRAMES, 0);
