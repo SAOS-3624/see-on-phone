@@ -14,46 +14,45 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-## What this project does NOT do
+## 这份许可覆盖什么
 
-The Apache-2.0 grant above covers **the source code of this package**, and nothing else.
+只覆盖**本仓库里的源代码**，不覆盖：
 
-- **It does not upload frames anywhere.** The camera stream is decoded on the phone, inside the
-  plugin process. No server, no relay, no analytics.
-- **It does not record audio.** The phone build has no audio path; `audioStrip` is off by default
-  and there is no audio source to put in it.
-- **It does not open the camera by itself.** It reads whatever MJPEG/RTSP endpoint or frame source
-  you point it at, from an app you installed and started.
-- **It does not host, mirror or redistribute any video.** Nothing is bundled.
-- **You are responsible for what you point it at** — including whether photographing a given
-  place or person is lawful where you are.
+- 你手机里拍到的画面、录到的声音、聊出来的会话内容 —— 那些是你的；
+- 你填进 App 的 API Key、接口地址、账号；
+- 任何第三方组件（见 [CREDITS](CREDITS.md)）。
 
-## Third-party components
+## 这个项目**不做**什么
 
-Two licences cover different files of the one vendored component. Both allow commercial use.
+**它不往我们的服务器发任何东西 —— 因为它没有服务器。**
 
-| Component | Files | Licence | Copyright |
-|---|---|---|---|
-| `jpeg-js` 0.4.4 | `src/cam/vendor/jpeg-js/index.js`, `package.json`, wrapper | BSD-3-Clause | © 2014 Eugene Ware — full text in `src/cam/vendor/jpeg-js/LICENSE` |
-| `jpeg-js` 0.4.4 | `src/cam/vendor/jpeg-js/lib/decoder.js` | **Apache-2.0** | © 2011 notmasteryet — full text in `src/cam/vendor/jpeg-js/LICENSE-APACHE.txt` |
+- **画面不出手机，除了你自己配的那个模型接口。** App 采集的帧在手机本地拼成一张宫格
+  （`471×628`，约 4~7 KB），然后**只发给你自己填的 OpenAI 兼容接口**。没有中转、没有统计、没有"匿名使用数据"。
+- **相机是借来的，不是常开的。** 只有模型调用 `look` 工具、或你打开通话页时才 `open`，
+  没人要 3 秒后自动关。App 界面上没有"一直录着"的状态。
+- **不留存音频。** 语音输入走系统识别器（把你的话转成文字），App 不写音频文件、不上传音频。
+  朗读（TTS）是**出声**，不是**收声**。
+- **不分发任何视频或素材。** 仓库里没有示例视频、没有抓取的网页内容。
+- **不替你做决定。** 它只是把看到的东西说给你听；判断、行动、后果都在你。
+- **不承诺能用来看路。** `mode:"guide"`（导盲读者）是**辅助**：它会把画面转成
+  "前面有什么、往哪走"的说法，但**它不是辅具、没有安全认证、会看错、会延迟**。
+  过马路、上下楼梯、避障这些事，**必须**用白杖/导盲犬/无障碍设施，不要依赖这个 App。
 
-`lib/decoder.js` is not byte-identical to upstream: the JPEG **encoder** was removed and the export
-changed from `{decode, encode}` to a bare `decode`. Those changes are stated in the file header, as
-Apache-2.0 §4(b) requires. Details: `src/cam/vendor/jpeg-js/NOTICE.md`.
+## 你需要注意的
 
-The upstream npm package ships only the BSD-3 `LICENSE`; the Apache-2.0 half has no licence text in
-it, so `LICENSE-APACHE.txt` is added here to satisfy §4(a).
+- **拍什么、问什么，责任在你。** 拍别人、拍私人场所、拍涉密环境，是否合法由你所在地区的法律决定。
+- **模型接口是第三方。** 你把画面发给谁，取决于你自己填的 `base_url`。选一个你信任的。
+- **这是 sideload 的 App**（不在任何应用商店），`targetSdk 29`，安装时系统会提示风险 —— 那是正常的。
 
-Used at runtime, **not** redistributed:
+## 第三方组件
 
-| Component | How it is used | Licence |
-|---|---|---|
-| 「看见」App (`com.dsh.eye`) | provides `:4444/video/mjpeg`; the plugin is just an HTTP client | part of this project |
-| Android IP Camera App (`DigitallyRefined/android-ip-camera`) | optional alternative MJPEG source, installed by the user | MIT |
-| FFmpeg / ffprobe | optional backends, spawned as an external process on `PATH` | LGPL/GPL (your build) |
-| `dsh-see-now` | source of `src/engine/` (same author, same licence) | Apache-2.0 |
+当前代码树**不含任何第三方源码**（App 侧零依赖、插件侧 0.4.0 已删除 vendor 目录）。
+历史版本曾内置 `jpeg-js`，其 BSD-3 / Apache-2.0 双许可署名保留在 [CREDITS](CREDITS.md) §4。
 
-## Documentation media
+运行时调用、但不随本仓库分发：Android SDK 构建工具、FFmpeg（可选）、`ffplay`/`mpv`（可选）、
+IP Camera App（可选的第三方摄像头源）。逐条见 [CREDITS](CREDITS.md) §5。
 
-Screenshots and sample sheets were produced by the author on his own devices, from synthetic or
-author-owned material. No third-party footage is redistributed.
+## 文档与截图
+
+`app/docs/` 里的截图由作者在自己的设备上实拍，内容为作者自有素材或合成画面，
+不包含任何第三方影视、直播或私人素材。

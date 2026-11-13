@@ -12,7 +12,50 @@ process.env.DSH_SEE_PHONE_CONFIG = JSON.stringify({
   backend: 'testsrc', width: 336, height: 448, fps: 8,
 });
 
+import { createServer } from 'node:http';
+
 const { apply } = await import('../src/index.js');
+
+/** 1×1 的真 JPEG —— 只要能被 base64 解出来、长度大于 0 就行。 */
+const TINY_JPEG = '/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRof'
+  + 'Hh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPDs0NDP/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAA'
+  + 'AAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==';
+
+/**
+ * 起一个"假手机"：只实现插件真正用到的那三个端点。
+ *
+ * 0.4.0 起插件不再自己抽帧，所以测试也从"合成视频源"换成了"假 HTTP 服务" ——
+ * 这样测的正好是**它和手机之间那层契约**（`/look` 的返回形状、超时、错误）。
+ */
+async function fakePhone(t, overrides = {}) {
+  const server = createServer((req, res) => {
+    const u = new URL(req.url, 'http://127.0.0.1');
+    res.setHeader('content-type', 'application/json');
+    if (u.pathname === '/look') {
+      res.end(JSON.stringify({
+        images: [TINY_JPEG], frames: 3, tokens: 197, why: 'time', canvas: { w: 471, h: 628 },
+        ...overrides.look,
+      }));
+      return;
+    }
+    if (u.pathname === '/status') {
+      res.end(JSON.stringify({
+        app: '鱼眼', version: '9.9.9', cameraOpen: false, camera: 'back',
+        width: 480, height: 640, convMsgs: 7, ctxTokens: 64000, think: 'low', speak: true, tools: true,
+        ...overrides.status,
+      }));
+      return;
+    }
+    if (u.pathname === '/say') { res.end('{"ok":true}'); return; }
+    res.statusCode = 404;
+    res.end('{}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address();
+  t.after(() => new Promise((r) => server.close(r)));
+  process.env.DSH_SEE_PHONE_CONFIG = JSON.stringify({ url: `http://127.0.0.1:${port}/video/mjpeg` });
+  return `http://127.0.0.1:${port}`;
+}
 
 /** 最小可用宿主：只要 register / get / on。 */
 function fakeHost() {
@@ -67,50 +110,69 @@ test('契约形状能被宿主接受（required 提升到父级、无 undefined�
   assert.deepEqual(JSON.parse(JSON.stringify(spec.parameters)), spec.parameters);
 });
 
-test('status 在未启动时也能答', async (t) => {
+test('连不上手机时说人话（不是抛异常）', async (t) => {
+  // 故意不给假手机：端口指到一个没人听的地方
+  process.env.DSH_SEE_PHONE_CONFIG = JSON.stringify({ url: 'http://127.0.0.1:1/video/mjpeg' });
   const host = await boot(t);
   const out = await host.tools[0].execute({ action: 'status' });
-  assert.equal(out.meta.ok, true);
-  assert.match(out.text, /还没启动/);
+  assert.equal(out.meta.ok, false);
+  assert.match(out.text, /连不上手机/);
+  assert.match(out.text, /App 在跑/, '必须告诉人去查什么');
 });
 
-test('look 能从合成源出图并交给 attachments', async (t) => {
+test('look 从手机拿到图并交给 attachments', async (t) => {
+  await fakePhone(t);
   const host = await boot(t);
-  const out = await host.tools[0].execute({ action: 'look', wait: 6 });
+  const out = await host.tools[0].execute({ action: 'look' });
   assert.equal(out.meta.ok, true, `look 失败：${out.text}`);
   assert.equal(host.saved.length, 1, '应当存了一张图');
-  assert.equal(host.saved[0].mediaType, 'image/png');
-  assert.ok(host.saved[0].bytes > 1000, 'PNG 太小说明出的是空图');
+  assert.equal(host.saved[0].mediaType, 'image/jpeg', '手机给的是 JPEG，不该再转 PNG');
   assert.equal(out.images.length, 1);
-  assert.match(out.text, /画面变化|帧/, '通用模式应当给画面变化说明，不是导盲话术');
-  // 默认读者必须是"看得见的人"：0.2.x 把盲人写死了，用户点「看一眼」就被当盲人接话
+  assert.equal(out.meta.engine, 'phone');
+  assert.equal(out.meta.frames, 3);
+  assert.match(out.text, /3 帧/);
   assert.equal(out.meta.mode, 'normal', '默认模式必须是 normal');
   assert.doesNotMatch(out.text, /用户看不见/, 'normal 模式不许说用户看不见');
-  assert.match(out.text, /用户自己看得见/, 'normal 模式要明确告诉模型读者看得见');
 });
 
-test('mode:"guide" 仍保留导盲读图规范（后续定制用）', async (t) => {
+test('mode:"guide" 走导盲口径', async (t) => {
+  await fakePhone(t);
   const host = await boot(t);
-  const out = await host.tools[0].execute({ action: 'look', mode: 'guide', wait: 6 });
-  assert.equal(out.meta.ok, true, `look 失败：${out.text}`);
-  assert.match(out.text, /正前|风险/, '导盲模式必须给出方位与风险约束');
+  const out = await host.tools[0].execute({ action: 'look', mode: 'guide' });
   assert.equal(out.meta.mode, 'guide');
+  assert.match(out.text, /先.*风险/, '导盲模式必须给出风险优先的约束');
 });
 
 test('旧值 mode:"general" 仍然当作 normal（存量配置不能炸）', async (t) => {
+  await fakePhone(t);
   const host = await boot(t);
-  const out = await host.tools[0].execute({ action: 'look', mode: 'general', wait: 6 });
+  const out = await host.tools[0].execute({ action: 'look', mode: 'general' });
   assert.equal(out.meta.mode, 'normal');
   assert.doesNotMatch(out.text, /用户看不见/);
 });
 
-test('stop 之后 status 说没在跑', async (t) => {
+test('stop 不再假装能关手机相机', async (t) => {
+  await fakePhone(t);
   const host = await boot(t);
-  await host.tools[0].execute({ action: 'look', wait: 6 });
-  const stopped = await host.tools[0].execute({ action: 'stop' });
-  assert.match(stopped.text, /已关|没在跑/);
-  const st = await host.tools[0].execute({ action: 'status' });
-  assert.equal(st.meta.running, false);
+  const out = await host.tools[0].execute({ action: 'stop' });
+  assert.match(out.text, /自己关/, '要说清相机归手机管');
+});
+
+test('status 报的是手机的状态', async (t) => {
+  await fakePhone(t);
+  const host = await boot(t);
+  const out = await host.tools[0].execute({ action: 'status' });
+  assert.equal(out.meta.ok, true);
+  assert.match(out.text, /9\.9\.9/, '版本要来自手机');
+  assert.match(out.text, /7 条消息/);
+  assert.equal(out.meta.engine, 'phone');
+});
+
+test('pace/tier/camera 不再由插件管，要说出来', async (t) => {
+  await fakePhone(t);
+  const host = await boot(t);
+  const out = await host.tools[0].execute({ action: 'look', pace: 'dense', tier: 'native' });
+  assert.match(out.text, /手机 App 的设置里/, '传了要解释去哪儿改，不能装作生效');
 });
 
 /**
@@ -120,17 +182,9 @@ test('stop 之后 status 说没在跑', async (t) => {
 test('help 是完整的（模板字符串没被反引号截断）', async (t) => {
   const host = await boot(t);
   const out = await host.tools[0].execute({ action: 'help' });
-  assert.match(out.text, /^See on Phone/);
-  assert.ok(out.text.length > 900, `help 只有 ${out.text.length} 字，多半被截断了`);
-  assert.match(out.text, /节奏档（pace）/);
-  assert.match(out.text, /tierStyle/);
+  assert.match(out.text, /^鱼眼 · See on Phone/);
+  assert.ok(out.text.length > 600, `help 只有 ${out.text.length} 字，多半被截断了`);
+  assert.match(out.text, /电脑借手机的眼睛/);
+  assert.match(out.text, /归手机管的事/);
   assert.match(out.text, /已知限制/);
-});
-
-test('status 报当前档位与设置（改了文件要看得出改没改到）', async (t) => {
-  const host = await boot(t);
-  const st = await host.tools[0].execute({ action: 'status' });
-  assert.equal(st.meta.tierStyle, 'standard');
-  assert.equal(st.meta.pace, 'normal');
-  assert.match(st.text, /档位 standard/);
 });

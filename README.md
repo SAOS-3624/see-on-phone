@@ -1,244 +1,182 @@
-# See on Phone
+<div align="center">
 
-> **手机版 see-now**：保留桌面版原有的「打分 → 挑帧 → 多帧宫格 → 时间线」能力，
-> 只把采集源从电脑屏幕换成手机摄像头。
->
-> **两种读者，显式选**：默认 `mode:"normal"` —— 用户自己看得见画面，按普通会话说；
-> `mode:"guide"` 才是导盲（看不见 → 只给结论和动作）。0.2.x 把导盲当成唯一定位写死，
-> 于是点一下「看一眼」也被当盲人接话 —— 0.3.0 修的就是这个。
+<img src="app/docs/icon.png" width="120" alt="鱼眼 See on Phone">
 
-- npm：`dsh-see-on-phone`
-- 工具名：`see_phone`
-- 依赖：Node ≥ 20；手机场景另需「看见」App（`phone/dsh-eye`，一个 App 顶摄像头 + TTS）
+# 鱼眼 · See on Phone
 
----
+**让 AI 住进手机 —— 在手机上聊天，需要时自己看世界。**
 
-## 1. 和 dsh-see-now 的关系
+一个 Android App + 一个电脑插件，同一个仓库，同一份 Apache-2.0。
 
-**同一套引擎，两个采集源。**
+[![License](https://img.shields.io/badge/license-Apache--2.0-5B9CFF.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Android-5.0%2B%20·%20no%20Gradle-9B7BFF.svg)](#-自己编译)
+[![Deps](https://img.shields.io/badge/runtime%20deps-0-3DDC97.svg)](CREDITS.md)
 
-| | `dsh-see-now`（桌面） | `dsh-see-on-phone` |
-|---|---|---|
-| 采集 | 屏幕：ddagrab / gdigrab / portal / PipeWire | **摄像头**：MJPEG / 抓拍 / RTSP |
-| 引擎 | 打分、切点、装箱 DP、拼图、PNG、token 换算 | **整块 vendor 过来**，随桌面版一起升级 |
-| 输出 | 多帧宫格（按画面变化挑帧） | **一样** |
-| 动作 | watch / peek / status / stop | **一样**（另有 `look` 取单帧） |
-| 语音 | 可选 `say` | 可选 `say`（有 TTS 就念） |
-| 读者 | 看得见屏幕的人 | `normal` 看得见 / `guide` 看不见 |
+[它是什么](#-它是什么) · [装哪个](#-装哪个) · [App](#-鱼眼-app) · [插件](#-电脑插件-dsh-see-on-phone) · [出处与署名](CREDITS.md) · [许可](LICENSE)
 
-引擎 `src/engine/` 的 9 个文件来自 `dsh-see-now` **0.2.1**（0.3.0 同步了
-`pack.solveSkyline` / `packTiers` / `tierCurve` / `tierMode` 那批改进；0.3.1 补了
-`tuning.js` / `pace.js`，把**设置与节奏档**也接上，见第 4 节），零宿主依赖（只用 `node:zlib`）。
-**采集层整个重写**：Android 上普通进程看不到 `/dev/video*`，桌面那套 ffmpeg 设备枚举一个都用不了。
-
-### 为什么独立成包而不是给 see-now 加 `--camera`
-
-采集配置、默认值、发版节奏都不同；导盲那套还要按真机反馈反复调阈值，
-不该带着"看视频"的用户一起发版。
+</div>
 
 ---
 
-## 2. 手机上的架构（当前版本）
+> **English, briefly.** *See on Phone* puts an AI agent **on** the phone instead of on a server:
+> a self-contained Android chat app that can open the camera, fold several frames into one
+> contact sheet, remember things, write files, speak, and listen — no PC required. A companion
+> Node plugin lets a desktop agent borrow the same camera. Blind navigation is **one optional
+> mode**, not the product.
 
-**采集链只剩一个外部程序。** 插件内置纯 JS 的 JPEG 解码器
-（[jpeg-js](https://github.com/jpeg-js/jpeg-js) 0.4.4，BSD-3-Clause，40KB，已 vendor 到
-`src/cam/vendor/jpeg-js/`），自己直连开源 IP Camera App 的 MJPEG 流：
+## 🐟 它是什么
 
-```
-Android IP Camera App (MIT, :4444/video/mjpeg, ~17fps)
-  → 插件 http-mjpeg 后端：SOI/EOI 抠帧 → jpeg-js 解码 → cover 缩放 → rgb24
-  → 打分 → 切点 → 装箱 DP → 多帧宫格 → PNG → 宿主附件
-```
+**鱼眼是一个能自己看东西的 AI 聊天 App。** 你打字或说话，模型需要知道"眼前有什么"时，
+自己调用 `look` 打开摄像头、看 1~8 秒、把几帧拼成一张宫格、然后回答你。
+不需要电脑、不需要上传视频流、不需要装 ffmpeg。
 
-**Termux / python / ffmpeg / watchdog 全部不再需要**。这是刻意收敛的结果：
-早期版本把解码放在 Termux 的几个后台进程里，华为锁屏会把它们一次性全清掉，
-整条链就断。现在插件跟着 dsh-go 活，唯一要保住的是 IP Camera App（它有
-`foregroundServiceType="camera"` 前台服务）。
+它同时还能：**听**（语音输入）、**说**（在线音色 / 系统 TTS）、**记**（跨会话记忆）、
+**写文件**（自己的一个工作区目录）、**搬会话**（和桌面 DSH 互通）。
 
-锁屏回来只要**点开一下 Android IP Camera App**，相机就重新接管；
-PC 侧也有 `phone/revive.sh` 一键拉起。
+电脑上的插件 `dsh-see-on-phone` 是另一半：让**桌面上的 agent** 借手机的眼睛看一眼，
+一张 JPEG 回来 —— 屏幕里看不到你桌上的杯子。
 
-## 3. 后端
+### 三条设计取向（决定了它长成现在这样）
 
-| 后端 | 帧率 | 需要 | 说明 |
-|---|---|---|---|
-| **`http-mjpeg`** | **8–13 fps** | 只要 IP Camera App | **手机默认**，插件内置解码，零外部进程 |
-| `http-raw` | 12–20 fps | Termux + 帧服务 | 旧链路，保留作回退（8123） |
-| `termux` | ~1 fps | Termux + Termux:API | 插件自己抓拍（只在插件直接跑在 Termux 里时用） |
-| `mjpeg` / `rtsp` | 15–30 fps | 任意流源 | 插件侧需 ffmpeg（PRoot 里没有，慎用） |
-| `v4l2` / `avfoundation` / `dshow` | 原生 | 桌面摄像头 | PC 调试 |
-| `file` / `testsrc` | — | — | 回归测试 |
-
-配置 `~/.dsh/see-phone.json`（或 `DSH_SEE_PHONE_CONFIG='{"backend":"testsrc"}'`）：
-
-```json
-{
-  "backend": "http-mjpeg",
-  "url": "http://127.0.0.1:4444/video/mjpeg",
-  "fps": 8,
-  "grabIntervalMs": 70,
-  "rotate": 90,
-  "camera": "back",
-  "mode": "normal"
-}
-```
-
-> `width` / `height` 不写就按模式取默认 **471×628**（3:4，与摄像头同比例，**197 token**）；
-> 写死了就以你的为准，模式不再改画布。
-
-### `rotate` 必须是 90（否则画面是歪的）
-
-Camera2 的 sensor 成像相对手机自然方向转了 90°。不转的话 IP Camera App 输出
-800×600 横图，`cover` 缩到 471×628 会**横向裁掉 44%** 的画面，而且图里的
-"左右前后"全是错的。转 90° 后源是 480×640 = 3:4，和 471×628 **同比例，零裁切**。
-
-插件启动时会把 `rotate` / `camera` / `resolution` / `torch` 拼成查询串发给
-IP Camera App（`GET /?camera=back&rotate=90`，App 侧持久化），再开始取流。
-`status` 里 `preset:{tried,ok}` 能看到下发结果。
-
-换机型发现图歪了就改这个值（0 / 180 / 270），不用改代码。
-
----
-
-## 4. 工具用法
-
-```js
-see_phone({ action: "watch" })                    // 默认：等多帧宫格（和桌面 see_now 一样）
-see_phone({ action: "peek" })                     // 不等待，领走已攒好的图
-see_phone({ action: "look" })                     // 单帧「此刻」，用户插话时用
-see_phone({ action: "status" })                   // 后端、帧率、抓拍成功/失败数、模式、上次错误
-see_phone({ action: "stop" })                     // 放掉摄像头，别一直耗电
-see_phone({ action: "look", mode: "guide" })      // 导盲话术（用户看不见时才用）
-```
-
-### 两种模式（0.3.0）
-
-| | `normal`（默认） | `guide` |
-|---|---|---|
-| 读者 | 用户自己看得见画面 | 用户看不见（导盲） |
-| 附文 | 宫格时间线 + 「你自己看得见，别替他描述」 | 先风险、再通路、最后动作，一两句 |
-| 画布 | 471×628 | 471×628 |
-| 出图口径 | 攒多帧宫格（同桌面 `normal`） | **逐帧**：一张图一个画面、格子撑满 |
-| App 朗读 | 只上字幕 | 默认念出来 |
-
-优先级：**调用参数 > App 顶栏开关 > `see-phone.json` 的 `mode` > normal**。
-App 的开关写在 `/sdcard/Download/DSH-Go/mode.txt`，插件每次工具调用都读一次 ——
-点一下开关，下一次调用就换口吻，不用重启插件、也不用重连 dsh-go。
-旧值 `general` 等同 `normal`（存量配置不会炸）。
-
-`watch` 的阻塞就是"暂停"，回完话再调一次；静止画面会一直攒着不打扰你（省 token 的设计）。
-配置改了不用再重载插件：每次调用会比对 `see-phone.json`，变了就自动重建采集会话；
-也可以显式 `see_phone({action:"reload"})`。（0.1.x 早期版本只在启动时读一次配置，已修。）
-
-### 出图算法与设置（0.3.1 起与桌面版同源）
-
-引擎文件一直是同一份，但**参数是在调用侧拼的** —— 0.3.0 之前这里只传了
-`{width, height, fps, queueDepth}`，其余全部退回 `pipeline.js::DEFAULTS`，于是：
-
-| 键 | 0.3.0 实际值（DEFAULTS） | 桌面版口径 | 后果 |
-|---|---|---|---|
-| `strategy` | `native`（1 档也占满整幅） | `standard`（1 档压成 2 档） | 单帧图吃满画布、多帧时张数变多 |
-| `floorGapK` | `0`（关掉自适应兜底） | `2`（兜底 = 2×近期出帧间隔，夹 2~20s） | 半动的画面长时间不给图 |
-| `tierThresholds` | `null` | 用户配的 7 道（默认同 `docx`） | 自定义阈值不生效 |
-
-0.3.1 起这些键**全部按桌面版 `runner.js::start()` 传**，并且设置文件用**同一套键名**
-（`~/.dsh/see-phone.json`，与 `~/.dsh/see-now.json` 一份文档管两个插件）：
-
-```json
-{
-  "tierStyle": "standard",
-  "tierMode": "density",
-  "tierCurve": "docx",
-  "tierThresholds": [0.26, 0.6, 0.9, 1.2, 1.8, 2.4, 3.0],
-  "tierMap": [1, 2, 3, 4, 5, 6, 7, 8],
-  "defaultPace": "normal",
-  "scoreNormalize": true,
-  "changeLog": false,
-  "audioStrip": false
-}
-```
-
-上面就是全部默认值。改任意一项 → 下一次工具调用生效（重开一次摄像头，约 1 秒）；
-写错了退回默认并在 `status` 里报原因。
-
-节奏档 `pace`（工具参数，粘性）：`calm` / `normal` / `dense` / `game-economic`，
-切点门槛 20 / 12 / 7 / 80，兜底间隔跟着换一张 —— 表在 `src/engine/pace.js`，
-与桌面版逐字一致。
-
-两处**手机特有**、桌面版没有对应的：
-
-- `audioStrip` **默认关**。桌面版默认开是因为它手里真有 RMS 音量；手机没有听声音那条链，
-  开着只会画一条恒定静音条（占 3% 高度，还会让模型以为"这段时间没声音"）。
-  桌面版自己在 `region` 模式（同样拿不到音量）也是关的，同一个判断。
-- `guide` 走桌面版的**逐帧模式**（`SCENE_OPTS`：`maxFrames:1` + `strategy:"single"`）。
-  `standard` 会把 1 档压成 2 档，而 `look` 的图里只有一帧 —— 不钉住整幅，导盲用户
-  看到的就是"四分之一是画面、其余全是灰"。
-
-这层约束有回归测试守着：`test/pipeline-parity.test.mjs`（改期望值 = 改桌面版口径，先去改 `dsh-see-now`）。
-
----
-
-## 5. 实测性能
-
-真机：HUAWEI nova 11（FOA-AL00），HarmonyOS 4.2 / Android 12，arm64。
-
-| 环节 | 实测 |
+| 取向 | 具体做法 |
 |---|---|
-| IP Camera MJPEG 源 | **~17 fps**（3 秒 49 帧） |
-| Termux ffmpeg → rgb24 | 336×448×3 = **451584 B**，精确对上 |
-| `/frame` 端到端 | **~25 ms** |
-| 帧服务内部计数 | **19.8 fps**（`ok=382 fail=0 age=0.03`） |
-| **插件端到端（新后端）** | **51 帧 / 6 秒 = 8.47 fps**，出 4 帧宫格，0 失败 |
+| **端上跑，不绕服务器** | 模型 API 你自己填；画面在手机本地拼成一张 `471×628` 的宫格（4~7 KB）再发出去。没有中转、没有统计 |
+| **相机是工具，不是取景器** | 只有 `look` 被调用时借相机，没人要 3 秒后自动关。想自己看画面进"通话页" |
+| **导盲只是读者之一** | `normal`（你看得见，它给你细节）和 `guide`（你看不见，它只给结论和动作）是**同一个模型的两个提示词**，不是两套代码。**它不是辅具**，见 [NOTICE](NOTICE) |
 
-⚠️ `grabIntervalMs` 默认 **70ms**（`http-raw` 钳到 80ms）。抓拍时代的 220ms
-会把 20fps 的源压成 4.4fps —— 这个坑实测踩过。
-纯 JS 解码比 ffmpeg 稍慢（8.47 vs 12.95fps）；把 IP Camera App 的分辨率调到
-640×480 能再提一截，因为 jpeg-js 的耗时跟源像素数成正比。
+## 📦 装哪个
 
-**悬浮预览**：手机浏览器直接打开 `http://127.0.0.1:4444/`（App 自带 Web 面板），
-或从最近任务把浏览器切成小窗/悬浮窗，不用编译原生 overlay App。
+仓库的 [Releases](https://github.com/SAOS-3624/see-on-phone/releases) 里每次都放**两个文件**，
+按你需要挑：
 
-其他边界：
-- 单帧 471×628 = 197 token，**图会留在会话历史里每轮重发**；长时间看要留意
-- 保持 IP Camera App 在跑（别从最近任务划掉），断流时插件会自动重连
-- 用完记得 `stop`；持续采集会耗电发热
+| 你想要 | 下这个 | 还需要 |
+|---|---|---|
+| 手机上有个能聊天、能看东西的 AI | `see-on-phone-<ver>.apk` | 一个 OpenAI 兼容的 API Key |
+| 让电脑上的 agent 借手机的眼睛 | `dsh-see-on-phone-<ver>.tgz` | **必须先装上面那个 APK**（手机就是服务端） |
+| 两个都要 | 两个都下 | 同上 |
 
-## 6. 当前装机进度
+> **不需要新仓库，也不需要两个仓库。** App 和插件是一个产品的两端，版本一起发、契约一起改，
+> 分开放只会让"插件 0.4 配 App 0.29"这种错配变成常态。Release 用两个资产区分就够了。
 
-- [x] dsh-go APK 装上（本机模式），引导走完、引擎启动
-- [x] Termux + Termux:API + Pillow + ffmpeg（`libc++` 27c→30 后能装）
-- [x] **开源 MIT 的 IP Camera App 装上**，关掉认证/TLS → 纯 HTTP MJPEG
-- [x] `cam_server.py` 流模式跑起来：`/frame`、`/jpg`、`/stream`、`/view`
-- [x] **端到端 12.95fps** 验证通过，多帧宫格出图
-- [x] 插件 `see_phone` 已装进 dsh-go
-- [x] 插件已升级到 `http-mjpeg`，配置已切到 `127.0.0.1:4444/video/mjpeg`
-- [x] **Termux 整层退役**：采集链只剩 IP Camera App 一个外部程序
-- [x] **0.1.2 真机验收（2026-11-07 20:45）**：6.3fps / 解码 25ms / 首帧 455ms /
-      0 失败 / 出 8 帧宫格；`rotate=90` 修好方向，`preset.ok=true`
+## 🐠 鱼眼 App
 
-装/升走 `dsh plugin --profile web add <tgz>`，装完**必须重启引擎**。
 
-## 开源与商用
+### 能干什么
 
-摄像头流 App：MIT License，允许商用、修改、再分发，无 copyleft 义务。
-从[官方 GitHub Releases](https://github.com/DigitallyRefined/android-ip-camera/releases) 下载，
-校验 SHA-256 `0e9d5fb859b9dc2d77f401f31964c412b22d6d787b88556a3001ea3b79f099fc`。
-插件本体 Apache-2.0，引擎同 `dsh-see-now`；内置
-[jpeg-js](https://github.com/jpeg-js/jpeg-js) 0.4.4 —— 封装层是 BSD-3-Clause，
-`lib/decoder.js` 是 notmasteryet 的 **Apache-2.0**（上游 npm 包没附这一半的全文，
-本仓库补在 `src/cam/vendor/jpeg-js/LICENSE-APACHE.txt`，两份许可与版权行均逐字保留，
-说明见 `src/cam/vendor/jpeg-js/NOTICE.md`）。三者均允许商用。
+- **聊天**：流式输出、Markdown 渲染、思考过程可折叠、上下文预算可调（2k~900k）
+- **看**：`look` 工具 —— 开相机 → 采样 → 挑帧 → 拼宫格 → 交给模型。宫格是**按镜头切换点**排的，
+  动得多的帧给大格子，静止的给一条；不是平均切九宫格
+- **听**：系统语音识别，单句输入
+- **说**：内置在线音色（小轩 / 晓晓 / 晓伊 / 云希 / 云扬），失败回落系统 TTS
+- **记**：`memory_read` / `memory_write`，跨会话；每轮自动带上
+- **写**：`files` 工具，一块固定工作区 `Download/DSH-Go/workspace/` —— 文件管理器里能直接看到、拷走、删
+  （目录名沿用 `DSH-Go`，这样老版本的会话、记忆、日志原地还能用，不用迁移）
+- **搬**：会话与记忆的摊平导出/增量导入，和桌面 `phone-bridge` 对得上
+- **给别人看**：内置 HTTP 服务（`127.0.0.1:4444`），电脑插件靠它工作
 
-## 7. 开发
+### 界面
+
+| 会话页 | 通话页 | 设置 | 对话 |
+|---|---|---|---|
+| 消息流 + 输入栏 + 工具状态 | 实时预览 + 字幕（离开就还相机） | 分组卡片，17 项配置一页到底 | 置顶 / 今天 / 更早，搜索和新建 |
+
+<p align="center">
+<img src="app/docs/shot-chat.png" width="23%" alt="会话页">
+<img src="app/docs/shot-call.jpg" width="23%" alt="通话页">
+<img src="app/docs/shot-settings.png" width="23%" alt="设置页">
+<img src="app/docs/shot-conv.png" width="23%" alt="对话列表">
+</p>
+
+> 截图是实机（华为，1084×2412）跑的 1.0.0，没有修饰。
+
+### 它看到的是什么
+
+**不是平均切的九宫格。** 先算逐帧变化分 → 找镜头切点 → 按切点密度分档 →
+行 DP 装箱：动得多的帧给大格子，没动的给一条。所以一张图里信息量是**被分配过**的。
+
+<p align="center">
+<img src="app/docs/sheet-4.jpg" width="26%" alt="4 帧：静止场景">
+<img src="app/docs/sheet-6.jpg" width="26%" alt="6 帧：中等变化">
+<img src="app/docs/sheet-9.jpg" width="26%" alt="9 帧：变化剧烈">
+</p>
+
+一张 `471×628` 的 JPEG，**4~7 KB**，约 **197 token**。
+
+### 装法
 
 ```bash
-npm run check:syntax      # 全量语法体检
-npm test                  # 宿主契约测试（假 ctx，6 条）
-npm run smoke testsrc 6   # 合成源跑通整条管线
-DSH_SEE_PHONE_CONFIG='{"backend":"http-raw","url":"http://127.0.0.1:8123/frame"}' npm run smoke http-raw 10
+# 1. 从 Releases 下 APK，然后
+adb install -r see-on-phone-<ver>.apk
+
+# 2. 打开「鱼眼」→ 右上角齿轮 → 填接口和 Key
+#    接口：https://api.deepseek.com/v1        （任何 OpenAI 兼容端点都行）
+#    模型：deepseek-chat
 ```
 
-## License
+第一次点"看"会申请相机权限。**装在应用商店之外**（sideload），系统会提示风险，正常。
 
-Apache-2.0。`src/engine/` 来自 [dsh-see-now](https://github.com/SAOS-3624/dsh-see-now)，同一许可证。
-第三方代码与许可全文见 [CREDITS.md](CREDITS.md)。
+### 自己编译
+
+不需要 Gradle，不需要 Android Studio。只要 **JDK 17** + 一份 `android.jar` + 四个 jar（d8 / aapt2 / apksigner / lib）：
+
+```bash
+export ANDROID_SDK=/path/to/android-sdk     # 里面有 android.jar 和 build-tools
+bash app/build.sh                            # 6 步：javac → d8 → aapt2 compile → link → 塞 dex → 签名
+```
+
+产物 `app/see-on-phone.apk`，约 190 KB（图标是 WebP）。构建细节与踩过的坑：[`app/docs/BUILD.md`](app/docs/BUILD.md)。
+
+<details>
+<summary><b>为什么 targetSdk 是 29（而不是 34）</b></summary>
+
+- ≤ 28 会被新系统弹"此应用是针对旧版 Android 打造的"，OPPO/小米上都见过；
+- ≥ 30 强制分区存储，`Download/鱼眼/` 下的工作区文件就写不进去，得改成 SAF 或申请全盘权限；
+- Android 12 的后台启动限制只管 targetSdk ≥ 31 的 App，而它要开机自启；
+- sideload 没有 Play 的 targetSdk 门槛，所以 29 没有代价。
+
+</details>
+
+## 🖥 电脑插件 `dsh-see-on-phone`
+
+```bash
+npm i -g dsh-see-on-phone      # 或者从 Release 里的 .tgz 装
+```
+
+模型调用 `see_phone` → 插件 HTTP 打手机 `/look` → 手机自己采、自己挑、自己拼 → **一张 JPEG** 回来。
+**电脑这边不抽帧、不装 ffmpeg、不拉原始流。**
+
+| action | 干什么 | 等待 |
+|---|---|---|
+| `look`（默认） | 抓一张宫格 | 手机采集 1~2 秒（`wait` 可调 0.5~8） |
+| `watch` | 看"这一会儿发生了什么" | 默认 8 秒 |
+| `peek` | 最快的一张 | 1 秒 |
+| `status` | 手机状态（相机/上下文/思考/朗读） | — |
+| `stop` | 停语音（相机归手机自己关） | — |
+
+`mode:"normal"`（默认，用户看得见画面）或 `mode:"guide"`（导盲：只给结论和动作）。
+配置只有两项，在 `~/.dsh/see-phone.json`：`url` 和 `mode` —— 档位、节奏、前后摄像头**都在手机 App 里**，
+两个地方各存一份配置最后一定会打架。
+
+```bash
+node scripts/doctor.mjs      # 手机通不通、语音播放有没有
+node scripts/smoke.mjs 6     # 拍 6 秒存成 jpg，自己看
+```
+
+## 🧭 出处与署名
+
+拼图那套（切点检测 → 档位 → 行 DP 装箱 → 拼图 → token 换算）最初写在
+[`dsh-see-now`](https://github.com/SAOS-3624/dsh-see-now) 和
+[`dsh-video-storyboard`](https://github.com/SAOS-3624/dsh-video-storyboard) 里，
+App 里这份是**同一套算法的 Java 逐行移植**（同作者，同许可），曾经逐字节对拍过。
+
+在线音色的 `Sec-MS-GEC` 令牌**参考** [edge-tts](https://github.com/rany2/edge-tts)（GPL-3.0）的
+协议行为，但 `Drm.java` / `EdgeTts.java` 是独立 Java 实现，**仓库里不含它的任何一行代码**。
+
+当前代码树**没有任何第三方源码**。逐条见 **[CREDITS.md](CREDITS.md)**。
+
+## ⚖️ 许可
+
+[Apache-2.0](LICENSE)。拿去商用、改名、闭源分发都可以，保留版权与许可声明即可。
+
+**但它不是辅具。** 这个 App 会把画面变成文字描述，它**会看错、会延迟、会在暗处失灵**。
+过马路、上下楼梯、避障 —— 用白杖、用导盲犬、用无障碍设施。详见 [NOTICE](NOTICE)。

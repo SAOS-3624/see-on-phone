@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    鱼眼 / See on Phone 的自适应图标（API 26+）。
+
+    前景是缩小到 68% 的霓虹 logo（边缘做了径向淡出，不会露出方框）；
+    背景是同色系的柔光晕。两层都是 432×432（108dp @ xxxhdpi），
+    这样圆形 / 方形 / squircle 任何蒙版都不会切到"See on phone"那几个字。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@mipmap/ic_bg" />
+    <foreground android:drawable="@mipmap/ic_fg" />
+</adaptive-icon>

@@ -3,3 +3,16 @@ node_modules/
 *.log
 *.tgz
 .DS_Store
+Thumbs.db
+npm-debug.log*
+
+# App 构建产物
+app/build/
+app/*.apk
+app/*.idsig
+
+# 本地签名密钥（仓库不保存；build.sh 首次运行会自动生成）
+app/dsh.keystore
+
+# 对拍脚本的临时帧
+app/tools/parity/.work/

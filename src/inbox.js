@@ -3,7 +3,7 @@
  *
  * ============================ 为什么是文件 ============================
  *
- * 手机上的「看见」App 和本插件不在同一个进程、也不在同一个 uid：
+ * 手机上的「鱼眼」App 和本插件不在同一个进程、也不在同一个 uid：
  *   - App 是原生 Android（`com.dsh.eye`），跑在系统里；
  *   - 插件跑在 dsh-go 的 PRoot 里（uid 是 dsh_app）。
  * 它们之间**唯一从没失败过的通道是 /sdcard 上的文件**（say.txt 已经证明了半年）。
@@ -25,7 +25,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-/** 和「看见」App 约定的落点（`EyeService.INBOX_FILE`）。 */
+/** 和「鱼眼」App 约定的落点（`EyeService.INBOX_FILE`）。 */
 export const INBOX_FILE = '/sdcard/Download/DSH-Go/inbox.txt';
 /** 顺手把诊断写进 App 的那份日志里，PC 侧一条命令就能看全链路。 */
 const LOG_FILE = '/sdcard/Download/DSH-Go/eye.log';

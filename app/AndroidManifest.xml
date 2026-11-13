@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  鱼眼（See on Phone，代码包名沿用 com.dsh.eye）—— 手机端「一个 App 干完所有活」。
+
+  它替代了三样东西：
+    1. Android IP Camera App（5.2MB）—— 摄像头 MJPEG 流，端口/参数/端点全兼容
+    2. DSH TTS Bridge（17KB）—— 语音朗读
+    3. 桥 App 里的「摄像头守护」—— 现在相机和自己是一个进程，不用互相拉
+
+  ⚠️ `package` 故意**仍然是 com.dsh.eye**：改了就无法覆盖安装，旧手机上会并排
+  多出两个 App，且 adb / 安装脚本 / 桌面插件里的每一条命令都要跟着改。
+  对外品牌是「鱼眼」，那是 label 的事，不是包名的事。
+
+  刻意定在 targetSdk **29**（既不老、又能用老式存储的那一档）：
+    - ≤ 28 会被新系统弹「此应用是针对旧版 Android 打造的」——OPPO/小米上都见过；
+    - ≥ 30 会强制分区存储，`/sdcard/Download/DSH-Go/` 那些文件（say.txt / inbox.txt）就写不进去；
+    - Android 12 的后台启动限制只管 targetSdk ≥ 31 的 App，我们要开机自启；
+    - Android 15/16 只拦 targetSdk < 24 的安装，29 不受影响。
+  另外靠 `requestLegacyExternalStorage` 在 29 上继续走老式存储。
+  sideload 安装没有 Google Play 的 targetSdk 门槛，所以 29 没有代价。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dsh.eye"
+    android:versionCode="68"
+    android:versionName="1.0.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="29" />
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- 悬浮窗 = 载体：AI 的台词飘在屏幕上，点一下就能插话 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 只是为了兼容老插件写 say.txt 的那条路；走 /say 接口时完全不需要它 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
+
+    <application
+        android:label="鱼眼"
+        android:icon="@mipmap/ic"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true"
+        android:requestLegacyExternalStorage="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:name=".MainActivity"
+            android:windowSoftInputMode="adjustResize|stateAlwaysHidden"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:label="鱼眼">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+
+
+        <!-- 通话页：会话页顶栏的 📹。实时预览 + 字幕，退出就还相机 -->
+        <activity
+            android:name=".CallActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize|stateAlwaysHidden"
+            android:label="鱼眼 · 通话" />
+
+        <!-- 设置页：顶栏那行状态文字点进来（原来是一个只有 3 个字段的弹窗） -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize|stateAlwaysHidden"
+            android:label="鱼眼 · 设置" />
+
+        <!-- 对话列表：设置页「对话：…」点进来，新建/切换/改名/删 -->
+        <activity
+            android:name=".ConvActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize|stateAlwaysHidden"
+            android:label="鱼眼 · 对话" />
+
+        <service
+            android:name=".EyeService"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="com.dsh.eye.WAKE" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

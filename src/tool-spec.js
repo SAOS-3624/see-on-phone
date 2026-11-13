@@ -1,13 +1,19 @@
 /**
  * tool-spec.js — `see_phone` 的契约。
  *
- * 与 see-now 的 `see_now` 是**两个采集源、同一套引擎**：`see_now` 看屏幕，
- * `see_phone` 看手机摄像头。默认读者是**能看见画面的普通用户** ——
- * 这是 0.2.x 最大的错：那段把用户预设成盲人，于是"看一眼"这种中性请求也会被
- * 接成导盲口吻。0.3.0 起读者的画像由 `mode` 显式选择，默认 normal。
+ * 0.4.0 起口径变了：**采集和拼图都在手机上**（同一套引擎的 Java 版，逐位对拍过），
+ * 插件只发一次 `/look` 把拼好的宫格拿回来。所以这里的描述不许再写"逐帧打分、
+ * 挑帧、本地拼图"——那是 0.3.x 的桌面引擎，已经删了（见 src/index.js 头注释）。
+ *
+ * 默认读者是**能看见画面的普通用户** —— 这是 0.2.x 最大的错：那段把用户预设成盲人，
+ * 于是"看一眼"这种中性请求也会被接成导盲口吻。0.3.0 起读者的画像由 `mode` 显式选择，
+ * 默认 normal。
  *
  * `parameters` 是「属性名 → 值 schema」的映射，不是完整 JSON Schema
  * （`output.schema` 才是完整 JSON Schema，两个形状不一样）。
+ *
+ * ⚠️ **参数名、类型、必填性一个都不许改**：宿主按 schema 过滤参数，改了会静默失效。
+ * 过期的是**描述文字**，那才是这一版要修的东西。
  */
 
 /** 工具名。注册日志、报错、测试都从这里取。 */
@@ -23,23 +29,27 @@ export function seePhoneToolSpec() {
   return {
     name: TOOL_NAME,
     description:
-      '**SeeNow, running on this phone.** Watch a live camera feed: score every frame by how '
-      + 'much the picture changed, keep only the ones that matter, and pack them into one image. '
-      + 'Same engine as `see_now` on desktop — only the capture source changed.\n\n'
+      '**Look through this phone\'s camera.** The phone captures for a moment, picks the frames '
+      + 'that actually changed, and packs them into **one image** — you get that image back. '
+      + 'The picking and packing happen **on the phone**; nothing is decoded on this machine.\n\n'
       + 'How to use it:\n'
-      + '- `see_phone({action:"watch"})` — **the normal, blocking call.** Returns a sheet of several '
-      + 'frames picked by change detection; a still scene costs almost nothing, a busy one gives '
-      + 'more frames. Call it again right after you reply to keep watching.\n'
-      + '- `see_phone({action:"peek"})` — grab the sheet that already piled up, without waiting. '
-      + 'Use it when the plugin wakes you ("有新画面了").\n'
-      + '- `see_phone({action:"look"})` — one single frame of *right now*, ignoring the change '
-      + 'detector. Use it when the user interrupts with a question.\n'
-      + '- `see_phone({action:"status"})` — backend, frame rate, capture stats, last error, mode. '
-      + 'Call it when frames keep not arriving.\n'
-      + '- `see_phone({action:"stop"})` — release the camera. **Always stop when done**; '
-      + 'otherwise the camera stays hot and drains the battery.\n\n'
-      + '`note` passes what the user just said; `wait` bounds how long to wait for a frame. '
+      + '- `see_phone({action:"watch"})` — **the default.** Captures on the phone for `wait` '
+      + 'seconds (default 8) and returns one sheet. Use it for "what happened just now / while '
+      + 'I do this". A still scene yields very few frames, so it is cheap when nothing moves.\n'
+      + '- `see_phone({action:"look"})` — the same call with a shorter window (default 1.5 '
+      + 'seconds). Lowest latency; use it when the user just asked something.\n'
+      + '- `see_phone({action:"peek"})` — the fastest one: 1 second of capture. **It is not '
+      + 'zero-wait** — there is no queue on the phone to grab from; it just captures less.\n'
+      + '- `see_phone({action:"status"})` — phone side of the link: camera open or not, how many '
+      + 'messages the conversation holds, think/speak/tools switches. Call it when images keep '
+      + 'not arriving.\n'
+      + '- `see_phone({action:"stop"})` — **stops speech only.** The phone closes its own camera '
+      + 'about 3 seconds after the last capture, so there is nothing to release here. You do not '
+      + 'need to call this to "free the camera" — just stop calling `look`.\n\n'
+      + '`note` passes what the user just said; it changes what matters in the picture. '
       + 'Passing `say` speaks a sentence out loud through the phone app.\n\n'
+      + '`pace` / `tier` / `camera` are **not this tool\'s knobs any more** — the phone app owns '
+      + 'them. Passing them has no effect and the result will say so.\n\n'
       + '`mode` decides who the answer is for. **"normal" (default)**: the user can see the '
       + 'picture himself — answer like any other conversation, describe it only as far as he '
       + 'cannot see it himself. **"guide"**: the user cannot see (blind navigation) — lead with '
@@ -70,27 +80,25 @@ export function seePhoneToolSpec() {
       },
       wait: {
         type: 'number',
-        description: `Seconds to wait for a usable frame before giving up (default ${DEFAULT_WAIT_SEC}).`,
+        description: 'How many seconds the **phone** captures for (capped at 8). '
+          + `Leave it out to use the action's own default (watch ${DEFAULT_WAIT_SEC}s, `
+          + 'look 1.5s, peek 1s). This is a capture window, not a timeout.',
       },
       /**
-       * 节奏档。与桌面版 `see_now` 的 `pace` 是**同一张表**（见 engine/pace.js），
-       * 只有一处口径不同：手机没有自动叫醒那条链，所以它控制的是"多久算一次画面变了"。
+       * 节奏档：**0.4.0 起归手机 App 管**，传进来只会被忽略并回一句提醒。
+       * 参数名和类型仍然保留 —— 宿主按 schema 过滤参数，删掉会让老调用直接失效。
        */
       pace: {
         type: 'string',
-        description: '"calm" | "normal" (default) | "dense" | "game-economic" — how often the picture '
-          + 'counts as "changed" (cut threshold) and how often a still scene still gets a frame.\n'
-          + 'User says **"太密了 / 太频繁 / 省点电 / 慢一点 / 别老说话"** → `pace:"calm"`. '
-          + 'This is the only switch that actually lowers how many images you get; promising to talk '
-          + 'less changes nothing.\n'
-          + 'User complains **"漏了 / 不灵敏 / 太迟钝 / 没抓到"** → `pace:"dense"` (costlier).\n'
-          + 'Handheld shake or fast motion where the image "糊得看不清 / 全是运动" → `pace:"game-economic"`; '
-          + 'it is only for fast motion — static scenes will lose most frames.\n'
-          + 'Sticky: it stays until you change it again. Changing it restarts the camera (~1s).',
+        description: '"calm" | "normal" | "dense" | "game-economic". '
+          + '⚠ **Ignored since 0.4.0** — pacing lives in the phone app now, and passing it only '
+          + 'gets you a warning in the result. Tell the user to change it in the app instead of '
+          + 'trying again with a different value.',
       },
       camera: {
         type: 'string',
-        description: '"back" (default) | "front". Back camera sees the way ahead.',
+        description: '"back" | "front". ⚠ **Ignored since 0.4.0** — the phone app owns the camera '
+          + 'switch (there is a front/back button in its call screen).',
       },
     },
     output: {

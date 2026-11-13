@@ -23,7 +23,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { dirname } from 'node:path';
-import { whichBin } from './cam/camera.js';
+import { whichBin } from './bin.js';
 
 /** 和桥 App 约定的落点（`SayService.SAY_FILE`）。 */
 export const SAY_FILE = '/sdcard/Download/DSH-Go/say.txt';

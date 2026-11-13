@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    全局主题 —— 两件事：把系统弹窗从 Material 的灰色改成「鱼眼」的深色，
+    以及把状态栏/导航栏压成页面底色（会话页是沉浸式的，其余三页靠这里对齐）。
+
+    所有颜色和 `src/com/dsh/eye/Theme.java` 一一对应。**两边都写是有意的**：
+    xml 这份只负责"framework 自己画的东西"（对话框、Toast、状态栏、输入框光标），
+    代码里的那份负责"我们画的东西"。改配色时两处一起改 —— 这是唯一一处刻意的重复。
+
+    父主题保持 `Theme.Material.NoActionBar`（深色那套），只覆盖颜色，
+    这样按钮、输入框、单选列表的其余默认行为都不变。
+-->
+<resources>
+
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:colorPrimary">#5B9CFF</item>
+        <item name="android:colorPrimaryDark">#0A0D14</item>
+        <item name="android:colorAccent">#5B9CFF</item>
+        <item name="android:colorBackground">#0A0D14</item>
+        <item name="android:windowBackground">#0A0D14</item>
+        <item name="android:statusBarColor">#0A0D14</item>
+        <item name="android:navigationBarColor">#0A0D14</item>
+        <item name="android:alertDialogTheme">@style/AppDialog</item>
+        <!-- 文字选中手柄：默认是 Material 的绿色，在蓝紫界面上很跳 -->
+        <item name="android:textColorHighlight">#405B9CFF</item>
+    </style>
+
+    <!-- 弹窗本体：卡片色 + 20dp 圆角 + 浅色字，和会话页气泡一个色系 -->
+    <style name="AppDialog" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorPrimary">#5B9CFF</item>
+        <item name="android:colorAccent">#5B9CFF</item>
+        <item name="android:colorBackground">#121826</item>
+        <item name="android:windowBackground">@drawable/dialog_bg</item>
+        <item name="android:textColorPrimary">#E9EEF7</item>
+        <item name="android:textColorSecondary">#8695AE</item>
+        <item name="android:textColorPrimaryInverse">#0A0D14</item>
+    </style>
+
+</resources>
