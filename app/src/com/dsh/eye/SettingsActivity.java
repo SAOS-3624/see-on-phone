@@ -169,6 +169,18 @@ public class SettingsActivity extends AppActivity {
                 apply();
             } });
 
+        head("通话");
+        row("fisheye", "攒帧张数", "自动开：攒满就发；自动关：发字时带上", cfg.callFrames() + " 张",
+            new Runnable() { public void run() {
+                cfg.setCallFrames(cfg.nextCallFrames());
+                apply();
+            } });
+        row("video", "自动看", "开着它自己开口；关着只在你说话时发", cfg.autoWatch() ? "开" : "关",
+            new Runnable() { public void run() {
+                cfg.setAutoWatch(!cfg.autoWatch());
+                apply();
+            } });
+
         head("能力");
         row("eye", "记忆", "它每轮都会看到的东西", memoryBrief(),
             new Runnable() { public void run() { memDialog(); } });

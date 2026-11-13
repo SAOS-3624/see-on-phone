@@ -139,6 +139,60 @@ final class Looker {
     }
 
     /**
+     * 把**已经攒在缓冲里**的几帧拼成一张宫格：不碰相机、不等待。
+     *
+     * 通话页的"滚动缓冲"要的就是这个 —— 相机早就开着、帧一直在来，再走
+     * {@link #grab} 那套"等第一帧 + 喂两秒"纯属白等，而且抓到的是**又一个两秒**，
+     * 不是用户刚刚那几眼。这里直接拿缓冲里的帧过一遍同一套管线（切点/档位/装箱/拼图），
+     * 所以出图口径和 grab 完全一致，只是时间轴是"过去这几秒"。
+     *
+     * @param jpgs 由旧到新的原始 JPEG（1~8 张）
+     */
+    Tools.Look compose(java.util.List<byte[]> jpgs, String why) {
+        if (jpgs == null || jpgs.isEmpty()) return null;
+        Pipeline pipe = new Pipeline(opts());
+        // 等间隔喂：缓冲是"每隔 SAMPLE 毫秒取一张"，相邻帧就是等距的
+        final double step = 0.9;
+        int fed = 0;
+        for (int i = 0; i < jpgs.size(); i += 1) {
+            byte[] jpg = jpgs.get(i);
+            if (jpg == null || jpg.length == 0) continue;
+            byte[] rgb = toRgb24(jpg);
+            if (rgb == null) continue;
+            synchronized (pipe) {
+                pipe.push((i + 1) * step, rgb, jpg);
+            }
+            fed += 1;
+        }
+        Pipeline.Sheet s;
+        synchronized (pipe) {
+            s = pipe.flushNow((jpgs.size() + 1) * step, why == null ? "buffer" : why);
+            pipe.take();                       // 必须取走，见 grab() 里的注释
+        }
+        if (s == null || s.frames.isEmpty()) {
+            // 一帧都没留住（画面从头到尾一样）：退回最新那一帧，至少让它看见东西
+            byte[] jpg = jpgs.get(jpgs.size() - 1);
+            if (jpg == null) return null;
+            Tools.Look l = new Tools.Look();
+            l.jpeg = jpg;
+            l.frames = 1;
+            l.tokens = Tokens.imageTokens(480, 640);
+            l.why = "still";
+            return l;
+        }
+        byte[] sheet = Sheet.compose(s);
+        if (sheet == null) return null;
+        Tools.Look l = new Tools.Look();
+        l.jpeg = sheet;
+        l.frames = s.frames.size();
+        l.tokens = s.layout == null ? Tokens.SHEET_TOKENS : s.layout.tokens();
+        l.why = s.why == null ? "buffer" : s.why;
+        EyeLog.w("look", "compose fed=" + fed + " frames=" + l.frames
+            + " why=" + l.why + " tokens=" + l.tokens + " jpeg=" + sheet.length);
+        return l;
+    }
+
+    /**
      * 建管线参数。**优先级：tuning.json > 设置页 > `Pipeline.Opts` 默认值**，
      * 和 0.13.x 完全一致（`tune` 改的就是前两级里的值）。
      */

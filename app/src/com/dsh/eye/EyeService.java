@@ -210,6 +210,11 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         void onQuiet();
         void onError(String msg);
         void onState();
+        /**
+         * 通话页的缓冲进度（"2/3"）。**采集线程**调的，实现里自己 post 到主线程。
+         * 这个数字是"它到底有没有在抓帧"的唯一可见证据 —— 没有它，用户只能猜。
+         */
+        void onFrames(int have, int need);
     }
 
     private volatile Ui uiSink;
@@ -224,64 +229,164 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     String lastLine() { return lastLine; }
 
     /**
-     * 通话页的"自动看"。
+     * 通话页的取帧：**一直采，只留最新 N 张**。
      *
-     * 用户的原话是"**攒满就发**"—— 这正是 0.13 连续看的语义：画面攒够变化就自己说一句。
-     * v4 把相机降级成工具之后，通话页只借相机取画面，**没有任何人喂 Pipeline**，
-     * 所以不主动说话 —— 用户能感觉到"它不动了"。
+     * 这是"自动/手动"共用的底座 —— 不管自动开还是关，只要通话页开着，
+     * 相机每出一帧就按 {@link #CALL_SAMPLE_MS} 抽一张进 {@link #callBuf}，
+     * 队列满就顶掉最旧的。所以"最新 N 张"永远是**刚刚发生的事**，不是几分钟前的。
      *
-     * 这里的规矩：
-     *   - 只在通话页开着时跑（关了立刻停，不烧电也不烧钱）
-     *   - 至少 {@link #AUTO_EVERY_MS} 才看一次，且**上一轮没在跑**
-     *   - `frames >= 2` 才算"攒满"（一帧就是没变化），再和上一张比一遍
-     *   - 模型回"没变"这类 → **不落盘、不朗读**（否则聊天记录里全是"嗯"）
+     * 两种用法：
+     *   - **自动 · 开**：攒满 N 张（且都是上次之后的新帧）就拼成一张宫格发过去，
+     *     它自己看一眼、有话说就说一句。间隔至少 {@link #AUTO_MIN_GAP_MS}，
+     *     画面一直没变则最多憋 {@link #AUTO_SAME_GAP_MS} 再看一眼。
+     *   - **自动 · 关**：一个字节都不发。等你开口（打字或话筒）时，
+     *     把当前这 N 张拼成一张宫格**挂在你的话上**一起发出去 ——
+     *     这样它回答的是"你现在看到的"，而不是历史里那张老图。
+     *
+     * ⚠️ 0.29.x 的病根：自动关着的时候**根本不采帧**，自动开着又要 `frames >= 2`
+     * （静止画面永远只有 1 帧）才发 —— 两头都堵死，表现就是"它一直看着同一张老图"。
      */
     private volatile boolean autoWatch;
     private volatile boolean autoBusy;
+    /**
+     * 有没有一轮正在跑。
+     *
+     * ⚠️ 不能用 `current != null` 来判断 —— `current` 是"最近一个 asker"，**跑完也不置空**
+     * （过期回包靠"下一条把 current 换成新 asker"来表达）。0.29.x 就是用 `current != null`
+     * 挡住自动看的，结果只要用户说过一句话，**自动看就永久失效**，用户看到的就是
+     * "自动开着它也不动了"。这里单独记一个真正会复位的标记。
+     */
+    private volatile boolean busyRound;
     /** 这一轮是"自己看一眼"发起的（回来太短就当没说话）。 */
     private volatile boolean pendingAuto;
     private volatile long lastAutoAt;
+    /** 上一次**真的发出去**的时间（和 lastAutoAt 不是一回事：那个是"尝试"的间隔）。 */
+    private volatile long lastAutoSentAt;
     private volatile byte[] lastAutoSheet;
-    private static final long AUTO_EVERY_MS = 15_000;
-    private static final int AUTO_MIN_FRAMES = 2;
+
+    /** 两次"自己看一眼"之间至少隔这么久（攒够了也等等，别一秒一句）。 */
+    private static final long AUTO_MIN_GAP_MS = 8_000;
+    /** 画面一直没变，最多憋这么久也要再看一眼（否则就是"它不动了"）。 */
+    private static final long AUTO_SAME_GAP_MS = 30_000;
+    /** 通话页缓冲的取样间隔：900ms ⇒ 攒 3 张约 2.7 秒。 */
+    private static final long CALL_SAMPLE_MS = 900;
+
+    /** 通话页开着没有（决定要不要一直采帧）。 */
+    private volatile boolean callActive;
+    /** 滚动缓冲：最新 N 张原始 JPEG，旧的在队首。 */
+    private final java.util.ArrayDeque<byte[]> callBuf = new java.util.ArrayDeque<byte[]>();
+    /** 已采样帧数 / 上一次交给模型的帧水位（差值 = 有几张是新的）。 */
+    private long callSeq;
+    private long callSentSeq;
+    private long lastCallSampleAt;
+
+    /** 缓冲要几张 —— 跟着设置 · 通话 · 攒帧张数走（2~8，默认 3）。 */
+    int callN() {
+        int n = cfg == null ? 3 : cfg.callFrames();
+        return Math.max(2, Math.min(8, n));
+    }
+
+    /** 现在是几张（界面显示"2/3"用）。 */
+    int callBuffered() {
+        synchronized (callBuf) { return callBuf.size(); }
+    }
 
     /** 通话页开/关时借用相机（预览是要一直有帧的）。 */
     void callOpen() {
+        callActive = true;                 // 先立标记：ensureEngine 建引擎时直接按它选分辨率
         camAcquire("call");
+        // 通话页的帧要拼成宫格喂模型，640 长边太小（一格只剩两百多像素，模型会说"糊"）
+        try { if (engine != null) engine.setResolution("medium"); } catch (Throwable ignored) { }
         autoWatch = cfg == null || cfg.autoWatch();   // 用记住的那个选择，别每次硬置 true
         lastAutoAt = System.currentTimeMillis();
+        synchronized (callBuf) {
+            callBuf.clear();
+            callSeq = 0;
+            callSentSeq = 0;
+        }
+        lastCallSampleAt = 0;
     }
 
     void callClose() {
+        callActive = false;
         autoWatch = false;
+        synchronized (callBuf) {
+            callBuf.clear();
+            callSeq = 0;
+            callSentSeq = 0;
+        }
+        // 回到会话页那种"偶尔看一眼"的用法，640 够用也省电
+        try { if (engine != null) engine.setResolution("low"); } catch (Throwable ignored) { }
         camRelease();
+    }
+
+    /**
+     * 采集线程每出一帧都走这里：按间隔抽一张进缓冲。
+     *
+     * 只做"塞进队列"这一件事，**不拼图不发请求** —— 拼图要 30~60ms，放在采集线程上
+     * 会把预览拖卡。发送由 1 秒一次的 tick 去判（见 {@link #maybeAutoSend()}）。
+     */
+    private void sampleCallFrame(byte[] jpg) {
+        if (!callActive || jpg == null || jpg.length == 0) return;
+        long now = System.currentTimeMillis();
+        if (now - lastCallSampleAt < CALL_SAMPLE_MS) return;
+        lastCallSampleAt = now;
+        int n = callN();
+        int have;
+        synchronized (callBuf) {
+            while (callBuf.size() >= n) callBuf.removeFirst();
+            callBuf.addLast(jpg);
+            callSeq += 1;
+            have = callBuf.size();
+        }
+        // 界面上的"2/3"：让用户看得见它确实在抓帧
+        Ui u = uiSink;
+        if (u != null) {
+            try { u.onFrames(have, n); } catch (Throwable ignored) { }
+        }
     }
 
     void setAutoWatch(boolean on) {
         autoWatch = on;
-        lastAutoAt = System.currentTimeMillis();
+        // 打开的那一刻就允许立刻发（否则要等 6 秒，用户会以为开关没生效）
+        lastAutoAt = on ? 0 : System.currentTimeMillis();
+        if (on) {
+            synchronized (callBuf) { callSentSeq = 0; }   // 缓冲里现有的也算"新的"
+        }
         if (cfg != null) cfg.setAutoWatch(on);        // 记住
     }
 
     boolean autoWatch() { return autoWatch; }
 
-    private void maybeAutoWatch() {
-        if (!autoWatch || !running || cfg == null || autoBusy) return;
-        if (current != null) return;                       // 正在回话，别插嘴
+    /** tick 每秒调一次：够不够"攒满就发"，够就发。 */
+    private void maybeAutoSend() {
+        if (!autoWatch || !callActive || !running || cfg == null || autoBusy) return;
+        if (busyRound) return;                             // 正在回话，别插嘴
         if (!cfg.direct()) return;
-        if (System.currentTimeMillis() - lastAutoAt < AUTO_EVERY_MS) return;
-        lastAutoAt = System.currentTimeMillis();
+        int n = callN();
+        long seq;
+        int have;
+        synchronized (callBuf) {
+            seq = callSeq;
+            have = callBuf.size();
+        }
+        if (have < n) return;                              // 还没攒满
+        long now = System.currentTimeMillis();
+        if (now - lastAutoAt < AUTO_MIN_GAP_MS) return;    // 攒够了也等一等
+        if (seq - callSentSeq < n) return;                 // 这 N 张里没有新的
+        lastAutoAt = now;
+        callSentSeq = seq;
         autoBusy = true;
         Ui u = uiSink;
         if (u != null) u.onTool("look", "running", "自己看一眼…");
         try {
             asks.submit(new Runnable() {
                 public void run() {
-                    try { autoLook(); } catch (Throwable e) { EyeLog.w("auto", "" + e); }
+                    try { autoLookBuffered(); } catch (Throwable e) { EyeLog.w("auto", "" + e); }
                     finally {
                         autoBusy = false;
                         Ui v = uiSink;
-                        if (v != null && current == null) v.onTool("look", "ok", "看完了");
+                        if (v != null && !busyRound) v.onTool("look", "ok", "看完了");
                     }
                 }
             });
@@ -290,28 +395,77 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         }
     }
 
-    private void autoLook() {
-        Tools.Look l = look(2.0);
+    /** 自动看：把缓冲里这几帧拼成一张，**连图带话**发过去。 */
+    private void autoLookBuffered() {
+        Tools.Look l = callSheet("auto");
         if (l == null || l.jpeg == null) return;
-        if (l.frames < AUTO_MIN_FRAMES) return;            // 攒不满 = 画面基本没动
-        if (sameSheet(l.jpeg, lastAutoSheet)) return;      // 变了但看起来一样
+        long now = System.currentTimeMillis();
+        // 画面一模一样就别反复烧钱 —— 但憋太久也要再看一眼，否则用户会觉得它卡住了
+        if (sameSheet(l.jpeg, lastAutoSheet) && now - lastAutoSentAt < AUTO_SAME_GAP_MS) {
+            EyeLog.w("auto", "跟上一次一模一样，这次跳过");
+            return;
+        }
+        lastAutoSentAt = now;
         lastAutoSheet = l.jpeg;
-        EyeLog.w("auto", "自己看一眼：frames=" + l.frames + " why=" + l.why);
+        EyeLog.w("auto", "攒满就发：frames=" + l.frames + " tokens=" + l.tokens);
         // ⚠️ 顺序：先 send（它会把 pendingAuto 清成 false），再立标记。
         //    反过来的话，`send` 开头那句清标记会把这次自动看标记掉。
-        send("（你自己看了一眼画面）有值得说的就一句话说；没变化就只回「嗯」。", l.jpeg, l.frames);
+        sendWithSheet("（你自己看了一眼画面）有值得说的就一句话说；没变化就只回「嗯」。",
+            l.jpeg, l.frames);
         pendingAuto = true;
     }
 
-    /** 抽 64 个点比一下：足够判断"还是那个画面"，又不用解码。 */
+    /** 拿缓冲里当前这几帧拼一张宫格（没有人开口时也能用：auto 和"发字带图"共用）。 */
+    private Tools.Look callSheet(String why) {
+        java.util.List<byte[]> frames = new java.util.ArrayList<byte[]>();
+        synchronized (callBuf) { frames.addAll(callBuf); }
+        if (frames.isEmpty() || looker == null) return null;
+        return looker.compose(frames, why);
+    }
+
+    /**
+     * 用户开口（打字/话筒）时，把缓冲里的帧挂在这句话上。
+     *
+     * 自动开着也照样挂 —— 他既然开口问了，就该让他问的是"现在"。
+     * 发完把水位推到当前，免得紧接着自动那条又发一遍同样的内容。
+     */
+    private void sendWithBufferedFrames(final String text) {
+        Tools.Look l = callSheet("user");
+        if (l == null || l.jpeg == null) {
+            send(text, (java.util.List<byte[]>) null, 0, false, null);
+            return;
+        }
+        synchronized (callBuf) { callSentSeq = callSeq; }
+        // 刚发过图：自动那条往后挪，而且以这张为"上一次看到的画面"
+        lastAutoAt = System.currentTimeMillis();
+        lastAutoSentAt = lastAutoAt;
+        lastAutoSheet = l.jpeg;
+        EyeLog.w("send", "带通话帧 " + l.frames + " 张 tokens=" + l.tokens);
+        send(text, java.util.Collections.singletonList(l.jpeg), l.frames, true,
+            "这是手机摄像头**刚才这几秒**攒的 " + l.frames + " 帧拼成的一张宫格"
+                + "（按时间先后，左上角是编号）。直接看这张图回答，不要调用 look 工具。");
+    }
+
+    /**
+     * 判断"还是那个画面"。
+     *
+     * ⚠️ **不能逐字节相等**：画面一动不动的时候，JPEG 也会因为自动曝光/传感器噪声
+     * 差几十个字节。0.29.x 用的就是 `a[i] != b[i]`，于是"一模一样"永远判不出来，
+     * 自动看每 6 秒发一次同样的图、模型每 6 秒回一次"没变化" —— 白烧钱还吵。
+     *
+     * 这里抽 128 个点，只有**明显不同**（|差| > 16）的点超过 8% 才算"变了"。
+     */
     private static boolean sameSheet(byte[] a, byte[] b) {
         if (a == null || b == null) return false;
         if (a.length != b.length) return false;
-        int step = Math.max(1, a.length / 64);
+        int step = Math.max(1, a.length / 128);
+        int diff = 0;
+        int n = 0;
         for (int i = 0; i < a.length; i += step) {
-            if (a[i] != b[i]) return false;
+            n += 1;
+            if (Math.abs((a[i] & 0xFF) - (b[i] & 0xFF)) > 16) diff += 1;
         }
-        return true;
+        return n > 0 && diff * 100 / n < 8;
     }
 
     /** 「没什么可说的」—— 只认明确的否定词，不用长度猜（"地上有水"只有 4 个字但必须说）。 */
@@ -427,7 +581,9 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             return;
         }
         engine = new CameraEngine(this, this);
-        try { engine.setResolution("low"); engine.setFps(12); } catch (Throwable ignored) { }
+        // 通话页要拼宫格给模型看，用 medium；平时 640 够用也省电
+        try { engine.setResolution(callActive ? "medium" : "low"); engine.setFps(12); }
+        catch (Throwable ignored) { }
         engine.start();
         lastCamOpenAt = System.currentTimeMillis();
         EyeLog.w("cam", "开（" + why + "）");
@@ -718,7 +874,18 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      *
      * 先打断上一轮：用户又说话 = 他不想等那 8 秒思考了。
      */
-    void send(String text) { send(text, (java.util.List<byte[]>) null, 0, false); }
+    void send(String text) {
+        // 通话页开着：这句话要带上"刚才这几秒"的画面，否则模型只能看历史里那张老图
+        if (callActive) { sendWithBufferedFrames(text); return; }
+        send(text, (java.util.List<byte[]>) null, 0, false, null);
+    }
+
+    /** 自动看那条：图必须**真的进 API**（不然模型只能自己再拍一次，白等一轮）。 */
+    private void sendWithSheet(String text, byte[] sheet, int frames) {
+        send(text, java.util.Collections.singletonList(sheet), frames, true,
+            "这是手机摄像头**刚才这一会儿**攒的 " + frames + " 帧拼成的一张宫格"
+                + "（按时间先后，左上角是编号）。直接看它，不要调用 look 工具。");
+    }
 
     /**
      * @param image 这一轮自带的图（"这是什么？"用）；null = 纯文字
@@ -726,7 +893,8 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      * `image` 只用于**落盘显示**，不进 API —— 相机是工具，模型通过调 `look` 拿图。
      */
     void send(String text, byte[] image, int frames) {
-        send(text, image == null ? null : java.util.Collections.singletonList(image), frames, false);
+        send(text, image == null ? null : java.util.Collections.singletonList(image),
+            frames, false, null);
     }
 
     /**
@@ -737,7 +905,8 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      */
     void sendWithImage(String text, byte[] image) {
         // frames=0：相册不是帧序列，别让模型说"第 1 帧"
-        send(text, image == null ? null : java.util.Collections.singletonList(image), 0, true);
+        send(text, image == null ? null : java.util.Collections.singletonList(image),
+            0, true, null);
     }
 
     /**
@@ -747,11 +916,16 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      * 单张换成 list —— 协议侧一行没改。
      */
     void sendWithImages(String text, java.util.List<byte[]> images) {
-        send(text, images, 0, true);
+        send(text, images, 0, true, null);
     }
 
     private void send(final String text, final java.util.List<byte[]> images,
                       final int frames, final boolean attach) {
+        send(text, images, frames, attach, null);
+    }
+
+    private void send(final String text, final java.util.List<byte[]> images,
+                      final int frames, final boolean attach, final String note) {
         final String t = text == null ? "" : text.trim();
         final boolean hasImg = images != null && !images.isEmpty();
         // 只发图不带字也要放行（相册里挑一张直接问"这是什么"是最自然的用法）
@@ -771,6 +945,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         final java.util.List<Conv.Out> ctx = contextFor();
         final Asker asker = new Asker(cfg, this);
         current = asker;
+        busyRound = true;
         newTurn();
         /**
          * 这一轮自带的图**必须是局部变量**，不能是字段。
@@ -797,12 +972,19 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
                 final boolean attached = attach && hasImg;
                 final String what = images != null && images.size() > 1
                     ? "这几张图" : "这张图";
-                final String askText = !attached ? t
-                    : (t.length() == 0
+                // note = 通话页攒帧/自动看那条的说明（自己写好了"这是什么、别调 look"）
+                final String askText;
+                if (!attached) {
+                    askText = t;
+                } else if (note != null && note.length() > 0) {
+                    askText = (t.length() == 0 ? "" : t + "\n\n") + "（" + note + "）";
+                } else {
+                    askText = (t.length() == 0
                         ? "（这是我刚从相册发给你" + (images.size() > 1 ? "的几张图" : "的一张图")
                             + "。直接看" + what + "回答，不要调用 look 工具）"
                         : t + "\n\n（" + what + "是我从相册选的，请直接看" + what
                             + "；不要调用 look 工具）");
+                }
                 asker.ask(askText, attach ? images : null, ctx, new Asker.Cb() {
                     public void onTool(String name, String phase, String detail) {
                         Ui u = uiSink;
@@ -825,6 +1007,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
                     public void onStopped(String partial) {
                         pendingAuto = false;
                         if (current != asker) return;
+                        busyRound = false;
                         String body = partial == null ? "" : partial.trim();
                         String out = body.length() == 0 ? "（已停止）" : body + "\n\n（已停止）";
                         java.util.List<byte[]> sheets = turnImgs != null ? turnImgs
@@ -841,6 +1024,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
 
                     public void onText(String out, String reasoning, long thinkMs) {
                         if (current != asker) return;      // 被打断了：这条答案作废
+                        busyRound = false;
                         if (pendingAuto) {
                             pendingAuto = false;
                             if (looksLikeNoop(out)) {
@@ -866,6 +1050,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
 
                     public void onFail(String reason) {
                         pendingAuto = false;
+                        if (current == asker) busyRound = false;
                         if (reason == null || reason.length() == 0) return;   // 被打断，静默
                         Ui u = uiSink;
                         if (u != null) u.onError(reason);
@@ -976,6 +1161,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     void cancelTurn() {
         Asker a = current;
         if (a != null) a.cancel();
+        busyRound = false;      // 这一轮作废了：标记也要复位，否则自动看永远等着
     }
 
     // ---------------------------------------------------------------- Tools.Env
@@ -1284,6 +1470,8 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         }
         Brain.setReadTimeoutSec(cfg.timeoutSec());
         refreshMemory();
+        // 设置里改了"自动看"，正在通话的页面要立刻跟着变（不然要点两次）
+        if (callActive) autoWatch = cfg.autoWatch();
         notifyState();
         EyeLog.w("svc", "apply think=" + cfg.think() + " speak=" + cfg.speak()
             + " ctx=" + Config.ctxLabel(cfg.ctxTokens())
@@ -1320,6 +1508,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     @Override
     public void onJpeg(byte[] jpg, int w, int h, int rotate) {
         if (looker != null) looker.onFrame(jpg);
+        try { sampleCallFrame(jpg); } catch (Throwable ignored) { }   // 通话页的滚动缓冲
         long s = seq + 1;
         seq = s;
         HttpServer.Frame f = new HttpServer.Frame(s, System.currentTimeMillis(), jpg);
@@ -1614,7 +1803,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         public void run() {
             if (!running) return;
             try { maybeCloseCamera(); } catch (Throwable ignored) { }
-            try { maybeAutoWatch(); } catch (Throwable ignored) { }
+            try { maybeAutoSend(); } catch (Throwable ignored) { }
             try { refreshNotification(); } catch (Throwable ignored) { }
             try { dumpStatus(); } catch (Throwable ignored) { }
             ui.postDelayed(this, 1000);

@@ -60,6 +60,7 @@ final class Config {
     private static final String K_PACE = "pace";
     private static final String K_TIER = "tierStyle";
     private static final String K_MAXFRAMES = "maxFrames";
+    private static final String K_CALLN = "callN";
 
     private static final String K_MAXTOK = "maxTokens";
     private static final String K_TIMEOUT = "timeoutSec";
@@ -376,6 +377,22 @@ final class Config {
     }
 
     void setMaxFrames(int v) { sp.edit().putInt(K_MAXFRAMES, v >= 0 && v <= 40 ? v : 0).apply(); }
+
+    // ---------------------------------------------------------------- 通话
+
+    /** 通话页滚动缓冲留几张（= 自动开着时"攒满几张发一次"，关着时"发字带几张"）。 */
+    int callFrames() {
+        int v = sp.getInt(K_CALLN, 3);
+        return v >= 2 && v <= 8 ? v : 3;
+    }
+
+    void setCallFrames(int v) { sp.edit().putInt(K_CALLN, v >= 2 && v <= 8 ? v : 3).apply(); }
+
+    /** 2 → 3 → … → 6 → 2。设置页点一下转一格。 */
+    int nextCallFrames() {
+        int v = callFrames() + 1;
+        return v > 6 ? 2 : v;
+    }
 
     // ---------------------------------------------------------------- 请求
 

@@ -62,6 +62,9 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
     /** 顶部那行字：在看 / 在想 / 在听。 */
     private TextView status;
     private TextView autoBtn;
+    /** 缓冲进度：当前几张 / 攒满需要几张（显示在"自动 · 开/关"后面）。 */
+    private int bufHave;
+    private int bufNeed;
     /** 点一下画面把上下两条栏收起来（沉浸看）。再点一下回来。 */
     private boolean chromeHidden;
 
@@ -315,8 +318,24 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
 
     private void paintAuto(boolean on) {
         if (autoBtn == null) return;
-        autoBtn.setText(on ? "自动 · 开" : "自动 · 关");
+        // 把缓冲进度挂在开关后面：**这是"它到底有没有在抓帧"的唯一证据**
+        String tail = bufNeed > 0 ? " · " + bufHave + "/" + bufNeed : "";
+        autoBtn.setText((on ? "自动 · 开" : "自动 · 关") + tail);
         autoBtn.setTextColor(on ? Theme.OK : Theme.TEXT_DIM);
+    }
+
+    /** 缓冲进度（采集线程调过来的）。 */
+    @Override
+    public void onFrames(final int have, final int need) {
+        ui.post(new Runnable() {
+            public void run() {
+                if (have == bufHave && need == bufNeed) return;
+                bufHave = have;
+                bufNeed = need;
+                EyeService s = EyeService.peek();
+                paintAuto(s != null && s.autoWatch());
+            }
+        });
     }
 
     private void setStatus(String text, int color) {
@@ -374,12 +393,11 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
     public void onTool(final String name, final String phase, final String detail) {
         ui.post(new Runnable() {
             public void run() {
-                if ("running".equals(phase)) {
-                    showSubtitle(detail, true);
-                    setStatus("在想…", Theme.BUSY);
-                } else {
-                    setStatus("在看", Theme.ACCENT);
-                }
+                // ⚠️ 工具状态**只进胶囊，不进字幕**。
+                //    以前这里 `showSubtitle(detail)` —— 它看一眼就把它上一句真说过的话
+                //    顶掉了，用户看到的是"话说出来了、字幕却没了"。
+                if ("running".equals(phase)) setStatus("在想…", Theme.BUSY);
+                else setStatus("在看", Theme.ACCENT);
             }
         });
     }
@@ -421,14 +439,33 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
         ui.post(new Runnable() {
             public void run() {
                 if (text != null) liveBuf.append(text);
-                long now = System.currentTimeMillis();
-                if (now - lastLiveAt < 80) return;
-                lastLiveAt = now;
-                showSubtitle(liveBuf.toString(), false);
-                setStatus("在说…", Theme.ACCENT);
+                renderLive();
             }
         });
     }
+
+    /**
+     * 把 {@link #liveBuf} 刷到字幕上，**并保证最后一段一定刷得出去**。
+     *
+     * 节流 80ms 是为了别把主线程占满，但只"跳过着一次"不补一次的话，
+     * 最后那几个字就永远只活在缓冲里 —— 声音念完了、字幕停在半句。
+     */
+    private void renderLive() {
+        long now = System.currentTimeMillis();
+        if (now - lastLiveAt < 80) {
+            ui.removeCallbacks(flushLive);
+            ui.postDelayed(flushLive, 90);
+            return;
+        }
+        lastLiveAt = now;
+        if (liveBuf.length() == 0) return;
+        showSubtitle(liveBuf.toString(), false);
+        setStatus("在说…", Theme.ACCENT);
+    }
+
+    private final Runnable flushLive = new Runnable() {
+        public void run() { renderLive(); }
+    };
 
     @Override
     public void onQuiet() {
@@ -449,8 +486,10 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
     public void onRoundReset() {
         ui.post(new Runnable() {
             public void run() {
+                // 同上：**别把字幕换成"正在想…"**。字幕只放"它真说过的话"，
+                // "在想"这件事交给上面那个胶囊。否则每调一次工具字幕就闪一下，
+                // 而声音（朗读是异步排队）可能还在念上一句，看起来就像"话说了一半没了"。
                 liveBuf.setLength(0);
-                showSubtitle("正在想…", true);
                 setStatus("在想…", Theme.BUSY);
             }
         });
