@@ -15,6 +15,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
@@ -87,8 +88,33 @@ final class Bubbles {
 
     // ------------------------------------------------------------ 对外：三种气泡
 
+    /**
+     * 用户气泡的把手。
+     *
+     * **为什么要有它**：图可能比字晚到 —— 通话页那一张是服务端现拼（40~80ms 拼图）
+     * 再落盘的，界面先画出"我说了什么"，图到了再补进**同一个气泡**。
+     *
+     * 以前是反过来：回答那条气泡带图（`onReply` 里按"没显示过"筛一遍再挂上去），
+     * 于是同一张图在磁盘上属于 user、在界面上却挂在 assistant 下面，
+     * 重进会话就"多出一张"。现在**图只属于用户气泡**，AI 气泡一张都不带。
+     */
+    static final class UserBubble {
+        final View view;
+        private final LinearLayout stack;
+        private final String text;
+        /** 已经挂了几张（0 = 还没有图，服务补来的那批才认）。 */
+        int shots;
+
+        UserBubble(View view, LinearLayout stack, String text, int shots) {
+            this.view = view;
+            this.stack = stack;
+            this.text = text;
+            this.shots = shots;
+        }
+    }
+
     /** 我说的。渐变底 + 白字 + 右下尖角。 */
-    View user(String text, List<String> shots, long at) {
+    UserBubble userBubble(String text, List<String> shots, long at) {
         final String body = text == null ? "" : text;
 
         LinearLayout stack = stack(Gravity.END);
@@ -102,8 +128,19 @@ final class Bubbles {
             });
             stack.addView(card, wrap());
         }
-        addShots(stack, shots, body);
-        return row(true, stack);
+        int n = addShots(stack, shots, body);
+        return new UserBubble(row(true, stack), stack, body, n);
+    }
+
+    /**
+     * 图晚到了：补进**已经画出来的**用户气泡。
+     *
+     * 只在气泡里一张图都没有时补 —— 有图说明是相册发的（发的时候就已经在气泡里了），
+     * 再补一遍就成了同一张图挂两次。
+     */
+    void addShots(UserBubble b, List<String> shots) {
+        if (b == null || b.shots > 0) return;
+        b.shots = addShots(b.stack, shots, b.text);
     }
 
     /**
@@ -282,21 +319,29 @@ final class Bubbles {
             more.setPadding(0, dp(6), 0, dp(2));
             box.addView(more);
         }
-        List<String> shotFiles = new java.util.ArrayList<String>();
         for (int i = from; i < msgs.size(); i += 1) {
             Conv.Msg m = msgs.get(i);
-            List<String> files = new java.util.ArrayList<String>();
-            if (m.shots != null) {
-                for (Conv.Shot sh : m.shots) if (sh.file != null) files.add(sh.file);
-            }
+            List<String> files = shotsOf(m);
+            /**
+             * **图只挂在"发出去"那一条上**（磁盘也是这么存的：`Msg.shots` 属于 user）。
+             *
+             * 以前这里把上一条 user 的图也递给 ai 气泡（`shotFiles`），于是同一张图
+             * 在"我的"和"它的"下面各出现一次；live 还有一份等价的补丁（`shownShots`）。
+             * 两处都删掉了 —— 图属于谁，看 `Msg.shots` 就够了。
+             */
             if ("user".equals(m.role)) {
-                box.addView(user(m.text, files, m.at));
-                shotFiles = files;
+                box.addView(userBubble(m.text, files, m.at).view);
             } else {
-                box.addView(ai(m.text, m.reasoning, m.thinkMs, shotFiles, m.at, false));
-                shotFiles = new java.util.ArrayList<String>();
+                box.addView(ai(m.text, m.reasoning, m.thinkMs, null, m.at, false));
             }
         }
+    }
+
+    private static List<String> shotsOf(Conv.Msg m) {
+        List<String> out = new ArrayList<String>();
+        if (m == null || m.shots == null) return out;
+        for (Conv.Shot sh : m.shots) if (sh.file != null) out.add(sh.file);
+        return out;
     }
 
     /**
@@ -473,8 +518,9 @@ final class Bubbles {
      *
      * 一张 = 120×160 的单图；多张 = 96×96 的横向条（相册多选，最多 4 张）。
      */
-    private void addShots(LinearLayout stack, List<String> shots, final String body) {
-        if (shots == null || shots.isEmpty()) return;
+    /** @return 真挂上去几张（0 = 没有图 / 全是不存在的路径） */
+    private int addShots(LinearLayout stack, List<String> shots, final String body) {
+        if (shots == null || shots.isEmpty()) return 0;
         int n = Math.min(shots.size(), 4);
         boolean single = n == 1;
         int w = single ? 120 : 96;
@@ -502,7 +548,7 @@ final class Bubbles {
             attach(iv, file);
             strip.addView(iv);
         }
-        if (strip.getChildCount() == 0) return;
+        if (strip.getChildCount() == 0) return 0;
 
         HorizontalScrollView hs = new HorizontalScrollView(a);
         hs.setHorizontalScrollBarEnabled(false);
@@ -512,6 +558,7 @@ final class Bubbles {
         lp.topMargin = dp(6);
         hs.setLayoutParams(lp);
         stack.addView(hs);
+        return strip.getChildCount();
     }
 
     private LinearLayout.LayoutParams wrap() {

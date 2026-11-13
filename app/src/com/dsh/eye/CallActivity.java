@@ -85,6 +85,8 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
         java.util.concurrent.Executors.newSingleThreadExecutor();
     /** 第几代请求：解码慢于新请求时，旧结果直接扔掉（否则预览会倒退回上一张）。 */
     private int thumbGen;
+    /** 已经**真的画上去**的那一代（判据是"比它新"，不是"是最新"）。 */
+    private int shownGen;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     /** 当前显示中的位图。换下一张时回收它（一帧 600KB，不能等 GC）。 */
@@ -435,6 +437,14 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
     }
 
     /** 取帧进度（采集线程调过来的）。 */
+    /**
+     * 这段时间内不要用"在看"盖掉那句"看过 · 没变化"。
+     *
+     * 自动看判成"没什么可说的"时，这一轮**不朗读不落盘**（见 `looksLikeNoop`）——
+     * 界面上要是也什么都不留，用户看到的就是"在想…闪一下、然后没下文"，像坏了。
+     */
+    private long quietUntil;
+
     /** 预览的显示状态：**只在这一个地方**动 `gridView` 和按钮文案。 */
     private void applyPreview() {
         if (gridToggle != null) {
@@ -471,21 +481,25 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
      * 免得"新图被旧图盖回去"。
      */
     @Override
-    public void onSheetPreview(byte[] jpeg, int cells, double spanSec) {
+    public void onSheetPreview(final byte[] jpeg, final int cells, final double spanSec) {
         if (jpeg == null || jpeg.length == 0 || !previewOn) return;
-        shownCells = cells;
-        shownSpan = spanSec;
-        final byte[] src = jpeg;
         final int gen;
         synchronized (this) { gen = ++thumbGen; }
         try {
             thumbPool.submit(new Runnable() {
                 public void run() {
-                    // 已经有一张更新的在排队了：这一张解了也是白解（预览 5fps 刷新时才会撞上）
-                    synchronized (CallActivity.this) { if (gen != thumbGen) return; }
-                    final Bitmap bmp = decode(src);
+                    /**
+                     * **不在这里判"是不是最新一张"**。
+                     *
+                     * 原来这里（和 `applyGrid` 里）都要求 `gen == thumbGen`，而预览是 5fps、
+                     * 主线程一忙（相机预览 + 字幕），`ui.post` 就可能晚于下一帧 ——
+                     * 于是每一张都"已经过期"，框里**永远是空的**（真机报过）。
+                     * 现在：照解，交给 `applyGrid` 按"只画比已画的更新的一代"决定。
+                     */
+                    final Bitmap bmp = decode(jpeg);
+                    if (bmp == null) return;
                     ui.post(new Runnable() {
-                        public void run() { applyGrid(gen, bmp); }
+                        public void run() { applyGrid(gen, bmp, cells, spanSec); }
                     });
                 }
             });
@@ -503,13 +517,21 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
         }
     }
 
-    /** 换上最新一张预览。**只有最新一代算数**。 */
-    private void applyGrid(int gen, Bitmap bmp) {
+    /**
+     * 换上预览图：**只画"比已经画上去的那张更新"的一代**。
+     *
+     * 判据是 `gen > shownGen`，不是 `gen == thumbGen` —— 后者要求"你必须是刚生成的那一张"，
+     * 主线程稍微慢一点就永远不成立（框一直空）。宁可晚一帧，也不能一帧都不画。
+     */
+    private void applyGrid(int gen, Bitmap bmp, int cells, double span) {
         if (bmp == null) return;
         if (destroyed) { try { bmp.recycle(); } catch (Throwable ignored) { } return; }
         synchronized (this) {
-            if (gen != thumbGen) { try { bmp.recycle(); } catch (Throwable ignored) { } return; }
+            if (gen <= shownGen) { try { bmp.recycle(); } catch (Throwable ignored) { } return; }
+            shownGen = gen;
         }
+        shownCells = cells;
+        shownSpan = span;
         Bitmap old = gridBmp;
         gridBmp = bmp;
         if (gridView != null) {
@@ -579,7 +601,7 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
                 //    以前这里 `showSubtitle(detail)` —— 它看一眼就把它上一句真说过的话
                 //    顶掉了，用户看到的是"话说出来了、字幕却没了"。
                 if ("running".equals(phase)) setStatus("在想…", Theme.BUSY);
-                else setStatus("在看", Theme.ACCENT);
+                else if (System.currentTimeMillis() >= quietUntil) setStatus("在看", Theme.ACCENT);
             }
         });
     }
@@ -659,7 +681,21 @@ public class CallActivity extends AppActivity implements EyeService.Ui, EyeServi
                 String last = s == null ? null : s.lastLine();
                 if (last != null && last.length() > 0) showSubtitle(last, false);
                 else if (subtitle != null) subtitle.setVisibility(View.GONE);
-                setStatus("在看", Theme.ACCENT);
+                /**
+                 * 胶囊上留一句"看过 · 没变化"再退回"在看"。
+                 *
+                 * 这一轮是不朗读、不落盘的（设计如此），但**界面上必须有痕迹** ——
+                 * 否则"在想…"闪一下就没下文，用户会以为卡死了（2026-11-14 就是这么报的）。
+                 */
+                quietUntil = System.currentTimeMillis() + 2500;
+                setStatus("看过 · 没变化", Theme.TEXT_DIM);
+                ui.postDelayed(new Runnable() {
+                    public void run() {
+                        if (!destroyed && System.currentTimeMillis() >= quietUntil) {
+                            setStatus("在看", Theme.ACCENT);
+                        }
+                    }
+                }, 2600);
             }
         });
     }

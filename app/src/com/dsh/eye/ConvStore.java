@@ -21,7 +21,7 @@ import java.util.Locale;
  * /sdcard/Download/DSH-Go/conv/
  *   20261111-2233.jsonl     一行一条消息，最早的在最上面
  *   20261111-2233.title     会话名（用户改的那个；没有就用第一句用户的话）
- *   20261111-2233/          这个会话用过的图，命名 <时间戳>.jpg
+ *   20261111-2233/          这个会话用过的图，命名 <时间戳>-<序号>.jpg
  * ```
  *
  * ## 为什么不用 JSON
@@ -45,6 +45,10 @@ import java.util.Locale;
  * 而这一步在主线程（回答落地时）。追加是 O(1)，断电最多丢最后一行。
  */
 final class ConvStore {
+
+    /** 同一毫秒里存多张图时的区分序号（见 {@link #saveImage}）。 */
+    private static final java.util.concurrent.atomic.AtomicInteger SEQ =
+        new java.util.concurrent.atomic.AtomicInteger();
 
     /**
      * 目录**写死绝对路径**，和工程里其它文件一致（`EyeLog` / `say.txt` / `inbox.txt` 都是
@@ -236,7 +240,13 @@ final class ConvStore {
     static String saveImage(String id, byte[] jpeg) {
         if (jpeg == null || jpeg.length == 0) return null;
         try {
-            File f = new File(imgDirOf(id), System.currentTimeMillis() + ".jpg");
+            /**
+             * 文件名 = `毫秒-序号`。
+             *
+             * ⚠️ 只用毫秒会撞名：一批 3 张宫格是连着存的，`currentTimeMillis()` 很可能
+             * 三张都一样 —— 后一张把前一张覆盖掉，三条消息指向同一张图（少两张、还看不出来）。
+             */
+            File f = new File(imgDirOf(id), System.currentTimeMillis() + "-" + SEQ.incrementAndGet() + ".jpg");
             FileOutputStream o = new FileOutputStream(f);
             o.write(jpeg);
             o.close();

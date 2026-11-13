@@ -679,8 +679,15 @@ final class Pipeline {
         acc += s;
         if (acc >= integralNeed() && entry.t - lastBound >= o.markMinGap) {
             // 只有**真的录进去**才清零；被去重挡掉时保留累积值
-            if (keep(entry, "mark")) acc = 0;
-            return;
+            if (keep(entry, "mark")) { acc = 0; return; }
+            /**
+             * ⚠️ 被去重挡掉时**不能 return**。
+             *
+             * `acc` 一旦攒够就永远 ≥ `integralNeed()`，而画面没变时每一帧都会被下面的
+             * `dupMin` 挡掉 —— 直接 return 就等于把**兜底（`silentFloorSec`）永远屏蔽掉**：
+             * 一帧都留不下来，管线彻底静止（真机实测：对着墙角，一箱停在 1 格两分钟，
+             * 自动看一张也发不出去）。让代码继续往下走，兜底才有机会。
+             */
         }
         double floorSec = o.silentFloorSec;
         if (o.floorGapK > 0 && gapEwma > 0) {

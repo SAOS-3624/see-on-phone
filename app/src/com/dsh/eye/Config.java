@@ -331,12 +331,19 @@ final class Config {
         return String.valueOf(v);
     }
 
+    /**
+     * 历史里带几张图（0~3），默认 **1**。
+     *
+     * ⚠️ 默认是 0 过一段时间，代价是**它记不住刚看过什么**：`imgWindow = 0` 时历史里的图
+     * 全被换成 `[图已省略 · 已存档]` 占位符 —— 自动看刚发完一张，你下一句问"刚才看到啥"，
+     * 它手里真的没有图（实测它会答"我没看到图片"）。一张图 197 token，留一张划算。
+     */
     int imgWindow() {
-        int v = sp.getInt(K_IMGW, 0);
-        return v >= 0 && v <= 3 ? v : 0;
+        int v = sp.getInt(K_IMGW, 1);
+        return v >= 0 && v <= 3 ? v : 1;
     }
 
-    void setImgWindow(int v) { sp.edit().putInt(K_IMGW, v >= 0 && v <= 3 ? v : 0).apply(); }
+    void setImgWindow(int v) { sp.edit().putInt(K_IMGW, v >= 0 && v <= 3 ? v : 1).apply(); }
 
     String convId() { return or(sp.getString(K_CONV, ""), ""); }
     void setConvId(String id) { sp.edit().putString(K_CONV, id == null ? "" : id.trim()).apply(); }

@@ -81,7 +81,7 @@ final class Tools {
     private static JSONArray buildSpec() {
         JSONArray arr = new JSONArray();
         arr.put(fn("look",
-            "用手机摄像头**现在**看一眼，拿回一张拼好的宫格（1~8 帧，按时间先后）。\n"
+            "用手机摄像头**现在**看一眼，拿回一张拼好的图（这一段的几个瞬间，按时间先后）。\n"
             + "什么时候调：用户问画面里的事、而你现在手上没有相关画面；或者上一次看的东西已经变了"
             + "（他翻页了、走动了、换了个东西）；或者他说「看看」「这是啥」「认得出来吗」。\n"
             + "**不用调**：纯聊天、你已经看着这张图回答过了、或者用户问的是常识。\n"
@@ -226,8 +226,7 @@ final class Tools {
             o.put("frames", l.frames);
             o.put("tokens", l.tokens);
             o.put("why", l.why == null ? "time" : l.why);
-            o.put("note", "画面在下一条消息里（" + l.frames
-                + " 帧宫格，按时间先后，左上角是编号）。看清楚再回答。");
+            o.put("note", "画面在下一条消息里（按时间先后拼成的一张图）。看清楚再回答。");
             return o.toString();
         } catch (Throwable e) {
             return "{\"frames\":" + l.frames + ",\"tokens\":" + l.tokens + "}";

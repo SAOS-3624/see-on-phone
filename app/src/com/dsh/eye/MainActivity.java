@@ -20,7 +20,6 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -71,6 +70,7 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
      * 语义靠记：`send(t,img)` 的 img **不进 API**，只有 `sendWithImage` 进。
      * 这就是交接文档点名的"容易搞混"（也就有了那个"发相册图它却去开相机"的 bug）。
      * 现在只有一个 `send(Out)`：`images` 非空就等于"要真的发给模型看"。
+     * 服务端那侧也收成一个壳了（`EyeService.Turn`），`attach` 才决定图进不进 API。
      */
     static final class Out {
         final String text;
@@ -113,8 +113,14 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
     private boolean loaded;
     /** 上一次发出去的东西（失败气泡的「重试」要它）。 */
     private Out lastOut;
-    /** 这一轮已经在界面上显示过的图（避免用户气泡和助手气泡各显示一遍）。 */
-    private final Set<String> shownShots = new HashSet<String>();
+    /**
+     * 最后一条**用户气泡**。
+     *
+     * 图属于发出去的那一条（磁盘上 `Msg.shots` 也只挂在 user 上），而通话页那张宫格是
+     * 服务端现拼的 —— 得等它落盘之后补进这个气泡。以前是反过来挂在回答下面
+     * （`shownShots` 那套"没显示过才挂"的补丁），结果同一张图界面/重进各出现一次。
+     */
+    private Bubbles.UserBubble lastUser;
 
     // ---------------------------------------------------------------- 生命周期
 
@@ -346,7 +352,7 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         endStream();
         setStreaming(false);
         if (toolChip != null) toolChip.hide(null);
-        shownShots.clear();
+        lastUser = null;                 // 这一屏重铺了：老把手已经不在视图树里
         loaded = true;
 
         EyeService s = EyeService.peek();
@@ -412,8 +418,8 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         endStream();
         setStreaming(true);
         lastOut = o;
-        for (String f : o.files) shownShots.add(f);
-        box.addView(bubbles.user(t, o.files, 0));
+        lastUser = bubbles.userBubble(t, o.files, 0);
+        box.addView(lastUser.view);
         showThinking("正在想…");
         if (has) s.sendWithImages(t, o.images);
         else s.send(t);
@@ -473,7 +479,7 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
      * 「拍一张」：输入栏那个相机按钮。
      *
      * 和打字发送的区别：这里**先由界面铺一条用户气泡**（"这是什么？"），再让服务去抓帧 ——
-     * `EyeService.lookNow()` 内部就是 `send("这是什么？", jpeg, frames)`，但它不经过
+     * `EyeService.lookNow()` 内部就是 `send("这是什么？", shot)`，但它不经过
      * `MainActivity.send()`，所以少了这一条气泡；不补的话，抓完图界面上只有它的回答，
      * 用户看不到"我问了什么"。
      */
@@ -483,7 +489,8 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         clearEmpty();
         endStream();
         setStreaming(true);
-        box.addView(bubbles.user("这是什么？", null, 0));
+        lastUser = bubbles.userBubble("这是什么？", null, 0);
+        box.addView(lastUser.view);
         showThinking("正在看一眼…");
         lastOut = null;                 // 抓帧失败重试 = 再点一次相机，不是重发这句话
         s.lookNow();
@@ -561,13 +568,19 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
                 toolChip.hide(null);
                 EyeLog.w("ui", "reply chars=" + (text == null ? 0 : text.length())
                     + " thinkMs=" + thinkMs + " at=" + at);
-                // 这一轮刚发出去时已经在用户气泡下面显示过的图，别在回答下面再来一遍
-                List<String> fresh = new ArrayList<String>();
-                if (imageFiles != null) {
-                    for (String f : imageFiles) if (!shownShots.contains(f)) fresh.add(f);
+                /**
+                 * 图**只挂在"发出去"那一条**上（磁盘也是这么存的）。
+                 *
+                 * · 相册发的：发送那一刻就在气泡里了（`o.files`），这里什么都不用做；
+                 * · 通话页开口：宫格是服务端现拼的，落盘晚了 40~80ms，这里补进同一个气泡；
+                 * · 服务自己发起的（自动看）：没有用户气泡，界面就不显示 ——
+                 *   磁盘上有，重进会话时挂在"它自己看了一眼"那条下面。
+                 */
+                if (lastUser != null && lastUser.shots == 0) {
+                    bubbles.addShots(lastUser, imageFiles);
                 }
-                shownShots.clear();
-                box.addView(bubbles.ai(text, reasoning, thinkMs, fresh, at, false));
+                lastUser = null;      // 这一轮答完了：把手交出去，别再让下一轮（比如自动看）往上补
+                box.addView(bubbles.ai(text, reasoning, thinkMs, null, at, false));
                 scrollBottom();
             }
         });
@@ -581,6 +594,7 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
                 setStreaming(false);
                 removeThinking();
                 toolChip.hide(null);
+                lastUser = null;
                 failedRow = bubbles.ai("（没答上：" + msg + "）", null, 0, null, 0, true);
                 box.addView(failedRow);
                 scrollBottom();
