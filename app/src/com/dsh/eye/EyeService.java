@@ -399,6 +399,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     private void autoLookBuffered() {
         Tools.Look l = callSheet("auto");
         if (l == null || l.jpeg == null) return;
+        clearCallBuf();                       // 这一批看过了：0/3 重新攒
         long now = System.currentTimeMillis();
         // 画面一模一样就别反复烧钱 —— 但憋太久也要再看一眼，否则用户会觉得它卡住了
         if (sameSheet(l.jpeg, lastAutoSheet) && now - lastAutoSentAt < AUTO_SAME_GAP_MS) {
@@ -413,6 +414,24 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         sendWithSheet("（你自己看了一眼画面）有值得说的就一句话说；没变化就只回「嗯」。",
             l.jpeg, l.frames);
         pendingAuto = true;
+    }
+
+    /**
+     * 这几帧已经**交出去了**：清空、计数归零。
+     *
+     * 界面上的 `2/3` 读作"攒了几张还没发" —— 发完必须是 `0/3` 再从头攒。
+     * 不清的话计数器一直停在满格，用户会以为它把同一批图反复发（其实也确实会反复发）。
+     */
+    private void clearCallBuf() {
+        int n = callN();
+        synchronized (callBuf) {
+            callBuf.clear();
+            callSentSeq = callSeq;          // 水位推到当前：下一轮必须重新攒满 N 张
+        }
+        Ui u = uiSink;
+        if (u != null) {
+            try { u.onFrames(0, n); } catch (Throwable ignored) { }
+        }
     }
 
     /** 拿缓冲里当前这几帧拼一张宫格（没有人开口时也能用：auto 和"发字带图"共用）。 */
@@ -435,7 +454,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             send(text, (java.util.List<byte[]>) null, 0, false, null);
             return;
         }
-        synchronized (callBuf) { callSentSeq = callSeq; }
+        clearCallBuf();                       // 这一批跟着话发出去了：0/3 重新攒
         // 刚发过图：自动那条往后挪，而且以这张为"上一次看到的画面"
         lastAutoAt = System.currentTimeMillis();
         lastAutoSentAt = lastAutoAt;
