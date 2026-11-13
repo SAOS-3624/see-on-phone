@@ -21,7 +21,7 @@ bash build.sh
 `build.sh` 找 SDK 的顺序：`$ANDROID_SDK` → `$ANDROID_HOME` → `../sdk/android-13` → `./sdk/android-13`。
 后两个是给"SDK 就放在仓库旁边"的离线包场景留的，正常用环境变量就行。
 
-产物：`see-on-phone.apk`（约 190 KB）。
+产物：`see-on-phone.apk`（约 220 KB）。
 
 ## 2. 六步在干什么
 

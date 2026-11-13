@@ -124,7 +124,7 @@ export ANDROID_SDK=/path/to/android-sdk     # 里面有 android.jar 和 build-to
 bash app/build.sh                            # 6 步：javac → d8 → aapt2 compile → link → 塞 dex → 签名
 ```
 
-产物 `app/see-on-phone.apk`，约 190 KB（图标是 WebP）。构建细节与踩过的坑：[`app/docs/BUILD.md`](app/docs/BUILD.md)。
+产物 `app/see-on-phone.apk`，约 220 KB（图标是 WebP）。构建细节与踩过的坑：[`app/docs/BUILD.md`](app/docs/BUILD.md)。
 
 <details>
 <summary><b>为什么 targetSdk 是 29（而不是 34）</b></summary>

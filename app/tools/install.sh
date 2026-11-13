@@ -15,7 +15,7 @@
 #      用户看到的就是"又要我点"。所以：**全程最多 dump 两次**，其余靠 `dumpsys` 轮询。
 #
 # 用法：
-#   bash tools/install.sh                 # 装 ../dsh-eye.apk
+#   bash tools/install.sh                 # 装 ../see-on-phone.apk
 #   bash tools/install.sh path/to/x.apk
 #
 # 退出码：0 = 装上了且版本对得上；1 = 没装上（已把弹窗关掉并打印原因）。
@@ -35,7 +35,7 @@ if ! command -v "$ADB" >/dev/null 2>&1; then
 fi
 command -v "$ADB" >/dev/null 2>&1 || { echo "找不到 adb：装 platform-tools 或设 ADB=<路径>"; exit 1; }
 PKG=com.dsh.eye
-APK="${1:-$HERE/dsh-eye.apk}"
+APK="${1:-$HERE/see-on-phone.apk}"
 MANIFEST="$HERE/AndroidManifest.xml"
 
 WANT_CODE=$(grep -o 'android:versionCode="[0-9]*"' "$MANIFEST" | head -1 | grep -o '[0-9]*')

@@ -29,7 +29,7 @@ AAPT2="$SDK/aapt2.exe"
 
 AJ="$SDK/android.jar"
 OUT="$HERE/build"
-APK="$HERE/dsh-eye.apk"
+APK="$HERE/see-on-phone.apk"
 
 [ -f "$AJ" ] || { echo "缺 android.jar: $AJ"; exit 1; }
 

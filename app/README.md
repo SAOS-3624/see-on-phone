@@ -1,6 +1,6 @@
 # 鱼眼 App
 
-> 手机上的 AI：会聊天，也会自己看世界。纯 Java、零三方库、无 Gradle，APK 约 190 KB。
+> 手机上的 AI：会聊天，也会自己看世界。纯 Java、零三方库、无 Gradle，APK 约 220 KB。
 >
 > 构建方式见 [`docs/BUILD.md`](docs/BUILD.md)；电脑侧插件在仓库根目录。
 
