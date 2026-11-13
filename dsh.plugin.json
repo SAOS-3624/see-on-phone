@@ -1,7 +1,7 @@
 {
   "name": "dsh-see-on-phone",
   "description": "Yuyan (Fish Eye) / See on Phone — let the AI live in the phone: chat with the model on the device itself, and when it needs to look, it uses its own camera (the phone captures, picks and packs the frames; the desktop just receives one image). Blind navigation is one optional reader, not the premise.",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "entry": {
     "name": "dsh-see-on-phone",
     "inject": [

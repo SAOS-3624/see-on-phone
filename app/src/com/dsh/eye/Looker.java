@@ -148,11 +148,35 @@ final class Looker {
      *
      * @param jpgs 由旧到新的原始 JPEG（1~8 张）
      */
-    Tools.Look compose(java.util.List<byte[]> jpgs, String why) {
+    Tools.Look compose(java.util.List<byte[]> jpgs, String why, double stepSeconds) {
         if (jpgs == null || jpgs.isEmpty()) return null;
-        Pipeline pipe = new Pipeline(opts());
-        // 等间隔喂：缓冲是"每隔 SAMPLE 毫秒取一张"，相邻帧就是等距的
-        final double step = 0.9;
+        /**
+         * ⚠️ **这套参数必须是"我喂什么就留什么"**，不能用默认的切点那一套。
+         *
+         * 默认 `cutAbs=12 / integralSeconds=3 / silentFloorSec=20` 是给"几十秒连续帧流"
+         * 设计的：判据负责从一大堆帧里挑出有信息的那几张。但这里**调用方已经按时间挑好了**
+         * （每 `interval` 秒一张、覆盖上一个发送窗口），再让切点算法筛一遍的结果就是
+         * 中间那帧被判"变化不够大"丢掉 —— 真机日志里 `fed=3 frames=2`，用户看到的就是
+         * "一次只抓很近的两帧，其余的都抓不到"。
+         *
+         * 所以：`cutAbs = 0` ⇒ 只要和上一帧不一样就算数；积分/兜底/跳变那几个"会自己加帧"
+         * 的判据全部关掉；`dupMin = 1` 只挡完全一致的两帧（画面真没动时 1 帧就够，
+         * 别为了凑数把同一张图摆三格）。
+         */
+        Pipeline.Opts o = opts();
+        o.cutAbs = 0;
+        o.cutIsolatedAbs = 0;
+        o.cutMcAbs = 0;
+        o.cutJumpAbs = 0;
+        o.cutSpikeAbs = 0;
+        o.floorGapK = 0;
+        o.integralSeconds = 9999;
+        o.silentFloorSec = 9999;
+        o.dupMin = 1;
+        o.maxFrames = Math.max(8, jpgs.size());
+        Pipeline pipe = new Pipeline(o);
+        // 等间隔喂：缓冲是"每隔 interval 秒取一张"，相邻帧就是等距的
+        final double step = stepSeconds > 0 ? stepSeconds : 1.0;
         int fed = 0;
         for (int i = 0; i < jpgs.size(); i += 1) {
             byte[] jpg = jpgs.get(i);
@@ -188,6 +212,7 @@ final class Looker {
         l.tokens = s.layout == null ? Tokens.SHEET_TOKENS : s.layout.tokens();
         l.why = s.why == null ? "buffer" : s.why;
         EyeLog.w("look", "compose fed=" + fed + " frames=" + l.frames
+            + String.format(java.util.Locale.ROOT, " span=%.1fs", (jpgs.size() - 1) * step)
             + " why=" + l.why + " tokens=" + l.tokens + " jpeg=" + sheet.length);
         return l;
     }

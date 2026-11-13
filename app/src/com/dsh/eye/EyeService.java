@@ -266,14 +266,20 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
 
     /** 兜底上限：连续"没变化"退避也不会超过这个。 */
     private static final long AUTO_MAX_GAP_MS = 60_000;
-    /** 连续几次"没什么变化"。整段没信息的时候自动翻倍退避 —— 这是"太灵敏"的正解。 */
-    private volatile int autoNoops;
+    /** 看门狗用：这一轮是什么时候开的。 */
+    private volatile long lastRoundAt;
     /** 上一次生效的灵敏度（变了就重置退避）。 */
     private String appliedPace;
     /** 画面一直没变，最多憋这么久也要再看一眼（否则就是"它不动了"）。 */
     private static final long AUTO_SAME_GAP_MS = 30_000;
-    /** 通话页缓冲的取样间隔：900ms ⇒ 攒 3 张约 2.7 秒。 */
-    private static final long CALL_SAMPLE_MS = 900;
+    /**
+     * 取样间隔**不再是常数**：见 {@link #sampleIntervalMs()}。
+     *
+     * 定死 900ms 的后果是"三帧只横跨 1.8 秒"，而发送窗口是 15 秒 ——
+     * 中间十几秒一帧都没采，用户看到的就是"只抓很近的两帧，其余的都抓不到"。
+     */
+    private static final long CALL_SAMPLE_MIN_MS = 1_000;
+    private static final long CALL_SAMPLE_MAX_MS = 6_000;
 
     /** 通话页开着没有（决定要不要一直采帧）。 */
     private volatile boolean callActive;
@@ -333,7 +339,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     private void sampleCallFrame(byte[] jpg) {
         if (!callActive || jpg == null || jpg.length == 0) return;
         long now = System.currentTimeMillis();
-        if (now - lastCallSampleAt < CALL_SAMPLE_MS) return;
+        if (now - lastCallSampleAt < sampleIntervalMs()) return;
         lastCallSampleAt = now;
         int n = callN();
         int have;
@@ -348,6 +354,19 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         if (u != null) {
             try { u.onFrames(have, n); } catch (Throwable ignored) { }
         }
+    }
+
+    /**
+     * 多久取一张：**让 N 张正好覆盖上一个发送窗口**。
+     *
+     * 正常 15s / 3 张 ⇒ 每 5 秒一张，三帧横跨 10 秒（第一帧到第三帧），
+     * 正好是"上次发完到现在"这一段。夹在 1~6 秒，免得灵敏档糊成一片、平静档太稀。
+     * **每次现算**：灵敏度和攒帧张数都是运行中可改的。
+     */
+    private long sampleIntervalMs() {
+        int n = Math.max(1, callN());
+        long ms = autoGapMs() / n;
+        return Math.max(CALL_SAMPLE_MIN_MS, Math.min(CALL_SAMPLE_MAX_MS, ms));
     }
 
     void setAutoWatch(boolean on) {
@@ -376,14 +395,21 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         else if ("dense".equals(p)) base = 8_000;
         else if ("game-economic".equals(p)) base = 20_000;
         else base = 15_000;
-        long g = base * (1 + Math.min(autoNoops, 3));
-        return Math.min(g, AUTO_MAX_GAP_MS);
+        return Math.min(base, AUTO_MAX_GAP_MS);
     }
 
     /** tick 每秒调一次：够不够"攒满就发"，够就发。 */
     private void maybeAutoSend() {
         if (!autoWatch || !callActive || !running || cfg == null || autoBusy) return;
-        if (busyRound) return;                             // 正在回话，别插嘴
+        if (busyRound) {
+            // 看门狗：只要有一次回调没来，busyRound 就永久 true，表现就是"卡住不动"
+            if (System.currentTimeMillis() - lastRoundAt > 120_000) {
+                EyeLog.w("auto", "看门狗：上一轮 120s 没回，放行");
+                busyRound = false;
+            } else {
+                return;                                    // 正在回话，别插嘴
+            }
+        }
         if (!cfg.direct()) return;
         int n = callN();
         long seq;
@@ -422,14 +448,9 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         Tools.Look l = callSheet("auto");
         if (l == null || l.jpeg == null) return;
         clearCallBuf();                       // 这一批看过了：0/3 重新攒
-        long now = System.currentTimeMillis();
-        // 画面一模一样就别反复烧钱 —— 但憋太久也要再看一眼，否则用户会觉得它卡住了
-        if (sameSheet(l.jpeg, lastAutoSheet) && now - lastAutoSentAt < AUTO_SAME_GAP_MS) {
-            EyeLog.w("auto", "跟上一次一模一样，这次跳过");
-            return;
-        }
-        lastAutoSentAt = now;
-        lastAutoSheet = l.jpeg;
+        // 「攒满就发」就是攒满就发：不再拿"跟上一次像不像"去拦。
+        // 用户的原话是这个，而拦一次的表现就是"它又不动了"。真没内容时模型会回一句
+        // 「没什么变化」—— 那一轮不朗读不落盘（looksLikeNoop），体验上分得开。
         EyeLog.w("auto", "攒满就发：frames=" + l.frames + " tokens=" + l.tokens);
         // ⚠️ 顺序：先 send（它会把 pendingAuto 清成 false），再立标记。
         //    反过来的话，`send` 开头那句清标记会把这次自动看标记掉。
@@ -461,7 +482,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         java.util.List<byte[]> frames = new java.util.ArrayList<byte[]>();
         synchronized (callBuf) { frames.addAll(callBuf); }
         if (frames.isEmpty() || looker == null) return null;
-        return looker.compose(frames, why);
+        return looker.compose(frames, why, sampleIntervalMs() / 1000.0);
     }
 
     /**
@@ -479,8 +500,6 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         clearCallBuf();                       // 这一批跟着话发出去了：0/3 重新攒
         // 刚发过图：自动那条往后挪，而且以这张为"上一次看到的画面"
         lastAutoAt = System.currentTimeMillis();
-        lastAutoSentAt = lastAutoAt;
-        lastAutoSheet = l.jpeg;
         EyeLog.w("send", "带通话帧 " + l.frames + " 张 tokens=" + l.tokens);
         send(text, java.util.Collections.singletonList(l.jpeg), l.frames, true,
             "这是手机摄像头**刚才这几秒**攒的 " + l.frames + " 帧拼成的一张宫格"
@@ -996,6 +1015,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         final Asker asker = new Asker(cfg, this);
         current = asker;
         busyRound = true;
+        lastRoundAt = System.currentTimeMillis();
         newTurn();
         /**
          * 这一轮自带的图**必须是局部变量**，不能是字段。
@@ -1077,11 +1097,9 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
                         busyRound = false;
                         if (pendingAuto) {
                             pendingAuto = false;
-                            if (!looksLikeNoop(out)) autoNoops = 0;   // 有话说：恢复正常节奏
                             if (looksLikeNoop(out)) {
                                 // 自己看了一眼，没什么可说的：**不落盘也不念**
-                                autoNoops += 1;                 // 下一次隔久一点
-                                EyeLog.w("auto", "没什么变化 → 这一轮丢弃（连续 " + autoNoops + " 次）");
+                                EyeLog.w("auto", "没什么变化 → 这一轮丢弃（不念不落盘）");
                                 Ui u = uiSink;
                                 if (u != null) u.onQuiet();
                                 return;
@@ -1527,9 +1545,10 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         // 灵敏度改了：立刻按新节奏来。退避计数也要清零，否则得等一分钟才生效。
         if (!cfg.pace().equals(appliedPace)) {
             appliedPace = cfg.pace();
-            autoNoops = 0;
-            lastAutoAt = 0;
-            EyeLog.w("auto", "灵敏度 → " + cfg.paceLabel());
+            lastAutoAt = 0;                 // 立刻按新节奏来
+            EyeLog.w("auto", "灵敏度 → " + cfg.paceLabel()
+                + "（每 " + (sampleIntervalMs() / 1000.0) + "s 取一张，间隔 "
+                + (autoGapMs() / 1000) + "s）");
         }
         notifyState();
         EyeLog.w("svc", "apply think=" + cfg.think() + " speak=" + cfg.speak()
