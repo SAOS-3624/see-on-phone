@@ -1162,7 +1162,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             return;
         }
         cancelTurn();
-        // 用户又开口了 = 上一句别念了（在线音色是排队异步的，不掐会一句句追着念完）
+        // 用户又开口了 = 上一句别念了（长回答是分段排队念的，不掐会一句句追着念完）
         if (speaker != null) speaker.shutUp();
         pendingUser = t;
         final Asker asker = new Asker(cfg, this);
@@ -1644,34 +1644,23 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         if (speaker != null) speaker.say("我在。这是现在的声音。");
     }
 
-    /** 清掉 MP3 缓存（换音色/换语速后旧缓存不再命中，但也不会自己消失）。 */
-    void clearVoiceCache() {
-        EdgeTts.clearCache();
-        notifyState();
-    }
-
-    int voiceCacheCount() { return EdgeTts.cacheCount(); }
-
     /**
-     * 可选的音色：**在线的那几个排在最前面**（小轩第一），后面才是系统的。
+     * 可选的音色 = **系统里真的装了的那些**（第 0 个是「系统默认」）。
      *
-     * 顺序是有意的：用户装完就想找"小轩"，翻到底下找它是不合理的；
-     * 系统音色是兜底，排后面才对。
+     * 2.0 之前最前面还挂着 5 个内置在线音色，删了（原因见 {@link Speaker}）。
+     * 想多几个嗓子就装系统语音引擎 —— 装完这里自动出现，不用改代码。
      */
     String[] voiceChoices() {
         java.util.List<String> out = new java.util.ArrayList<>();
         out.add("系统默认");
-        for (String l : Config.EDGE_LABELS) out.add(l);
         if (speaker != null) out.addAll(speaker.voiceLabels());
         return out.toArray(new String[0]);
     }
 
     String voiceKeyAt(int i) {
-        if (i <= 0) return "";
-        if (i <= Config.EDGE_VOICES.length) return Config.EDGE_PREFIX + Config.EDGE_VOICES[i - 1];
-        if (speaker == null) return "";
-        int k = i - Config.EDGE_VOICES.length - 1;
+        if (i <= 0 || speaker == null) return "";
         java.util.List<String> keys = speaker.voiceKeys();
+        int k = i - 1;
         return k < keys.size() ? keys.get(k) : "";
     }
 
@@ -1705,7 +1694,6 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         if (cfg == null) return;
         if (speaker != null) {
             speaker.setRate(cfg.rate());
-            speaker.setEdgeRate(cfg.rate());
             speaker.setVoice(cfg.ttsVoice());
         }
         Brain.setReadTimeoutSec(cfg.timeoutSec());

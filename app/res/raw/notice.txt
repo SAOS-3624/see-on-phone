@@ -1,0 +1,78 @@
+# NOTICE
+
+Copyright 2026 SAOS-3624
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+## 这份许可覆盖什么
+
+只覆盖**本仓库里的源代码**，不覆盖：
+
+- 你手机里拍到的画面、录到的声音、聊出来的会话内容 —— 那些是你的；
+- 你填进 App 的 API Key、接口地址、账号；
+- 任何第三方组件（见 [CREDITS](CREDITS.md)）。
+
+## 这个项目**不做**什么
+
+**它不往我们的服务器发任何东西 —— 因为它没有服务器。**
+
+- **画面不出手机，除了你自己配的那个模型接口。** App 采集的帧在手机本地拼成一张宫格
+  （`471×628`，约 4~7 KB），然后**只发给你自己填的 OpenAI 兼容接口**。没有中转、没有统计、没有"匿名使用数据"。
+- **相机是借来的，不是常开的。** 只有模型调用 `look` 工具、或你打开通话页时才 `open`，
+  没人要 3 秒后自动关。App 界面上没有"一直录着"的状态。
+- **不留存音频。** 语音输入走系统识别器（把你的话转成文字），App 不写音频文件、不上传音频。
+  朗读（TTS）是**出声**，不是**收声**。
+- **不分发任何视频或素材。** 仓库里没有示例视频、没有抓取的网页内容。
+- **不替你做决定。** 它只是把看到的东西说给你听；判断、行动、后果都在你。
+- **不承诺能用来看路。** `mode:"guide"`（导盲读者）是**辅助**：它会把画面转成
+  "前面有什么、往哪走"的说法，但**它不是辅具、没有安全认证、会看错、会延迟**。
+  过马路、上下楼梯、避障这些事，**必须**用白杖/导盲犬/无障碍设施，不要依赖这个 App。
+
+## 你需要注意的
+
+- **拍什么、问什么，责任在你。** 拍别人、拍私人场所、拍涉密环境，是否合法由你所在地区的法律决定。
+- **模型接口是第三方。** 你把画面发给谁，取决于你自己填的 `base_url`。选一个你信任的。
+- **这是 sideload 的 App**（不在任何应用商店），`targetSdk 29`，安装时系统会提示风险 —— 那是正常的。
+
+## 第三方组件
+
+当前代码树**不含任何第三方源码**（App 侧零依赖、插件侧 0.4.0 已删除 vendor 目录、
+App 2.0 已删除在线音色链路）。用到的**算法与思想**（PySceneDetect 的 HSV 加权打分等）
+是独立实现，来源记在 [CREDITS](CREDITS.md) §3；一条代码都没复制。
+
+**历史版本里有、现在已经删掉的两块**（旧版本仍按原许可使用）：
+
+- `jpeg-js`（BSD-3 + Apache-2.0）—— 插件 0.3.x 的 JPEG 解码，0.4.0 删除。见 §5.2。
+- `edge-tts`（**GPL-3.0**）—— App 1.x 的在线音色。当时的令牌算法是把那份 Python 实现
+  翻译成 Java 的，属于演绎作品，会让整个 APK 落到 GPL；**2.0 整条链路已删除**，只留系统 TTS。
+  见 §5.1。拿到 1.3.x 及更早 APK 的人，请按 GPL-3.0 使用。
+
+运行时调用、但不随本仓库分发：Android SDK 构建工具、Android 系统 TTS 引擎（用户自装）、
+FFmpeg（可选）、`ffplay`/`mpv`（可选）、IP Camera App（可选的第三方摄像头源）。
+逐条见 [CREDITS](CREDITS.md) §6。
+
+## 许可放在哪儿
+
+- **npm 包**：`LICENSE` / `NOTICE` / `CREDITS.md` 都在 `files` 里，装包即附带。
+- **APK**：许可全文与这份 NOTICE 打进包里，手机上进「设置 → 关于 → 许可」查看。
+  （Apache-2.0 §4(a) 要求随分发附许可，APK 是独立下载的二进制，不能指望它"旁边有个仓库"。）
+
+## 文档与截图
+
+`app/docs/` 里的截图由作者在自己的设备上实拍，内容为作者自有素材或合成画面，
+不包含任何第三方影视、直播或私人素材。
+
+
+---
+完整版（含每一条第三方署名）：
+github.com/SAOS-3624/see-on-phone/blob/main/CREDITS.md

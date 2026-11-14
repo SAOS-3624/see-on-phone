@@ -23,7 +23,7 @@
 │ Conv / ConvStore  上下文：预算裁剪 + 滚动摘要   │
 │ Pipeline / Packer 切点 → 档位 → 行 DP → 拼图   │
 │ HttpServer        127.0.0.1:4444（给电脑插件）  │
-│ Drm / EdgeTts     在线音色（失败回落系统 TTS）   │
+│ Speaker           系统 TTS（音色靠系统引擎）    │
 └─────────────────────────────────────────────┘
 ```
 
@@ -186,10 +186,14 @@ bash tools/parity/render.sh    # 真画成 PNG 放到 tools/parity/out/，用眼
 - **`minSdk 21` / `targetSdk 29`**：见 [BUILD.md](docs/BUILD.md) 的说明，不是懒得升级。
 - **语音输入只有单句**（系统 `RecognizerIntent`）。常驻 `SpeechRecognizer` 在部分机型上
   会一直 `ERROR_RECOGNIZER_BUSY`，试过了，不划算。
-- **在线音色是逆向接口**：`Sec-MS-GEC` 令牌五分钟一格，服务端会校验。
-  它随时可能被改掉，所以**必须可关**（选"系统默认"就完全不走网络）。
+- **只有系统 TTS**：1.x 的在线音色（自己算 `Sec-MS-GEC`）在 2.0 删掉了 —— 那套令牌
+  算法是把 GPL-3.0 的 `edge-tts` 翻译成 Java，会让整个 APK 落到 GPL。想多几个嗓子，
+  装一个系统语音引擎，设置 → 音色 里就能选（对话框右下角「更多音色」直接跳系统设置）。
 - **导盲模式不是辅具。** 见 [../NOTICE](../NOTICE)。
 
 ## 许可
 
 Apache-2.0。代码出处与署名见 [../CREDITS.md](../CREDITS.md)。
+
+许可全文和 NOTICE 打在 `res/raw/license.txt` / `res/raw/notice.txt`，跟着 APK 走 ——
+**别删这两个文件**：APK 是独立分发的二进制，不能指望它旁边有个仓库。

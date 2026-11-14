@@ -157,7 +157,7 @@ public class SettingsActivity extends AppActivity {
                 cfg.setSpeak(!cfg.speak());
                 apply();
             } });
-        row("mic", "音色", "前五个是在线的（小轩）", voiceLabel(),
+        row("mic", "音色", "系统的；装引擎就多几个", voiceLabel(),
             new Runnable() { public void run() { pickVoice(); } });
         row("speed", "语速", null, String.format(java.util.Locale.ROOT, "%.1f×", cfg.rate()),
             new Runnable() { public void run() {
@@ -241,6 +241,8 @@ public class SettingsActivity extends AppActivity {
         row("gear", "接口", null, shortModel() + " · " + (cfg.direct() ? "key 已填" : "还没填 key"),
             new Runnable() { public void run() { apiDialog(); } });
         row("check", "版本", "端口 4444", BuildConfig.version(this), null);
+        row("copy", "许可", "Apache-2.0 · 第三方署名", "查看",
+            new Runnable() { public void run() { licenseDialog(); } });
         row("folder", "目录", "DSH-Go/conv · memory · eye.log", null, new Runnable() {
             public void run() {
                 toast("/sdcard/Download/DSH-Go/\n"
@@ -254,6 +256,76 @@ public class SettingsActivity extends AppActivity {
     }
 
     private String voiceLabel() { return Config.voiceDisplay(cfg.ttsVoice()); }
+
+    /** 跳系统的「文字转语音」设置：装引擎、下语音包、挑默认嗓子都在那儿。 */
+    private void openTtsSettings() {
+        try {
+            startActivity(new Intent("com.android.settings.TTS_SETTINGS"));
+        } catch (Throwable e) {
+            try {
+                startActivity(new Intent(android.provider.Settings.ACTION_SETTINGS));
+                toast("进「系统 → 语言与输入 → 文字转语音」装音色");
+            } catch (Throwable e2) {
+                toast("这台机器没这个设置页，去系统设置里找「文字转语音」");
+            }
+        }
+    }
+
+    /**
+     * 许可。
+     *
+     * 为什么要在 App 里做这一页：**APK 是独立分发的二进制** —— npm 包里带了
+     * NOTICE/CREDITS，不代表拿到 APK 的人也拿到了。Apache-2.0 §4(a) 要求随分发
+     * 附一份许可，所以全文直接塞 `res/raw/`，跟着 APK 走。
+     */
+    private void licenseDialog() {
+        new AlertDialog.Builder(this)
+            .setTitle("许可")
+            .setMessage("代码：Apache-2.0。\n"
+                + "本 APK 内附许可全文与第三方署名，点下面看。\n\n"
+                + "github.com/SAOS-3624/see-on-phone")
+            .setItems(new String[] { "许可全文（Apache-2.0）", "第三方署名（NOTICE）" },
+                new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int which) {
+                        showRaw(which == 0 ? "license" : "notice");
+                    }
+                })
+            .setNegativeButton("关了", null)
+            .show();
+    }
+
+    /** 读 `res/raw/<name>.txt` 显示。用 getIdentifier 而不是 R —— build.sh 不编 R.java。 */
+    private void showRaw(String name) {
+        int id = getResources().getIdentifier(name, "raw", getPackageName());
+        String body;
+        if (id == 0) {
+            body = "这个包里没找到 " + name + ".txt（构建时漏了 res/raw/）。";
+        } else {
+            try {
+                java.io.InputStream in = getResources().openRawResource(id);
+                java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                in.close();
+                body = bo.toString("UTF-8");
+            } catch (Throwable e) {
+                body = "读不出来：" + e.getMessage();
+            }
+        }
+        ScrollView sv = new ScrollView(this);
+        TextView t = new TextView(this);
+        t.setText(body);
+        t.setTextSize(Theme.T_TINY);
+        t.setTextColor(Theme.TEXT_DIM);
+        t.setPadding(dp(16), dp(8), dp(16), dp(8));
+        sv.addView(t);
+        new AlertDialog.Builder(this)
+            .setTitle("license".equals(name) ? "Apache-2.0" : "第三方署名")
+            .setView(sv)
+            .setPositiveButton("关了", null)
+            .show();
+    }
 
     /**
      * 上下文那一行：`64k（现 3.2k）`。
@@ -560,7 +632,7 @@ public class SettingsActivity extends AppActivity {
     private void pickVoice() {
         EyeService s = EyeService.peek();
         if (s == null) { toast("服务还没起来，等两秒再点"); return; }
-        // 前 5 个是在线音色（edge-tts），后面是系统自带的 —— 见 EyeService.voiceChoices
+        // 全是系统里装了的音色（第 0 个是「系统默认」）—— 见 EyeService.voiceChoices
         final String[] labels = s.voiceChoices();
         new AlertDialog.Builder(this)
             .setTitle("发音")
@@ -575,14 +647,8 @@ public class SettingsActivity extends AppActivity {
                     rebuild();
                 }
             })
-            .setNeutralButton("清语音缓存", new DialogInterface.OnClickListener() {
-                public void onClick(DialogInterface d, int which) {
-                    EyeService svc = EyeService.peek();
-                    if (svc == null) return;
-                    int n = svc.voiceCacheCount();
-                    svc.clearVoiceCache();
-                    toast("清了 " + n + " 段");
-                }
+            .setNeutralButton("更多音色", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int which) { openTtsSettings(); }
             })
             .show();
     }

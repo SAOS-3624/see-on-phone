@@ -1,7 +1,6 @@
 package com.dsh.eye;
 
 import android.content.Context;
-import android.media.MediaPlayer;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
@@ -35,23 +34,15 @@ final class Speaker {
     private volatile long lastAt;
 
     /**
-     * 小轩这类**在线音色**（{@link EdgeTts}）。空 = 走系统 TTS。
+     * ⚠️ 2.0 删掉了「在线音色」那一档。
      *
-     * 存的是音色 id（`zh-CN-XiaoxuanNeural`），前缀 `edge:` 由 {@link Config} 那层去掉。
-     * 之所以在 Speaker 里而不是单开一个类：**"念一句"的入口只能有一个** ——
-     * 谁先谁后、失败了回落谁，必须由同一个队列决定（见 {@link #edgeQ}）。
+     * 1.x 里内置了 Edge 朗读接口，自己算 `Sec-MS-GEC` 令牌、自己收 MP3。那套令牌算法是从
+     * **GPL-3.0 的 `edge-tts` 逐位移植**过来的 —— 翻译同一个实现就是演绎作品，整个 APK
+     * 会跟着落到 GPL 里。本项目的卖点是 Apache-2.0（允许闭源分发），所以整块拿掉了。
+     *
+     * 现在**只走系统 TTS**。要更多嗓子：装一个系统语音引擎（讯飞/搜狗/Google TTS 都行），
+     * 回设置 → 音色 里挑，装了什么这里就能选什么。
      */
-    private volatile String edgeVoice = "";
-    private volatile String edgeRate = "+0%";
-    private MediaPlayer mp;
-    /**
-     * 在线合成**串行**跑：合成要 300~800ms，并发跑会让两句话抢同一个 MediaPlayer，
-     * 表现就是"念到一半跳回上一句"。单线程队列天然保证"一句接一句"。
-     */
-    private final java.util.concurrent.ExecutorService edgeQ =
-        java.util.concurrent.Executors.newSingleThreadExecutor();
-    private volatile int edgeOk, edgeCacheHit, edgeFail;
-    private volatile String edgeErr;
 
     /** 系统里实际可用的中文音色名（`Voice.getName()`，华为上就是 `xiaoxuan` 这种）。 */
     private final java.util.List<android.speech.tts.Voice> voices = new java.util.ArrayList<>();
@@ -117,25 +108,6 @@ final class Speaker {
     String say(String text) {
         String s = text == null ? "" : plain(text).replace('\r', ' ').trim();
         if (s.length() == 0) return "empty";
-        if (edgeVoice.length() > 0) {
-            /**
-             * 在线音色是**异步**的（要联网合成），所以这里立刻返回 null。
-             * 调用方（{@link Asker} 那条线程）不该为了一句朗读卡 1 秒。
-             */
-            final String t = s;
-            final String v = edgeVoice;
-            final String r = edgeRate;
-            try {
-                edgeQ.submit(new Runnable() {
-                    public void run() { speakEdge(t, v, r); }
-                });
-                lastText = s;
-                lastAt = System.currentTimeMillis();
-                return null;
-            } catch (Throwable e) {
-                edgeErr = "queue:" + e;
-            }
-        }
         return saySystem(s);
     }
 
@@ -349,117 +321,11 @@ final class Speaker {
      */
     void setVoice(String key) {
         wanted = key == null ? "" : key.trim();
-        /**
-         * `edge:` 开头的走在线音色（小轩那些）。**这条判断必须在这里**：
-         * 系统 TTS 里没有 `zh-CN-XiaoxuanNeural` 这个名字，走 applyVoice 只会
-         * 得到一句"没有这个音色"，然后静默退回默认嗓子 —— 用户听到的是"设了没用"。
-         */
-        if (wanted.startsWith("edge:")) {
-            edgeVoice = wanted.substring(5).trim();
-            voiceName = edgeVoice;
-            voiceErr = null;
-            return;
-        }
-        edgeVoice = "";
         applyVoice();
-    }
-
-    /** 语速：系统那边是 float，edge 那边是 `+20%` 这种字符串，一起改。 */
-    void setEdgeRate(float rate) {
-        int pct = Math.round((rate - 1.0f) * 100);
-        edgeRate = String.format(java.util.Locale.ROOT, "%+d%%", pct);
-    }
-
-    /**
-     * 合成 → 播 → 存缓存；**任何一步失败就回落系统 TTS**。
-     *
-     * 跑在 {@link #edgeQ} 的线程上，所以可以直接阻塞。
-     */
-    private void speakEdge(String text, String voice, String rate) {
-        byte[] mp3 = null;
-        java.io.File cf = EdgeTts.cacheFile(text, voice, rate);
-        mp3 = EdgeTts.readCache(cf);
-        if (mp3 != null) {
-            edgeCacheHit += 1;
-        } else {
-            try {
-                mp3 = EdgeTts.synth(text, voice, rate);
-                EdgeTts.writeCache(cf, mp3);
-                edgeOk += 1;
-            } catch (Throwable e) {
-                edgeFail += 1;
-                edgeErr = String.valueOf(e.getMessage() == null ? e : e.getMessage());
-                EyeLog.w("edge", "合成失败，回落系统音：" + edgeErr);
-                saySystem(text);
-                return;
-            }
-        }
-        if (!playMp3(mp3)) {
-            edgeFail += 1;
-            saySystem(text);
-        }
-    }
-
-    /** 播一段 MP3。**写临时文件再播** —— MediaPlayer 吃路径最稳，喂字节流各机型差异大。 */
-    private boolean playMp3(byte[] mp3) {
-        java.io.File tmp = new java.io.File(app.getCacheDir(), "say.mp3");
-        try {
-            // ⚠️ 先停旧的再覆盖同一个文件：边播边写会把正在读的文件改掉（会卡一下/爆音）
-            stopMp();
-            java.io.FileOutputStream o = new java.io.FileOutputStream(tmp, false);
-            o.write(mp3);
-            o.close();
-            MediaPlayer p = new MediaPlayer();
-            try {
-                p.setAudioStreamType(android.media.AudioManager.STREAM_MUSIC);
-                p.setDataSource(tmp.getAbsolutePath());
-                p.prepare();
-                p.start();
-            } catch (Throwable e) {
-                // prepare 失败也要 release：不然这条 native 播放器就一直挂在那儿
-                try { p.release(); } catch (Throwable ignored) { }
-                throw e;
-            }
-            mp = p;
-            speaks += 1;
-            lastError = null;
-            return true;
-        } catch (Throwable e) {
-            lastError = "mp3:" + e;
-            EyeLog.w("edge", "播放失败: " + e);
-            return false;
-        }
-    }
-
-    private void stopMp() {
-        MediaPlayer p = mp;
-        mp = null;
-        if (p == null) return;
-        try { p.stop(); } catch (Throwable ignored) { }
-        try { p.release(); } catch (Throwable ignored) { }
-    }
-
-    /** 在线音色这会儿有没有在工作（设置页显示"正在用哪个嗓子"）。 */
-    String edgeStatus() {
-        if (edgeVoice.length() == 0) return "";
-        return edgeVoice + " · 合成 " + edgeOk + " / 缓存 " + edgeCacheHit + " / 失败 " + edgeFail
-            + (edgeErr == null ? "" : "（" + edgeErr + "）");
     }
 
     private void applyVoice() {
         if (tts == null || !ready) return;      // init 成功后会自动再调一次
-        /**
-         * 在线音色也走这条路（TTS 初始化完成时会再调一次 applyVoice）。
-         * 不挡住的话，系统 TTS 会认真地去找一个叫 `edge:zh-CN-XiaoxuanNeural` 的嗓子、
-         * 找不到、然后把 voiceError 写成"没有这个音色" —— 明明能正常出声，
-         * 设置页/`/status` 却一直挂着一条红字。
-         */
-        if (wanted.startsWith(Config.EDGE_PREFIX)) {
-            edgeVoice = wanted.substring(Config.EDGE_PREFIX.length()).trim();
-            voiceName = edgeVoice;
-            voiceErr = null;
-            return;
-        }
         if (wanted.length() == 0) { voiceName = ""; voiceErr = null; return; }
         try {
             if (voices.isEmpty()) enumerateVoices();
@@ -491,14 +357,11 @@ final class Speaker {
         try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Throwable ignored) { }
         tts = null;
         ready = false;
-        stopMp();
-        try { edgeQ.shutdownNow(); } catch (Throwable ignored) { }
     }
 
     /** 打断（用户又说话了 / 关了悬浮窗）：把正在念的那句掐掉。 */
     void shutUp() {
         try { if (tts != null) tts.stop(); } catch (Throwable ignored) { }
-        stopMp();
     }
 
     /** 一段 JSON，给 `/tts/status` 和诊断用。 */
@@ -516,10 +379,6 @@ final class Speaker {
             + ",\"wanted\":\"" + Json.esc(wanted) + "\""
             + ",\"voiceError\":" + (voiceErr == null ? "null" : "\"" + Json.esc(voiceErr) + "\"")
             + ",\"voices\":[" + vs + "]"
-            + ",\"edge\":\"" + Json.esc(edgeVoice) + "\""
-            + ",\"edgeOk\":" + edgeOk
-            + ",\"edgeHit\":" + edgeCacheHit
-            + ",\"edgeFail\":" + edgeFail
             + ",\"speaks\":" + speaks
             + ",\"lastAt\":" + lastAt
             + ",\"lastText\":" + (lastText == null ? "null" : "\"" + Json.esc(lastText) + "\"")

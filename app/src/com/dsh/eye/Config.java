@@ -143,6 +143,16 @@ final class Config {
             sp.edit().putInt(K_CTX, DEFAULT_CTX).apply();
         }
 
+        /**
+         * ③ 在线音色已删（2.0）。旧值长这样：`edge:zh-CN-XiaoxuanNeural`。
+         *
+         * 不清掉的话：`voiceDisplay` 会显示成"系统默认"（人话对了），但 `Speaker.setVoice`
+         * 拿到这个 key 在系统音色里找不到 —— 静默退回默认嗓子，`voiceErr` 还挂着一条红字，
+         * 用户看到的是"设置里写着小轩、声音是别的人"。清空 = 干净的系统默认。
+         */
+        String oldVoice = or(sp.getString(K_VOICE, ""), "");
+        if (oldVoice.startsWith(LEGACY_EDGE_PREFIX)) sp.edit().putString(K_VOICE, "").apply();
+
         if (sp.getBoolean("v4", false)) return;
         String m = or(sp.getString(K_MODEL, ""), "");
         if ("deepseek-chat".equals(m) || "deepseek-reasoner".equals(m)) {
@@ -208,26 +218,14 @@ final class Config {
     void setSpeak(boolean v) { sp.edit().putBoolean(K_SPEAK, v).apply(); }
 
     /**
-     * 音色的键。三种形态，**靠前缀区分**（不用再加一个开关字段）：
+     * 音色的键就是**系统 TTS 的 `Voice.getName()`**（华为上长这样：`xiaoxuan`）。
+     * 空字符串 = 系统默认（用户在系统语音设置里挑的那个）。
      *
-     * ```
-     * ""                    系统默认（用户在系统语音设置里挑的那个）
-     * "edge:zh-CN-XXX"      在线音色（小轩这些，走 EdgeTts）
-     * "xiaoxuan"            系统 TTS 的 Voice.getName()
-     * ```
+     * ⚠️ 1.x 这里还有第二档 `"edge:zh-CN-XXX"`（内置的 Edge 在线音色）。2.0 删了：
+     * 那套 `Sec-MS-GEC` 令牌是从 GPL-3.0 的 `edge-tts` 逐位移植来的，会把整个 APK
+     * 拖进 GPL。下面这个前缀只留给 `migrate()` 认旧值，**不要再拿它拼新值**。
      */
-    static final String EDGE_PREFIX = "edge:";
-
-    /** 能选的在线音色。第一个就是小轩 —— 用户要的那个。 */
-    static final String[] EDGE_VOICES = {
-        "zh-CN-XiaoxuanNeural", "zh-CN-XiaoxiaoNeural", "zh-CN-XiaoyiNeural",
-        "zh-CN-YunxiNeural", "zh-CN-YunyangNeural",
-    };
-
-    static final String[] EDGE_LABELS = {
-        "小轩 · 在线 · 女", "晓晓 · 在线 · 女", "晓伊 · 在线 · 女",
-        "云希 · 在线 · 男", "云扬 · 在线 · 男",
-    };
+    static final String LEGACY_EDGE_PREFIX = "edge:";
 
     String ttsVoice() { return or(sp.getString(K_VOICE, DEFAULT_VOICE), DEFAULT_VOICE); }
 
@@ -262,13 +260,8 @@ final class Config {
     /** 给人看的音色名。 */
     static String voiceDisplay(String key) {
         if (key == null || key.length() == 0) return "系统默认";
-        if (key.startsWith(EDGE_PREFIX)) {
-            String id = key.substring(EDGE_PREFIX.length());
-            for (int i = 0; i < EDGE_VOICES.length; i += 1) {
-                if (EDGE_VOICES[i].equals(id)) return EDGE_LABELS[i];
-            }
-            return id + "（在线）";
-        }
+        // 旧版本存下来的在线音色，现在已经用不了了 —— 显示成"系统默认"才是真的
+        if (key.startsWith(LEGACY_EDGE_PREFIX)) return "系统默认";
         return key;
     }
     void setTtsVoice(String v) { sp.edit().putString(K_VOICE, v == null ? "" : v).apply(); }
