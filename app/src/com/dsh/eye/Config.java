@@ -332,18 +332,21 @@ final class Config {
     }
 
     /**
-     * 历史里带几张图（0~3），默认 **1**。
+     * 历史里带几张图（0~3），默认 **0**（省钱）。
      *
-     * ⚠️ 默认是 0 过一段时间，代价是**它记不住刚看过什么**：`imgWindow = 0` 时历史里的图
-     * 全被换成 `[图已省略 · 已存档]` 占位符 —— 自动看刚发完一张，你下一句问"刚才看到啥"，
-     * 它手里真的没有图（实测它会答"我没看到图片"）。一张图 197 token，留一张划算。
+     * 这是个**取舍**，不是 bug：
+     *   · `0` = 历史图一律换成 `[图已省略 · 已存档]` 占位符。省 token，但**它记不住刚看过什么** ——
+     *     自动看刚发完一张，你下一句问"刚才看到啥"，它手里真的没有图（会答"我没看到图片"）。
+     *   · `1~3` = 每轮把最近 N 张图原样带上（一张宫格约 197 token），能追问上一张，但每次请求都贵。
+     *
+     * 默认取 0 是**钱**这一侧的取舍（2026-11-14 用户拍板）；想要"能追问"就调到 1。
      */
     int imgWindow() {
-        int v = sp.getInt(K_IMGW, 1);
-        return v >= 0 && v <= 3 ? v : 1;
+        int v = sp.getInt(K_IMGW, 0);
+        return v >= 0 && v <= 3 ? v : 0;
     }
 
-    void setImgWindow(int v) { sp.edit().putInt(K_IMGW, v >= 0 && v <= 3 ? v : 1).apply(); }
+    void setImgWindow(int v) { sp.edit().putInt(K_IMGW, v >= 0 && v <= 3 ? v : 0).apply(); }
 
     String convId() { return or(sp.getString(K_CONV, ""), ""); }
     void setConvId(String id) { sp.edit().putString(K_CONV, id == null ? "" : id.trim()).apply(); }
