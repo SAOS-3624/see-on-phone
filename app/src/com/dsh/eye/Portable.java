@@ -50,7 +50,12 @@ final class Portable {
      *
      * @return 给人看的 JSON（路径、条数、字节数）
      */
-    static String export() {
+    /**
+     * ⚠️ 必须 **synchronized**：实测两个导出撞在一起时，后一个的 `cleanExceptConvs`
+     * 会把前一个正在打包的文件删掉，前一个的 `zdir` 读到一半就 ENOENT 整包失败
+     * （真机上就是这么炸的：`1794572042952.jpg: open failed: ENOENT`）。
+     */
+    static synchronized String export() {
         File dir = new File(EXPORT_DIR);
         try {
             /**
@@ -75,14 +80,17 @@ final class Portable {
                         sub.mkdirs();
                         File[] imgs = f.listFiles();
                         if (imgs != null) for (File img : imgs) {
-                            bytes += Files.copy(img, new File(sub, img.getName()));
+                            // 单张图出错（被删 / 只读 / 正被写）只跳过这一张，不能让整包失败
+                            try { bytes += Files.copy(img, new File(sub, img.getName())); }
+                            catch (Throwable e) { EyeLog.w("port", "跳过图 " + img.getName() + "：" + e); }
                         }
                         continue;
                     }
                     String n = f.getName();
                     if (!(n.endsWith(".jsonl") || n.endsWith(".sum") || n.endsWith(".pin"))) continue;
                     if (n.endsWith(".jsonl")) convs += 1;
-                    bytes += Files.copy(f, new File(convOut, n));
+                    try { bytes += Files.copy(f, new File(convOut, n)); }
+                    catch (Throwable e) { EyeLog.w("port", "跳过 " + n + "：" + e); }
                 }
             }
 
@@ -95,7 +103,8 @@ final class Portable {
                 for (File m : ms) {
                     if (m.isDirectory()) continue;
                     mems += 1;
-                    bytes += Files.copy(m, new File(memOut, m.getName()));
+                    try { bytes += Files.copy(m, new File(memOut, m.getName())); }
+                    catch (Throwable e) { EyeLog.w("port", "跳过记忆 " + m.getName() + "：" + e); }
                 }
             }
 
@@ -460,13 +469,24 @@ final class Portable {
             String full = f.getAbsolutePath();
             if (full.endsWith(".zip")) continue;
             String rel = full.substring(base.length());
-            z.putNextEntry(new java.util.zip.ZipEntry(rel));
-            FileInputStream in = new FileInputStream(f);
-            byte[] buf = new byte[16 * 1024];
-            int n;
-            while ((n = in.read(buf)) > 0) z.write(buf, 0, n);
-            in.close();
-            z.closeEntry();
+            /**
+             * ⚠️ `listFiles()` 到 `new FileInputStream(f)` 之间，文件可能已经被删了
+             * （并发导出 / 用户清理）。ENOENT 会把**整包**打成失败 —— 少一张图而已，
+             * 跳过它，剩下的照打。
+             */
+            java.io.FileInputStream in = null;
+            try {
+                in = new java.io.FileInputStream(f);
+                z.putNextEntry(new java.util.zip.ZipEntry(rel));
+                byte[] buf = new byte[16 * 1024];
+                int n;
+                while ((n = in.read(buf)) > 0) z.write(buf, 0, n);
+                z.closeEntry();
+            } catch (Throwable e) {
+                EyeLog.w("port", "打包跳过 " + rel + "：" + e);
+            } finally {
+                if (in != null) try { in.close(); } catch (Throwable ignored) { }
+            }
         }
     }
 
