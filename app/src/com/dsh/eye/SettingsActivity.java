@@ -224,6 +224,14 @@ public class SettingsActivity extends AppActivity {
         row("wifi", "局域网", "关了只能插数据线连",
             cfg.lanOn() ? "开 · " + lanIp() + ":4444" : "关",
             new Runnable() { public void run() { lanDialog(); } });
+        /**
+         * 「电脑地址」—— 手机上的「发到电脑」往哪儿发。
+         *
+         * 一直写死 `127.0.0.1:7788`，只有 `adb reverse` 隧道通的时候才指得到电脑，
+         * 所以**不插线就永远发不出去**。这里放出来让用户能填电脑的局域网地址。
+         */
+        row("wifi", "电脑地址", "「发到电脑」往哪儿发", cfg.syncHost(),
+            new Runnable() { public void run() { syncHostDialog(); } });
         row("folder", "工作区", "它能自己往里写文件", wsBrief(),
             new Runnable() { public void run() { workspace(); } });
         row("refresh", "备份与迁移", "手机 ⇄ 电脑", null,
@@ -783,6 +791,46 @@ public class SettingsActivity extends AppActivity {
                     EyeService s = EyeService.peek();
                     if (s != null) s.rebind();
                     toast(!on ? "已开：" + lanIp() + ":4444" : "已关，只能插线连");
+                    rebuild();
+                }
+            })
+            .setNegativeButton("算了", null)
+            .show();
+    }
+
+    /**
+     * 电脑地址。
+     *
+     * 插数据线时走 `127.0.0.1:7788`：电脑端的同步面板会 `adb reverse` 把这个端口
+     * 接到自己身上，所以手机这边不用知道电脑在哪。
+     *
+     * 不插线时那个地址没人接 —— 改成电脑的局域网地址，手机直接往那边发。
+     * 电脑端同步面板对外监听时会打印这个地址。
+     */
+    private void syncHostDialog() {
+        // 示例用**手机自己**的网段推算，不把任何一台具体电脑的 IP 写进代码
+        final String myIp = lanIp();
+        final String example = myIp.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")
+            ? myIp.substring(0, myIp.lastIndexOf('.')) + ".100:7788"
+            : "192.168.0.100:7788";
+
+        final EditText et = new EditText(this);
+        et.setSingleLine(true);
+        et.setText(cfg.syncHost());
+        et.setSelection(et.getText().length());
+        et.setHint(example);
+        new AlertDialog.Builder(this)
+            .setTitle("电脑地址")
+            .setMessage("「发到电脑」往这个地址发。\n\n"
+                + "· 插数据线：保持 127.0.0.1:7788（电脑端会自动接上）\n"
+                + "· 不插线：填电脑的局域网地址，形如 " + example + "\n"
+                + "  电脑和手机要在同一个 WiFi 下")
+            .setView(et)
+            .setPositiveButton("保存", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int which) {
+                    String v = et.getText().toString().trim();
+                    cfg.setSyncHost(v.length() == 0 ? "127.0.0.1:7788" : v);
+                    toast("电脑地址：" + cfg.syncHost());
                     rebuild();
                 }
             })
