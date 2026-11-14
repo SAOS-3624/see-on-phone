@@ -14,7 +14,7 @@ package com.dsh.eye;
  * 5fps 下切点判据照样成立（差分是"相邻采样帧"的差，采样越稀差值越大，反而更好判）。
  * `Pipeline.Opts.fps` 必须跟着设成 {@link #FPS}。
  *
- * 纯 Java，不碰 Android（`tools/parity/capture.sh` 在电脑上验节奏）。
+ * 纯 Java，不碰 Android（离线探针脚本（`tools/parity/capture.sh`，不在发布包里）在电脑上验节奏）。
  */
 final class CallCapture {
 

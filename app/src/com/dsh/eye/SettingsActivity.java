@@ -860,7 +860,7 @@ public class SettingsActivity extends AppActivity {
                 : "现在是**关**：只监听本机，必须用数据线 + adb forward。")
                 + "\n\n开了之后，同一个 WiFi 下的任何设备只要知道这个地址，"
                 + "就能看图、让它说话、改档位。**在公共 WiFi 上别开。**"
-                + "\n\n电脑那边：\nnode tools/phone-bridge.mjs status --host " + lanIp() + ":4444")
+                + "\n\n电脑那边：\ndsh-see-on-phone status --host " + lanIp() + ":4444")
             .setPositiveButton(on ? "关掉" : "打开", new DialogInterface.OnClickListener() {
                 public void onClick(DialogInterface d, int which) {
                     cfg.setLanOn(!on);
@@ -1014,7 +1014,7 @@ public class SettingsActivity extends AppActivity {
                 + "并在那儿生成一个 phone-时间.zip（可以直接发走）。\n\n"
                 + "导入：读 Download/DSH-Go/import/ 里的内容合并进来。\n"
                 + "会话按时间戳增量追加，记忆同名不同内容不覆盖（另存到 import/skipped/）。\n\n"
-                + "电脑那头一条命令：\nnode tools/phone-bridge.mjs pull\nnode tools/phone-bridge.mjs push")
+                + "电脑那头一条命令：\ndsh-see-on-phone sync")
             .setPositiveButton("导出", new DialogInterface.OnClickListener() {
                 public void onClick(DialogInterface d, int which) {
                     EyeService s = EyeService.peek();

@@ -30,7 +30,7 @@ import java.util.List;
  * 帧一帧不增不减：装不下时按 `flush()` 的做法**只画 bin 0**（多出来的丢给下一张，
  * `Pipeline` 的 `splitOneBin` 早就切过了，走到这里还溢出就是 `stats.overflow`）。
  *
- * 纯 Java、不碰 Bitmap —— `tools/parity/{stream,render}.sh` 在电脑上验。
+ * 纯 Java、不碰 Bitmap —— 离线探针脚本（不在发布包里）在电脑上验。
  */
 final class CallSheet {
 

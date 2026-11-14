@@ -10,7 +10,7 @@ import java.net.URL;
  * ## 它到底做了什么
  *
  * 手机**不能主动推**给一个不知道在哪的电脑。所以这里的做法是：
- * 电脑那边开着同步面板（`tools/phone-sync.mjs`），它启动时会执行
+ * 电脑那边开着同步面板（`dsh-see-on-phone sync`），它启动时会执行
  * `adb reverse tcp:7788 tcp:7788` —— 于是**手机里的 127.0.0.1:7788 就是电脑的面板**。
  *
  * 手机只要请求一次 `/run?cmd=receive`，电脑就去 pull + import 刚才打好的包。

@@ -210,7 +210,7 @@ final class ConvStore {
             try {
                 FileOutputStream o = new FileOutputStream(fileOf(id), true);
                 // 列序固定：at / role / text / shots / reasoning / origin / thinkMs
-                // ⚠️ 只在**末尾**加列。桌面 tools/phone-pack.mjs 按 `line.split('\t')` 读前 4 列，
+                // ⚠️ 只在**末尾**加列。桌面插件的解析器（`src/portable/pack.mjs`）按 `line.split('\t')` 读前 4 列，
                 //    多出来的列会被忽略；加在中间会把它读歪。
                 o.write((m.at + "\t" + m.role + "\t" + Json.esc(m.text) + "\t" + shots(m)
                     + "\t" + Json.esc(m.reasoning)

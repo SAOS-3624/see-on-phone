@@ -384,8 +384,8 @@ public class ConvActivity extends AppActivity {
                                 .setMessage(head + "\n\n" + (err == null
                                     ? "电脑正在收，几秒后 DSH 的会话列表里就有这段。"
                                     : "原因：" + err + "\n\n"
-                                        + "先在电脑上开着：\nnode tools/phone-sync.mjs\n\n"
-                                        + "包已经存在手机里了，回头在面板上按「收手机 → 电脑」也一样。"))
+                                        + "先在电脑上装好插件：\nnpm i -g dsh-see-on-phone\n\n"
+                                        + "包已经存在手机里了，回头在电脑上跑一次 dsh-see-on-phone sync 也一样。"))
                                 .setPositiveButton("知道了", null)
                                 .show();
                         }

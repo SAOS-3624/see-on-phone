@@ -21,8 +21,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.dsh.eye"
-    android:versionCode="212"
-    android:versionName="2.1.1">
+    android:versionCode="220"
+    android:versionName="2.2.0">
 
     <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="29" />
 

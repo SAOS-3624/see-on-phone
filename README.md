@@ -163,6 +163,32 @@ node scripts/doctor.mjs      # 手机通不通、语音播放有没有
 node scripts/smoke.mjs 6     # 拍 6 秒存成 jpg，自己看
 ```
 
+### 搬会话（手机 ⇄ 电脑）
+
+手机上聊过的可以搬到电脑的 DSH 里接着聊，反过来也行。装完插件就自带这个命令：
+
+```bash
+dsh-see-on-phone sync               # 一条命令：从手机拉包 + 导进 DSH
+dsh-see-on-phone status             # 先看看手机在不在
+dsh-see-on-phone export latest      # 反向：把 DSH 里最近改过的那条推到手机
+dsh-see-on-phone push               # （导出后再推）
+dsh-see-on-phone doctor             # 体检：哪些会话 DSH 打不开、为什么
+dsh-see-on-phone repair --write     # 修（默认只看不改；每个文件先备份 .bak-*）
+```
+
+| 你担心的 | 实际行为 |
+|---|---|
+| 会不会覆盖我原来的会话 | **只加不删**。手机侧按时间戳增量追加，电脑侧新建 / 补齐，从不 truncate |
+| 图片呢 | **不跟着搬**：导出时换成一行「图已省略」占位（省时间省流量），手机上的原图还在 |
+| 电脑上看得到图吗 | 看不到。这是刻意的 —— 那段对话在电脑上只有文字 |
+| 搬完为什么列表没变 | 列表是 DSH 进程里的缓存，**完全退出再打开**才刷新 |
+
+不插线也能搬：手机 App → 设置 → 数据 → 打开「局域网」，然后
+`dsh-see-on-phone sync --host 192.168.1.5:4444`（IP 用手机上显示的那个）。
+
+> 导进 **WorkBuddy 侧边栏**也行：`dsh-see-on-phone import --wb`（这条线要 Node 22.5+）。
+> 插线时先用 `-s <序列号>` 指定设备（`adb devices` 第一列），插两台时必用。
+
 ## 🧭 出处与署名
 
 拼图那套（切点检测 → 档位 → 行 DP 装箱 → 拼图 → token 换算）最初写在
