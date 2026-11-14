@@ -279,17 +279,22 @@ public class SettingsActivity extends AppActivity {
      * 附一份许可，所以全文直接塞 `res/raw/`，跟着 APK 走。
      */
     private void licenseDialog() {
+        /**
+         * ⚠️ 这里**不能**同时用 `setMessage` + `setItems`：实测（华为，2.1.0）列表项会整个不见，
+         * 只剩 message 和一个「关了」——点了没反应，看着像"许可页坏了"。
+         * 三个按钮 + message 才是能同时显示的组合。
+         */
         new AlertDialog.Builder(this)
             .setTitle("许可")
             .setMessage("代码：Apache-2.0。\n"
-                + "本 APK 内附许可全文与第三方署名，点下面看。\n\n"
+                + "本 APK 内附许可全文与第三方署名。\n\n"
                 + "github.com/SAOS-3624/see-on-phone")
-            .setItems(new String[] { "许可全文（Apache-2.0）", "第三方署名（NOTICE）" },
-                new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface d, int which) {
-                        showRaw(which == 0 ? "license" : "notice");
-                    }
-                })
+            .setPositiveButton("许可全文", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int which) { showRaw("license"); }
+            })
+            .setNeutralButton("第三方署名", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int which) { showRaw("notice"); }
+            })
             .setNegativeButton("关了", null)
             .show();
     }
@@ -315,7 +320,12 @@ public class SettingsActivity extends AppActivity {
         }
         ScrollView sv = new ScrollView(this);
         TextView t = new TextView(this);
-        t.setText(body);
+        /**
+         * 许可全文是纯文本（不要过 Markdown —— Apache 正文里全是 `*` 和编号，
+         * 会被当列表/强调吃掉）；NOTICE 是 Markdown，走项目自带的渲染器，
+         * 否则屏幕上会原样显示 `# NOTICE` 和一堆 `**`。
+         */
+        t.setText("license".equals(name) ? body : Markdown.render(body));
         t.setTextSize(Theme.T_TINY);
         t.setTextColor(Theme.TEXT_DIM);
         t.setPadding(dp(16), dp(8), dp(16), dp(8));
