@@ -157,7 +157,7 @@ public class SettingsActivity extends AppActivity {
                 cfg.setSpeak(!cfg.speak());
                 apply();
             } });
-        row("mic", "音色", "系统的；装引擎就多几个", voiceLabel(),
+        row("mic", "音色", "前五个是在线的（小轩）", voiceLabel(),
             new Runnable() { public void run() { pickVoice(); } });
         row("speed", "语速", null, String.format(java.util.Locale.ROOT, "%.1f×", cfg.rate()),
             new Runnable() { public void run() {
@@ -287,6 +287,8 @@ public class SettingsActivity extends AppActivity {
         new AlertDialog.Builder(this)
             .setTitle("许可")
             .setMessage("代码：Apache-2.0。\n"
+                + "例外：在线音色那两个文件（Drm / EdgeTts）按 LGPL-3.0 分发，\n"
+                + "详见「第三方署名」。\n"
                 + "本 APK 内附许可全文与第三方署名。\n\n"
                 + "github.com/SAOS-3624/see-on-phone")
             .setPositiveButton("许可全文", new DialogInterface.OnClickListener() {
@@ -638,11 +640,11 @@ public class SettingsActivity extends AppActivity {
 
     // ---------------------------------------------------------------- 各对话框
 
-    /** 音色：系统的中文语音列表（第 0 个是「系统默认」）。 */
+    /** 音色：前 5 个是在线音色（edge-tts），后面是系统自带的（第 0 个是「系统默认」）。 */
     private void pickVoice() {
         EyeService s = EyeService.peek();
         if (s == null) { toast("服务还没起来，等两秒再点"); return; }
-        // 全是系统里装了的音色（第 0 个是「系统默认」）—— 见 EyeService.voiceChoices
+        // 前 5 个是在线音色（edge-tts），后面是系统自带的 —— 见 EyeService.voiceChoices
         final String[] labels = s.voiceChoices();
         new AlertDialog.Builder(this)
             .setTitle("发音")
@@ -659,6 +661,15 @@ public class SettingsActivity extends AppActivity {
             })
             .setNeutralButton("更多音色", new DialogInterface.OnClickListener() {
                 public void onClick(DialogInterface d, int which) { openTtsSettings(); }
+            })
+            .setNegativeButton("清语音缓存", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int which) {
+                    EyeService svc = EyeService.peek();
+                    if (svc == null) return;
+                    int n = svc.voiceCacheCount();
+                    svc.clearVoiceCache();
+                    toast("清了 " + n + " 段");
+                }
             })
             .show();
     }

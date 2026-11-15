@@ -186,9 +186,10 @@ bash tools/parity/render.sh    # 真画成 PNG 放到 tools/parity/out/，用眼
 - **`minSdk 21` / `targetSdk 29`**：见 [BUILD.md](docs/BUILD.md) 的说明，不是懒得升级。
 - **语音输入只有单句**（系统 `RecognizerIntent`）。常驻 `SpeechRecognizer` 在部分机型上
   会一直 `ERROR_RECOGNIZER_BUSY`，试过了，不划算。
-- **只有系统 TTS**：1.x 的在线音色（自己算 `Sec-MS-GEC`）在 2.0 删掉了 —— 那套令牌
-  算法是把 GPL-3.0 的 `edge-tts` 翻译成 Java，会让整个 APK 落到 GPL。想多几个嗓子，
-  装一个系统语音引擎，设置 → 音色 里就能选（对话框右下角「更多音色」直接跳系统设置）。
+- **在线音色要联网**：小轩 / 晓晓 / 晓伊 / 云希 / 云扬 走 Edge 的朗读接口（`EdgeTts.java` +
+  `Drm.java`，**LGPL-3.0**，见 [../CREDITS.md](../CREDITS.md) §4.1）。默认不启用；不选它就走系统 TTS，
+  也可以装个系统语音引擎多几个嗓子（音色对话框右下角「更多音色」直接跳系统设置）。
+  这套接口微软没有公开，**随时可能失效**，合成失败会自动回落系统 TTS。
 - **导盲模式不是辅具。** 见 [../NOTICE](../NOTICE)。
 
 ## 许可
