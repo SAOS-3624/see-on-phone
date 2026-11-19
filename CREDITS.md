@@ -45,6 +45,7 @@
 |---|---|---|---|
 | [PySceneDetect](https://github.com/Breakthrough/PySceneDetect)（Breakthrough） | BSD-3-Clause | `ContentDetector` 的**加权打分思想**：把 HSV 三通道的差异加权成一个 0–255 的"变化分"。网格多大、阈值怎么定、怎么确认尖峰，全是我们自己试出来的 | `app/src/com/dsh/eye/Cuts.java`（`scan.js` → `cuts.js` → 这里，三代都是独立实现，没有读过它的源码） |
 | DeepSeek 官方《图像理解 · Token 用量》文档 | 文档 | 图像 token 的换算公式（14px patch 对齐 / 42px token 格 / 每行 +1 / 整图 +2） | `app/src/com/dsh/eye/Tokens.java` |
+| [dsh-cost-meter](https://github.com/Han-1413141/dsh-cost-meter)（MIT，1.9.46） | MIT | DeepSeek V4 的输入/输出参考牌价数字（opencode-go 档，用于费用估算）；**没有复制代码**，`Cost.java` 是独立实现 | `app/src/com/dsh/eye/Cost.java` |
 
 > PySceneDetect 那条要特别说明：**思想可以借用，代码不行**。它用 OpenCV + numpy 在原始分辨率上算，
 > 我们在 64×36 的降采样网格上手写，连哈希和阈值都是另一套。所以这不是"移植"，是"读了结论自己实现"。

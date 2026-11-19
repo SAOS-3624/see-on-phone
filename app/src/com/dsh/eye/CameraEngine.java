@@ -198,6 +198,8 @@ final class CameraEngine {
 
     boolean isFront() { return front; }
     boolean isTorch() { return torch; }
+    /** 当前这颗镜头有没有闪光灯（切到前置后通常没有）。 */
+    boolean hasFlash() { return hasFlash; }
     String resolutionName() { return res; }
     int frameCount() { return frames; }
     long lastFrameAt() { return lastFrameAt; }

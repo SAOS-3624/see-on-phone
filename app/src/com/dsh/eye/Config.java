@@ -26,10 +26,21 @@ final class Config {
     private static final String K_BASE = "apiBase";
     private static final String K_MODEL = "apiModel";
 
-    /** 思考强度：off | low | medium | high。默认 low（够用又不至于等太久）。 */
+    /**
+     * 思考档位：`auto`（自动）| `high`（高）| `max`（最高）| `off`（关）。默认 `auto`。
+     *
+     * 老值 `low` / `medium` 已在 {@link #migrate()} 里一次性归一，读的时候不信它们
+     * （{@link Caps#normEffort} 也会再兜一次）。
+     */
     private static final String K_THINK = "think";
     /** 念不念出来。 */
     private static final String K_SPEAK = "speak";
+    /** 累计花费（微美元，long 存，避免 float 漂移）。 */
+    private static final String K_COST = "costMicros";
+    private static final String K_LAST_IN = "lastIn";
+    private static final String K_LAST_OUT = "lastOut";
+    private static final String K_LAST_TOOLS = "lastTools";
+    private static final String K_LAST_COST = "lastCostMicros";
     private static final String K_VOICE = "ttsVoice";
     /** 通话页"自动看"（攒满就发）开着没有。默认开 —— 用户要的就是这个行为。 */
     private static final String K_AUTOW = "autoWatch";
@@ -55,6 +66,21 @@ final class Config {
 
     /** 工具总开关（关掉就退化成纯聊天，不带 tools）。 */
     private static final String K_TOOLS = "tools";
+
+    // ---- v5：对齐官方 App（ARCH §3.3 / §6.2）----
+    /** 「联网」模式的标题轻请求开关。默认**开**（关掉就只剩本地截断标题）。 */
+    private static final String K_TITLE_AUTO = "titleAuto";
+    /** 对齐总闸。关掉 = 全退回 v4 的老行为（一个请求、只有聊天、没有卡片/引用/模式）。 */
+    private static final String K_PARITY = "parity";
+    /** `server_tool_calls` 原样回传。**必须**开，否则联网多轮的第一步就会被 400 打回。 */
+    private static final String K_STC_REPLAY = "stcReplay";
+    /**
+     * 联网模式下是否放开文档附件。默认 **true**（T0 探针 P2 已通过）。
+     *
+     * 关掉之后联网 + 文档会被 {@code Caps.plan} 判成 {@code Err.DOC_IN_WEB} 直接拦住
+     * （上传之前就拦，不白传 100MB）—— 这就是"官方哪天不让混了"的回滚开关。
+     */
+    private static final String K_DOCS_IN_WEB = "allowDocsInWeb";
 
     // ---- 以下三项**只给 `tune` 用**，设置页不显示（见类注释）----
     private static final String K_PACE = "pace";
@@ -85,13 +111,27 @@ final class Config {
     private static final String K_TIMEOUT = "timeoutSec";
 
     static final String DEFAULT_BASE = "https://api.deepseek.com";
-    /** v4 起默认走 flash：`deepseek-chat` 已于 2026-07-24 弃用（映射到它的非思考模式）。 */
-    static final String DEFAULT_MODEL = "deepseek-v4-flash";
+    /**
+     * v5 起默认走 `deepseek-flash`（= V4.1-Flash，官方的默认档，有视觉、能读文件）。
+     *
+     * `deepseek-v4-flash` 是它的**旧名**（官方仍接受，但设置页不该显示一个"要自己查才知道
+     * 是什么"的名字），升级时由 {@link #migrate()} 一次性换掉。
+     * `deepseek-chat` / `deepseek-reasoner` 已于 2026-07-24 弃用，同样在迁移里换掉。
+     */
+    static final String DEFAULT_MODEL = "deepseek-flash";
     static final String DEFAULT_VOICE = "";
 
-    /** 思考四档。顺序就是设置页的循环顺序。 */
-    static final String[] THINK = { "off", "low", "medium", "high" };
-    static final String[] THINK_LABEL = { "关", "低", "中", "高" };
+    /**
+     * 思考四档。顺序就是设置页的循环顺序（由浅入深 → 关）。
+     *
+     * `auto` = 开思考但不写 `reasoning_effort`（让服务端自己定）——这是**新的默认**：
+     * 用户根本不该关心"high 还是 max"，那是官方调过的默认值。
+     */
+    static final String[] THINK = { "auto", "high", "max", "off" };
+    static final String[] THINK_LABEL = { "自动", "高", "最高", "关" };
+
+    /** 默认档位（`migrate` 与 `think()` 共用，避免两处写死不同的值）。 */
+    static final String THINK_DEFAULT = "auto";
 
     private final SharedPreferences sp;
 
@@ -143,6 +183,37 @@ final class Config {
             sp.edit().putInt(K_CTX, DEFAULT_CTX).apply();
         }
 
+        /**
+         * ③ v5 一次性迁移（对齐官方 App）。
+         *
+         * 三件：
+         *   1. 模型名 `deepseek-v4-flash` → `deepseek-flash`（同一个模型，只是官方改名，
+         *      设置页不该显示旧名）；
+         *   2. 档位老值 `medium` → `high`、`low` → `auto`（四档换了口径，老值留着就会
+         *      被 `think()` 判成认不出来、悄悄回落到默认 —— 用户会以为"我的设置丢了"）；
+         *   3. 记 `migratedV5`，**只跑一次**：以后用户自己再切回高/关，下次启动不会被顶回去。
+         *
+         * ⚠️ 必须在下面 `v4` 的 early-return **之前**：`v4` 标记早就落盘了，
+         *    写在它后面等于"这段永远不执行"（`ctxSet` 那次踩过一模一样的坑）。
+         */
+        if (!sp.getBoolean("migratedV5", false)) {
+            String m5 = or(sp.getString(K_MODEL, ""), "");
+            if ("deepseek-v4-flash".equals(m5) || "deepseek-chat".equals(m5)
+                || "deepseek-reasoner".equals(m5) || m5.length() == 0) {
+                // 空串也补上：没填过模型的人应该拿到新默认，而不是"一直空着"。
+                sp.edit().putString(K_MODEL, DEFAULT_MODEL).apply();
+            }
+            String t5 = or(sp.getString(K_THINK, ""), "");
+            if ("medium".equals(t5)) {
+                sp.edit().putString(K_THINK, "high").apply();
+            } else if ("low".equals(t5)) {
+                sp.edit().putString(K_THINK, "auto").apply();
+            } else if (t5.length() == 0) {
+                sp.edit().putString(K_THINK, THINK_DEFAULT).apply();
+            }
+            sp.edit().putBoolean("migratedV5", true).apply();
+        }
+
         if (sp.getBoolean("v4", false)) return;
         String m = or(sp.getString(K_MODEL, ""), "");
         if ("deepseek-chat".equals(m) || "deepseek-reasoner".equals(m)) {
@@ -167,20 +238,26 @@ final class Config {
 
     // ---------------------------------------------------------------- 思考
 
+    /**
+     * 当前档位。**恒返回 {@link #THINK} 里的一个值**（认不出来 → 默认 `auto`）。
+     *
+     * 这里不信老值（`low` / `medium`）：迁移已经把它们换掉了，万一有人手工改了
+     * SharedPreferences，{@link Caps#normEffort} 还会再兜一次，不会把脏值发到线上。
+     */
     String think() {
-        String v = sp.getString(K_THINK, "low");
+        String v = sp.getString(K_THINK, THINK_DEFAULT);
         for (String ok : THINK) if (ok.equals(v)) return v;
-        return "low";
+        return THINK_DEFAULT;
     }
 
     void setThink(String v) {
-        String m = "low";
+        String m = THINK_DEFAULT;
         for (String ok : THINK) if (ok.equals(v)) m = ok;
         sp.edit().putString(K_THINK, m).apply();
     }
 
     /**
-     * 下一档（设置页点一下循环）。`off → low → medium → high → off`。
+     * 下一档（设置页点一下循环）。`自动 → 高 → 最高 → 关 → 自动`。
      *
      * 顺序是"由浅入深"：用户点这个按钮时想的是"再想深一点"，
      * 而不是"按字母序换一个"。
@@ -190,22 +267,171 @@ final class Config {
         for (int i = 0; i < THINK.length; i += 1) {
             if (THINK[i].equals(cur)) return THINK[(i + 1) % THINK.length];
         }
-        return "low";
+        return THINK_DEFAULT;
     }
 
     static String thinkLabel(String v) {
         for (int i = 0; i < THINK.length; i += 1) if (THINK[i].equals(v)) return THINK_LABEL[i];
-        return "低";
+        return THINK_LABEL[0];
     }
 
     String thinkLabel() { return thinkLabel(think()); }
 
     boolean thinking() { return !"off".equals(think()); }
 
+    // ---------------------------------------------------------------- v5 开关
+
+    /**
+     * 「联网」模式下是否随本轮带 `title:{"enabled":true}` 之外的**独立标题轻请求**。
+     *
+     * 默认开：标题失败只损失"更好的标题"，不影响回答。
+     * ⚠️ 与 `function tools` 互斥的那条路（聊天/Agent）**永远不会**带 title，
+     *    那个判断在 {@code Caps.plan}，不是这个开关。
+     */
+    boolean titleAuto() { return sp.getBoolean(K_TITLE_AUTO, true); }
+    void setTitleAuto(boolean v) { sp.edit().putBoolean(K_TITLE_AUTO, v).apply(); }
+
+    /**
+     * **对齐总闸**。false = 全退回 v4 老行为（单请求、只有聊天、无机型卡片/引用/模式）。
+     *
+     * 留着它是为了"线上一出问题就一键回到昨天"：v5 的改动面横跨请求形状、落盘、
+     * 渲染三层，靠"改代码回滚"来不及，靠一个开关来得及。
+     */
+    boolean parity() { return sp.getBoolean(K_PARITY, true); }
+    void setParity(boolean v) { sp.edit().putBoolean(K_PARITY, v).apply(); }
+
+    /**
+     * `server_tool_calls` 原样回传。**默认开且基本不该关** ——
+     * 关掉之后联网多轮的第一步就会被官方 400（`cannot be used together` 那一类），
+     * 开关只用于排障对比。
+     */
+    boolean stcReplay() { return sp.getBoolean(K_STC_REPLAY, true); }
+    void setStcReplay(boolean v) { sp.edit().putBoolean(K_STC_REPLAY, v).apply(); }
+
+    /**
+     * 联网模式下是否放开文档附件。**默认 true**（T0 探针 P2 实测：`{"type":"file"}` 块与
+     * `deepseek_web_search` 同请求返回 200，可以混用）。
+     *
+     * 闸门**仍然留着**：把这里关掉，`Caps.plan` 立刻回到 `Err.DOC_IN_WEB`
+     * （联网模式选文档 → 上传前就拦住，不白传 100MB）。这样"官方哪天不让混了"只需要翻一个开关。
+     */
+    boolean allowDocsInWeb() { return sp.getBoolean(K_DOCS_IN_WEB, true); }
+    void setAllowDocsInWeb(boolean v) { sp.edit().putBoolean(K_DOCS_IN_WEB, v).apply(); }
+
+    // ---------------------------------------------------------------- 模式（按会话记忆）
+
+    /**
+     * 每个会话各记一个模式的键前缀：`mode:<convId>` → `"chat" | "web" | "agent"`。
+     *
+     * 为什么不放在会话文件里：模式是**用户当下的选择**，不是这一轮回答的属性。
+     * 换到别的会话再回来，应该还是上次那个模式；而消息上那份 `Msg.mode` 记的是"那一轮
+     * 实际用的模式"，两者不同义，谁也别覆盖谁。
+     */
+    private static final String K_MODE_PREFIX = "mode:";
+
+    /**
+     * 某个会话上次选的模式。**永不返回 null**（没记录 / 认不出 / `parity` 关掉 → `CHAT`）。
+     *
+     * @param convId 会话 id；null/空 → 用当前会话（{@link #convId()}），再没有就是 `CHAT`
+     */
+    Caps.Mode modeOf(String convId) {
+        // 总闸关掉 = 全退回 v4（只有聊天）。编排层/UI 就不用各自再判一次。
+        if (!parity()) return Caps.Mode.CHAT;
+        String id = or(convId, convId());
+        if (id.length() == 0) return Caps.Mode.CHAT;
+        Caps.Mode m = Caps.Mode.of(sp.getString(K_MODE_PREFIX + id, ""));
+        return m == null ? Caps.Mode.CHAT : m;
+    }
+
+    /** 记住某个会话的模式（null 当 `CHAT`）。T3 的胶囊行点 chip 时调它。 */
+    void setMode(String convId, Caps.Mode m) {
+        String id = or(convId, convId());
+        if (id.length() == 0) return;                     // 还没有会话 id：无处可记，不落脏键
+        Caps.Mode v = m == null ? Caps.Mode.CHAT : m;
+        sp.edit().putString(K_MODE_PREFIX + id, v.key).apply();
+    }
+
+    /** 当前会话的模式（`modeOf(convId())` 的便捷写法，给编排层用）。 */
+    Caps.Mode mode() {
+        return modeOf(convId());
+    }
+
+    /** 当前会话的模式（`setMode(convId(), m)` 的便捷写法，给编排层用）。 */
+    void setMode(Caps.Mode m) {
+        setMode(convId(), m);
+    }
+
+    // ---------------------------------------------------------------- 联网开关（按会话）
+
+    /**
+     * 每个会话各记一个"联网开着没有"的键：`web:<convId>` → `true` / `false`。
+     *
+     * ## 为什么它和"模式"是两个键
+     *
+     * 模式是**三选一**（聊天 / 联网 / Agent），联网开关是**叠加**的：
+     * ```
+     * 聊天 + 联网开  → 就是原来的「联网」模式（`Caps.plan` 会归一成 WEB）
+     * Agent + 联网开 → **混合**：动手工具 + 一个 `web_search` function
+     * ```
+     * 合成一个枚举会变成 5 个模式，而用户心里只有"要不要联网"这一件事。
+     */
+    private static final String K_WEB_PREFIX = "web:";
+
+    /**
+     * 某个会话的联网开关。`parity` 总闸关掉时**恒为 false**（联网一起退回 v4）。
+     *
+     * @param convId null/空 → 用当前会话；连当前会话都没有 → false
+     */
+    boolean webOf(String convId) {
+        if (!parity()) return false;
+        String id = or(convId, convId());
+        if (id.length() == 0) return false;
+        return sp.getBoolean(K_WEB_PREFIX + id, false);
+    }
+
+    /** 记住某个会话的联网开关（空 id 不落键，免得留下脏 `web:` 空键）。 */
+    void setWeb(String convId, boolean v) {
+        String id = or(convId, convId());
+        if (id.length() == 0) return;
+        sp.edit().putBoolean(K_WEB_PREFIX + id, v).apply();
+    }
+
+    /** 当前会话的联网开关。 */
+    boolean web() {
+        return webOf(convId());
+    }
+
+    /** 当前会话的联网开关。 */
+    void setWeb(boolean v) {
+        setWeb(convId(), v);
+    }
+
     // ---------------------------------------------------------------- 语音
 
     boolean speak() { return sp.getBoolean(K_SPEAK, true); }
     void setSpeak(boolean v) { sp.edit().putBoolean(K_SPEAK, v).apply(); }
+
+    // ---- 花费累计（微美元） ----
+    long costMicros() { return sp.getLong(K_COST, 0L); }
+    double costTotalUsd() { return costMicros() / 1_000_000.0; }
+    void addCostUsd(double usd) {
+        if (usd <= 0 || Double.isNaN(usd)) return;
+        long add = Math.round(usd * 1_000_000.0);
+        sp.edit().putLong(K_COST, costMicros() + add).apply();
+    }
+
+    /** 最近一轮的用量（重启后"本轮"还能显示，不用把每条消息都存 cost）。 */
+    void setLastTurn(int in, int out, int tools, double usd) {
+        sp.edit().putInt(K_LAST_IN, in).putInt(K_LAST_OUT, out)
+            .putInt(K_LAST_TOOLS, tools)
+            .putLong(K_LAST_COST, Math.max(0, Math.round(usd * 1_000_000.0)))
+            .apply();
+    }
+
+    int lastIn() { return sp.getInt(K_LAST_IN, 0); }
+    int lastOut() { return sp.getInt(K_LAST_OUT, 0); }
+    int lastTools() { return sp.getInt(K_LAST_TOOLS, 0); }
+    double lastCostUsd() { return sp.getLong(K_LAST_COST, 0L) / 1_000_000.0; }
 
     /**
      * 音色的键。三种形态，**靠前缀区分**（不用再加一个开关字段）：

@@ -8,6 +8,8 @@ import android.text.style.ForegroundColorSpan;
 import android.text.style.StyleSpan;
 import android.text.style.TypefaceSpan;
 
+import java.util.List;
+
 /**
  * 极简 Markdown —— 只认模型回答里**真的会出现**的六种东西。
  *
@@ -31,6 +33,31 @@ final class Markdown {
     private static final int QUOTE_FG = 0xFF8B98A5;
 
     private Markdown() { }
+
+    /**
+     * 带**引用角标**的渲染。
+     *
+     * <p>三步，一步都不能省（ARCH §5.3）：
+     * <pre>
+     * ① Cites.inject(src, cites)      在原文的码点位置埋哨兵 \u0001 1,2 \u0002
+     * ② render(...)                   哨兵原样穿过（本类只特殊处理 * ` [ 三个字符）
+     * ③ CiteSpans.materialize(...)    把哨兵换成上标可点角标，并删掉控制符
+     * </pre>
+     *
+     * <p>**为什么位置不会漂**：`inject` 是在"喂给渲染"之前做的，所以哨兵和正文一起
+     * 被 `**` 吃掉 / `[](url)` 裁掉等规则处理，走到哪它就跟到哪 —— 不需要维护一张
+     * "原文 char ↔ 渲染后 char"的映射表（那张表一定会出错）。
+     *
+     * <p>{@link #render(String)} 的行为**逐字不变**：没有引用时直接走老路。
+     *
+     * @param src   磁盘上的干净正文（不含 `[1]`、不含哨兵）
+     * @param cites 这条消息的引用（可空；空 = 跟老版本一模一样）
+     */
+    static CharSequence render(String src, List<Cites.Cite> cites) {
+        if (src == null || src.length() == 0) return "";
+        if (cites == null || cites.isEmpty()) return render(src);
+        return CiteSpans.materialize(render(Cites.inject(src, cites)), cites, null);
+    }
 
     /**
      * 把一段模型输出渲染成 TextView 能吃的东西。

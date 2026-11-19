@@ -50,6 +50,10 @@ final class Tools {
         void newTurn();
         /** 工作区（`Download/DSH-Go/workspace/`）里的文件操作。 */
         String files(String action, String path, String text);
+        /** 精确替换（逐字匹配）。默认不支持；真机由 `EyeService` 覆盖。 */
+        default String replace(String path, String oldText, String newText, boolean all) {
+            return "{\"error\":\"这个环境不支持精确替换\"}";
+        }
         String memRead(String name);
         String memWrite(String name, String text, boolean append);
         String memList();
@@ -76,6 +80,62 @@ final class Tools {
             if (cached == null) cached = buildSpec();
             return cached;
         }
+    }
+
+    /** 混合模式（Agent + 联网）那套：基础五个 + 一个 `web_search`。 */
+    private static volatile JSONArray cachedWeb;
+
+    /**
+     * 工具定义。`web=true` 时**多一个 `web_search`**。
+     *
+     * ## 为什么联网要用"自定义工具"而不是服务端工具
+     *
+     * 官方的 `deepseek_web_search` 与 `function` 工具**同请求 400**
+     * （`cannot be used together`）。所以"Agent + 联网"不能把两者塞一个 `tools` 数组；
+     * 做法是给 Agent 普通 function `web_search` / `read_url`，模型调它们时我们**内部**
+     * 打官方的原子接口（`/v1/tools/search`、`/v1/tools/fetch`，见 `Brain.search/fetch`），
+     * 把结构化结果当工具结果喂回来。
+     *
+     * 好处：对外还是"一次工具调用"，模型看到的是普通工具结果，服务端看不到混用。
+     * 代价：按次计费（搜索/读取都很便宜），但不再多一次模型往返。
+     */
+    static JSONArray spec(boolean web) {
+        if (!web) return spec();
+        JSONArray c = cachedWeb;
+        if (c != null) return c;
+        synchronized (Tools.class) {
+            if (cachedWeb == null) cachedWeb = buildSpecWeb();
+            return cachedWeb;
+        }
+    }
+
+    private static JSONArray buildSpecWeb() {
+        JSONArray base = spec();
+        JSONArray arr = new JSONArray();
+        for (int i = 0; i < base.length(); i += 1) {
+            JSONObject one = base.optJSONObject(i);
+            if (one != null) arr.put(one);      // 复用同一批 JSONObject（只读，不会有谁改它）
+        }
+        arr.put(fn("web_search",
+            "联网搜索。需要**今天 / 现在 / 最新 / 实时**的信息（新闻、价格、天气、比分、"
+            + "谁是谁、某地最近发生了什么）时，先调它再回答。\n"
+            + "什么时候调：问题里有时间敏感的词；你说不准而现在必须准；用户明确让你查一下。\n"
+            + "**不用调**：纯闲聊、常识、或者说的是「我们刚才在聊的事」。\n"
+            + "query 写一句具体的搜索词（像在人肉搜的那样，别写成一句话问题）。\n"
+            + "返回值是一段带来源的搜索结果摘要，直接拿它组织回答。",
+            new String[][] {
+                { "query", "string", "搜索词（一句具体的词，中英文都行）" },
+            },
+            new String[] { "query" }));
+        arr.put(fn("read_url",
+            "读一个网页的正文（去掉导航/广告）。用户给你一个链接、或者说「把这个页面看完 / "
+            + "总结一下 / 里面怎么写的」时用它；读完再回答，不要凭 URL 猜内容。\n"
+            + "只支持 http/https 的普通网页。",
+            new String[][] {
+                { "url", "string", "完整 URL（http:// 或 https:// 开头）" },
+            },
+            new String[] { "url" }));
+        return arr;
     }
 
     private static JSONArray buildSpec() {
@@ -142,9 +202,13 @@ final class Tools {
             + "只能在相对路径里操作（根目录就是工作区），不许 `..`。文件能长期留着，不像记忆那样每轮都重发。\n"
             + "什么时候**不要**用：想让它以后每轮都自动看到的东西 → 用 memory_write。",
             new String[][] {
-                { "action", "string", "list(默认，列目录) / read / write(整篇覆盖) / append(追加) / delete" },
+                { "action", "string", "list(默认，列目录) / read / write(整篇覆盖) / append(追加) / "
+                    + "replace(精确替换) / delete" },
                 { "path", "string", "相对路径，如 notes/买菜.txt。list 不传 = 列根目录" },
-                { "text", "string", "write / append 时写的内容" }
+                { "text", "string", "write / append 时写的内容" },
+                { "old", "string", "replace 时要被替换的原文（逐字匹配，区分大小写）" },
+                { "new", "string", "replace 时替换成什么" },
+                { "all", "boolean", "replace 时是否替换全部（默认 false，只替换第一处）" }
             },
             new String[] { "action" }));
 
@@ -256,6 +320,13 @@ final class Tools {
         String text = a.optString("text", "");
         if (action.length() == 0) action = "list";
         if (!"list".equals(action) && path.length() == 0) return err("这个动作要 path");
+        if ("replace".equals(action)) {
+            String oldText = a.optString("old", "");
+            String newText = a.optString("new", "");
+            boolean all = a.optBoolean("all", false);
+            if (oldText.length() == 0) return err("old 是空的，没法逐字匹配");
+            return env.replace(path, oldText, newText, all);
+        }
         if (("write".equals(action) || "append".equals(action)) && text.length() == 0) {
             return err("text 是空的，没什么可写");
         }

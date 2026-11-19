@@ -62,7 +62,7 @@ public final class Glyph {
     static final String[] NAMES = {
         "mic", "image", "send", "stop", "gear", "video", "menu", "back", "plus", "trash",
         "edit", "chevron", "chevronUp", "chevronRight", "eye", "check", "close", "copy",
-        "refresh", "search", "fisheye", "sound", "folder", "wifi", "speed", "camera",
+        "refresh", "search", "fisheye", "sound", "mute", "folder", "wifi", "speed", "camera",
         "grid",
     };
 
@@ -333,6 +333,19 @@ public final class Glyph {
             s.close();
             s.addArc(new RectF(10.4f, 7.2f, 17.2f, 16.8f), -62f, 124f);
             s.addArc(new RectF(9.4f, 3.6f, 21.4f, 20.4f), -58f, 116f);
+
+        } else if ("mute".equals(name)) {
+            // 喇叭 + 一道声波 + 斜杠（静音）
+            s.moveTo(4f, 9.4f);
+            s.lineTo(7.4f, 9.4f);
+            s.lineTo(11.6f, 5.4f);
+            s.lineTo(11.6f, 18.6f);
+            s.lineTo(7.4f, 14.6f);
+            s.lineTo(4f, 14.6f);
+            s.close();
+            s.addArc(new RectF(10.4f, 7.2f, 17.2f, 16.8f), -62f, 124f);
+            s.moveTo(5.2f, 5.2f);
+            s.lineTo(18.8f, 18.8f);
 
         } else if ("folder".equals(name)) {
             // 文件夹：上沿有个台阶（不然就是个方块）

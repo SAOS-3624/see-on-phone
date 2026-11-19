@@ -21,10 +21,15 @@ final class TopBar extends LinearLayout {
         void onMenu();
         void onVideo();
         void onGear();
+        void onSpeak();
+        void onUsage();
     }
 
     private final TextView title;
     private final TextView subtitle;
+    private android.widget.ImageView speakIcon;
+    private ContextRing ring;
+    private boolean speakOn = true;
 
     TopBar(Activity a, Cb cb) {
         super(a);
@@ -63,6 +68,16 @@ final class TopBar extends LinearLayout {
 
         addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+        ring = new ContextRing(a);
+        ring.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { if (cb != null) cb.onUsage(); }
+        });
+        addView(ring, new LinearLayout.LayoutParams(dp(26), dp(26)));
+
+        addView(speakBtn(a, new Runnable() {
+            public void run() { if (cb != null) cb.onSpeak(); }
+        }), new LinearLayout.LayoutParams(dp(40), dp(40)));
+
         addView(iconBtn(a, "video", new Runnable() {
             public void run() { if (cb != null) cb.onVideo(); }
         }), new LinearLayout.LayoutParams(dp(40), dp(40)));
@@ -78,6 +93,41 @@ final class TopBar extends LinearLayout {
 
     void setSubtitle(String s) {
         subtitle.setText(s == null ? "" : s);
+    }
+
+    /** 上下文圆环：0..budget 的 token 占用。 */
+    void setUsage(int used, int budget) {
+        if (ring != null) ring.setUsage(used, budget);
+    }
+
+    /** 朗读开关：换图标（喇叭 / 静音），由 `MainActivity` 在点击后推过来。 */
+    void setSpeak(boolean on) {
+        speakOn = on;
+        paintSpeak();
+    }
+
+    private void paintSpeak() {
+        if (speakIcon == null) return;
+        speakIcon.setImageDrawable(Glyph.of(getContext(),
+            speakOn ? "sound" : "mute", 20, Theme.TEXT_DIM));
+    }
+
+    private View speakBtn(Activity a, final Runnable onClick) {
+        android.widget.FrameLayout f = new android.widget.FrameLayout(a);
+        f.setBackground(Theme.rippleCircle(Theme.RIPPLE));
+        speakIcon = new android.widget.ImageView(a);
+        paintSpeak();
+        android.widget.FrameLayout.LayoutParams lp =
+            new android.widget.FrameLayout.LayoutParams(
+                Math.round(20 * a.getResources().getDisplayMetrics().density),
+                Math.round(20 * a.getResources().getDisplayMetrics().density));
+        lp.gravity = android.view.Gravity.CENTER;
+        f.addView(speakIcon, lp);
+        f.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) { onClick.run(); }
+        });
+        Anim.press(f);
+        return f;
     }
 
     /** 状态栏高度：沉浸式下要自己加 padding，不然内容会钻到状态栏/刘海底下。 */

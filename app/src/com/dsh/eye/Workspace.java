@@ -186,6 +186,64 @@ final class Workspace {
         }
     }
 
+    /**
+     * 精确替换：把文件里的 `oldText` 换成 `newText`（逐字匹配，区分大小写）。
+     *
+     * <p>为什么需要它：`write` 是整篇覆盖，模型要改一行就得把全文重写一遍 ——
+     * 文件一大就烧 token，而且很容易把别的地方改坏。`replace` 只动命中的那一段。
+     *
+     * @param all true = 替换全部命中；false = 只替换第一处
+     */
+    static String replace(String rel, String oldText, String newText, boolean all) {
+        if (oldText == null || oldText.length() == 0) return Json.err("old 不能为空");
+        if (newText == null) newText = "";
+        File f;
+        try {
+            f = resolve(rel);
+        } catch (Throwable e) {
+            return Json.err(e.getMessage());
+        }
+        if (!f.exists()) return Json.err("没有这个文件：" + rel);
+        if (f.isDirectory()) return Json.err("这是个目录，不是文件");
+        if (f.length() > MAX_WRITE) return Json.err("太大了（" + f.length() + " 字节），不是文本文件吧");
+
+        try {
+            int len = (int) f.length();
+            byte[] buf = new byte[len];
+            FileInputStream in = new FileInputStream(f);
+            int off = 0;
+            while (off < len) {
+                int k = in.read(buf, off, len - off);
+                if (k <= 0) break;
+                off += k;
+            }
+            in.close();
+            String text = new String(buf, 0, off, "UTF-8");
+
+            int from = 0;
+            int count = 0;
+            StringBuilder out = new StringBuilder(text.length() + 64);
+            while (true) {
+                int idx = text.indexOf(oldText, from);
+                if (idx < 0) break;
+                out.append(text, from, idx).append(newText);
+                from = idx + oldText.length();
+                count += 1;
+                if (!all) break;
+            }
+            if (count == 0) return Json.err("没找到要替换的原文（old 必须逐字匹配）");
+            out.append(text.substring(from));
+
+            String w = write(rel, out.toString(), false);
+            if (!w.startsWith("{\"ok\":true")) return w;
+            EyeLog.w("ws", "替换 " + rel + " " + count + " 处");
+            return "{\"ok\":true,\"path\":\"" + Json.esc(rel) + "\",\"replaced\":" + count
+                + ",\"bytes\":" + f.length() + "}";
+        } catch (Throwable e) {
+            return Json.err("替换失败：" + e);
+        }
+    }
+
     static String delete(String rel) {
         File f;
         try {

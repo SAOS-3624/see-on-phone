@@ -54,9 +54,28 @@ final class Bubbles {
         void onRetry(long at);
     }
 
+    /**
+     * 「这条消息要不要在前面插一张过程卡」。
+     *
+     * <p>从磁盘重铺时由界面提供（{@link Cards#history}），这样 `Bubbles` 不需要知道
+     * 搜索卡 / 步骤条长什么样 —— 它只负责"卡片在气泡上方"这个位置关系。
+     */
+    interface CardFor {
+        /** @return 卡片视图；null = 这条没有卡片 */
+        View card(Conv.Msg m);
+    }
+
     private final Activity a;
     private final Cb cb;
     private final float density;
+
+    /** 角标点击的去处（由界面装进来；历史消息与实时消息共用同一个）。 */
+    private CiteSpans.Cb citeCb;
+
+    /** 装角标点击回调。**必须在使用前调**，否则角标点了没反应。 */
+    void citeCb(CiteSpans.Cb c) {
+        this.citeCb = c;
+    }
 
     /**
      * 缩略图缓存。**必须缓存 + 后台解码**：以前每次重铺都在主线程把每条消息的图解一遍
@@ -150,17 +169,34 @@ final class Bubbles {
      */
     View ai(String text, String reasoning, long thinkMs, List<String> shots, long at,
             boolean failed) {
+        return ai(text, reasoning, thinkMs, null, false, shots, at, failed, null);
+    }
+
+    /**
+     * 它说的（**带引用角标 / 档位 / 停止态**的完整版）。
+     *
+     * <p>老签名转发到这里，`cites` / `effort` / `stopped` 全给空值 —— 于是
+     * "没联网的老消息"和以前画出来的东西完全一样。
+     *
+     * @param effort  档位（`auto` 等）；null = 老消息，思考条不带「· 自动」这一截
+     * @param stopped 这一轮被按了停止（思考条写「已停止」，正文里已经有「（已停止）」）
+     * @param cites   引用；非空时正文里出现可点角标，长按复制仍是干净正文（见 `MainActivity.copy`）
+     */
+    View ai(String text, String reasoning, long thinkMs, String effort, boolean stopped,
+            List<String> shots, long at, boolean failed, List<Cites.Cite> cites) {
         final String body = text == null ? "" : text;
 
         LinearLayout stack = stack(Gravity.START);
         LinearLayout card = card(false);
         // 只有它说的话渲染 Markdown —— 我自己打的字不该被当成格式
-        TextView tv = textView(Markdown.render(body), false);
+        TextView tv = textView(Markdown.render(body, cites), false);
+        // 角标要能点：setText 之后把回调与手势装上去（没有角标时 bind 什么都不做）
+        if (cites != null && !cites.isEmpty()) CiteSpans.bind(tv, citeCb);
         card.addView(tv);
 
         boolean hasReason = reasoning != null && reasoning.length() > 0;
         // 有思考过程就必须让用户能点开 —— 哪怕不知道它想了多久（老会话文件没记时长）
-        if (thinkMs > 0 || hasReason) card.addView(thinkChip(thinkMs, reasoning));
+        if (thinkMs > 0 || hasReason) card.addView(thinkBar(thinkMs, effort, reasoning, stopped));
 
         card.setOnLongClickListener(new View.OnLongClickListener() {
             public boolean onLongClick(View v) { cb.onBubbleLong(false, body, at); return true; }
@@ -194,29 +230,7 @@ final class Bubbles {
     }
 
     /**
-     * 流式输出那条**会长大**的气泡。
-     *
-     * @param out 出参：把里面那个 TextView 交回去，界面边收边 `setText`
-     */
-    View streamRow(TextView[] out) {
-        LinearLayout stack = stack(Gravity.START);
-        LinearLayout card = card(false);
-        TextView tv = textView("", false);
-        card.addView(tv);
-        stack.addView(card, wrap());
-        View v = row(false, stack);
-        if (out != null && out.length > 0) out[0] = tv;
-        return v;
-    }
-
-    /**
-     * 一个"正在长"的回答气泡的完整生命周期：`begin → append* → end`。
-     *
-     * 抽出来是因为这套状态机（row / tv / buf 三个字段 + 三处互斥判断）原本横躺在
-     * `MainActivity` 里，和"消息区该滚到哪"混在一起。现在界面只管调这三个方法。
-     */
-    /**
-     * 一个"正在长"的回答气泡的完整生命周期：`begin → append* → finish → end`。
+     * 一个"正在长"的回答气泡的完整生命周期：`begin → think* / append* → finish → end`。
      *
      * 抽出来是因为这套状态机（row / tv / buf 三个字段 + 三处互斥判断）原本横躺在
      * `MainActivity` 里，和"消息区该滚到哪"混在一起。现在界面只管调这几个方法。
@@ -241,6 +255,14 @@ final class Bubbles {
         /** 收尾之后不再接受增量：迟到的 onDelta 不许把气泡"复活"成一条半截话。 */
         private boolean closed;
 
+        // ---- 思考（流式）：折叠条 + 一行滚动灰字（PRD §6.6）----
+        private LinearLayout thinkWrap;
+        private TextView thinkHead;
+        private TextView thinkLine;
+        private final StringBuilder thinkBuf = new StringBuilder();
+        private long thinkAt;
+        private boolean thinkStopped;
+
         Stream(LinearLayout box) { this.box = box; }
 
         boolean active() { return row != null; }
@@ -251,11 +273,98 @@ final class Bubbles {
         void begin() {
             if (row != null) return;
             closed = false;
-            TextView[] holder = new TextView[1];
-            row = streamRow(holder);
-            tv = holder[0];
+
+            LinearLayout st = stack(Gravity.START);
+            LinearLayout cd = card(false);
+
+            /**
+             * 思考条**建出来就藏着**（GONE）。没有 reasoning 的那些轮次一个字都不该多
+             * —— 留一个空框比不显示更糟（用户会以为"它是不是想了一下没想出来"）。
+             */
+            thinkWrap = new LinearLayout(a);
+            thinkWrap.setOrientation(LinearLayout.VERTICAL);
+            thinkWrap.setVisibility(View.GONE);
+            thinkWrap.setPadding(0, 0, 0, dp(4));
+
+            thinkHead = new TextView(a);
+            thinkHead.setTextSize(Theme.T_SUB);
+            thinkHead.setTextColor(Theme.TEXT_DIM);
+            thinkHead.setSingleLine(true);
+            thinkHead.setEllipsize(TextUtils.TruncateAt.END);
+
+            thinkLine = new TextView(a);
+            thinkLine.setTextSize(Theme.T_TINY);
+            thinkLine.setTextColor(Theme.TEXT_DIM);
+            thinkLine.setSingleLine(true);
+            // 跑马灯：一行里横向滚动最新的思考（不换行、不撑高，PRD §6.6 的"滚动灰字"）
+            thinkLine.setEllipsize(TextUtils.TruncateAt.MARQUEE);
+            thinkLine.setMarqueeRepeatLimit(-1);
+            thinkLine.setSelected(true);
+            thinkLine.setMaxWidth(maxBodyWidth());
+
+            thinkWrap.addView(thinkHead, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            llp.topMargin = dp(2);
+            thinkWrap.addView(thinkLine, llp);
+
+            cd.addView(thinkWrap, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            TextView body = textView("", false);
+            cd.addView(body);
+            st.addView(cd, wrap());
+
+            row = row(false, st);
+            tv = body;
             buf.setLength(0);
+            thinkBuf.setLength(0);
+            thinkAt = 0;
+            thinkStopped = false;
             box.addView(row);
+        }
+
+        /**
+         * 思考增量（`reasoning_content`）。
+         *
+         * <p>只保留**最后一行**画出来：思考正文可能几千字，全画出来会把答案挤到屏幕外，
+         * 而用户此刻要看的是"它在动"，不是"它在想什么"（想看完可以点开折叠条）。
+         */
+        void think(String delta) {
+            if (closed) return;
+            if (row == null) begin();
+            if (thinkWrap == null || delta == null || delta.length() == 0) return;
+            if (thinkAt == 0) thinkAt = System.currentTimeMillis();
+            thinkBuf.append(delta);
+            thinkWrap.setVisibility(View.VISIBLE);
+            thinkLine.setVisibility(View.VISIBLE);
+            long ms = System.currentTimeMillis() - thinkAt;
+            thinkHead.setText("▾ 思考中… " + Cards.secs(ms));
+            thinkLine.setText(lastLine(thinkBuf.toString()));
+        }
+
+        /**
+         * 思考结束（首个正文 token 到达）：折叠条定型。
+         *
+         * @param ms     想了多久（服务端/编排层给的；0 = 用本地首末差兜一个）
+         * @param effort 档位（写进「· 自动」那一截；null = 不写）
+         */
+        void thinkDone(long ms, String effort) {
+            if (thinkWrap == null || thinkWrap.getVisibility() != View.VISIBLE) return;
+            if (thinkStopped) return;              // 已经按过停止：不再被迟到的收尾覆盖
+            long real = ms > 0 ? ms : (thinkAt > 0 ? System.currentTimeMillis() - thinkAt : 0);
+            thinkLine.setVisibility(View.GONE);
+            thinkHead.setText(thinkTitle(real, effort, false, true));
+        }
+
+        /** 用户按了停止：思考条保留已产生的部分并标注「已停止」（PRD P0-5 验收第 3 条）。 */
+        void thinkStopped() {
+            if (thinkWrap == null || thinkWrap.getVisibility() != View.VISIBLE) return;
+            thinkStopped = true;
+            long real = thinkAt > 0 ? System.currentTimeMillis() - thinkAt : 0;
+            thinkLine.setVisibility(View.GONE);
+            thinkHead.setText(thinkTitle(real, null, true, true));
         }
 
         /** 追加一段增量；**每段都重新渲染 Markdown**（否则用户会看到满屏 `**`）。 */
@@ -275,9 +384,22 @@ final class Bubbles {
          * 也不能少一个字"的那一次。
          */
         void finish(String full) {
+            finish(full, null);
+        }
+
+        /**
+         * 收尾（**带引用角标**）。
+         *
+         * <p>为什么联网那一轮必须走这个重载：`annotations[]` 只在**最后一帧**到，
+         * 流式期间那条气泡是**没有角标**的。收尾必须用权威全文 + 角标同步覆盖一次，
+         * 否则用户看到的是"文字对、但引用全丢"的答案，而磁盘上其实是全的。
+         */
+        void finish(String full, List<Cites.Cite> cites) {
             if (full != null && full.length() > 0 && tv != null) {
-                tv.setText(Markdown.render(full));
-                fitWidth(tv, tv.getText());
+                CharSequence cs = Markdown.render(full, cites);
+                tv.setText(cs);
+                if (cites != null && !cites.isEmpty()) CiteSpans.bind(tv, citeCb);
+                fitWidth(tv, cs);
                 tv.requestLayout();
             }
             closed = true;
@@ -293,7 +415,27 @@ final class Bubbles {
             } catch (Throwable ignored) { }
             row = null;
             tv = null;
+            thinkWrap = null;
+            thinkHead = null;
+            thinkLine = null;
             buf.setLength(0);
+            thinkBuf.setLength(0);
+            thinkAt = 0;
+        }
+
+        /** 思考正文的"最后一行"（跑马灯只画这一行）。 */
+        private String lastLine(String s) {
+            if (s == null) return "";
+            int end = s.length();
+            while (end > 0 && (s.charAt(end - 1) == '\n' || s.charAt(end - 1) == '\r')) end -= 1;
+            int start = end;
+            while (start > 0) {
+                char c = s.charAt(start - 1);
+                if (c == '\n' || c == '\r') break;
+                start -= 1;
+            }
+            String line = s.substring(start, end).trim();
+            return line.length() > 240 ? line.substring(line.length() - 240) : line;
         }
     }
 
@@ -308,6 +450,15 @@ final class Bubbles {
      * 就把它交给这条 assistant。
      */
     void render(LinearLayout box, List<Conv.Msg> msgs, int max) {
+        render(box, msgs, max, null);
+    }
+
+    /**
+     * 从磁盘重铺（**带历史卡片**）。
+     *
+     * @param cf 每条消息要不要在前面插一张卡（搜索卡 / 步骤条）；null = 不插
+     */
+    void render(LinearLayout box, List<Conv.Msg> msgs, int max, CardFor cf) {
         if (msgs == null || msgs.isEmpty()) return;
         int from = Math.max(0, msgs.size() - max);
         if (from > 0) {
@@ -332,7 +483,19 @@ final class Bubbles {
             if ("user".equals(m.role)) {
                 box.addView(userBubble(m.text, files, m.at).view);
             } else {
-                box.addView(ai(m.text, m.reasoning, m.thinkMs, null, m.at, false));
+                // 卡片在气泡**上方**（PRD §6.1 的线框：用户消息 → 卡片 → 思考条 → 答案）
+                if (cf != null) {
+                    View card = cf.card(m);
+                    if (card != null) box.addView(card);
+                }
+                /**
+                 * 历史消息只读重建：角标（`Msg.cites`）、档位（`Msg.effort`）、
+                 * 停止态（正文尾巴上的「（已停止）」）都是从磁盘读出来的**原样**，
+                 * 一个字都不重算 —— 重算就会算出跟当时不一样的耗时和编号。
+                 */
+                boolean stopped = m.text != null && m.text.indexOf("（已停止）") >= 0;
+                box.addView(ai(m.text, m.reasoning, m.thinkMs, m.effort, stopped,
+                    null, m.at, false, m.cites));
             }
         }
     }
@@ -465,26 +628,49 @@ final class Bubbles {
         return tv;
     }
 
-    /** 「思考 2.0s · 点开看过程」—— 11sp 胶囊，不是灰字。 */
-    private TextView thinkChip(long thinkMs, final String reasoning) {
-        TextView t = new TextView(a);
-        // 时长是"这一轮想了多久"，只活在内存里；老会话文件没这一列，就只写「思考过程」
-        String label = thinkMs > 0
-            ? String.format(Locale.ROOT, "思考 %.1fs", thinkMs / 1000.0)
+    /**
+     * 思考折叠条的**定型文案**（PRD §6.6）。
+     *
+     * <table>
+     * <tr><td>想完了 + 有档位</td><td>{@code ▸ 思考 6.2 秒 · 自动}</td></tr>
+     * <tr><td>想完了 + 老消息（没记档位）</td><td>{@code ▸ 思考 6.2 秒 · 点开看过程}</td></tr>
+     * <tr><td>被按了停止</td><td>{@code ▸ 思考 4.8 秒 · 已停止}</td></tr>
+     * <tr><td>只知道有思考、不知道多久</td><td>{@code ▸ 思考过程}</td></tr>
+     * </table>
+     *
+     * <p>档位为"自动"时**只写「自动」**，不去猜服务端实际选了哪一档 ——
+     * 那是服务端的事，界面假装知道就是在编（PRD §4 的最后一句话）。
+     */
+    static String thinkTitle(long thinkMs, String effort, boolean stopped, boolean hasReason) {
+        String head = thinkMs > 0
+            ? String.format(Locale.ROOT, "思考 %.1f 秒", thinkMs / 1000.0)
             : "思考过程";
-        if (reasoning != null && reasoning.length() > 0) label += " · 点开看过程";
-        t.setText(label);
-        t.setTextSize(Theme.T_TINY);
+        String tail = null;
+        if (stopped) tail = "已停止";
+        else if (effort != null && effort.length() > 0) tail = Caps.effortLabel(effort);
+        else if (hasReason) tail = "点开看过程";
+        return tail == null ? "▸ " + head : "▸ " + head + " · " + tail;
+    }
+
+    /** 「▸ 思考 6.2 秒 · 自动」—— 28dp 高、12sp、次要色的折叠条（点开看原文）。 */
+    private TextView thinkBar(long thinkMs, String effort, final String reasoning,
+                             boolean stopped) {
+        boolean hasReason = reasoning != null && reasoning.length() > 0;
+        TextView t = new TextView(a);
+        t.setText(thinkTitle(thinkMs, effort, stopped, hasReason));
+        t.setTextSize(Theme.T_SUB);
         t.setTextColor(Theme.TEXT_DIM);
         t.setSingleLine(true);
         t.setEllipsize(TextUtils.TruncateAt.END);
-        t.setPadding(dp(10), dp(5), dp(10), dp(5));
+        t.setGravity(Gravity.CENTER_VERTICAL);
+        t.setMinHeight(dp(28));
+        t.setPadding(dp(10), 0, dp(10), 0);
         t.setBackground(Theme.pill(Theme.SURFACE_2));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(6);
         t.setLayoutParams(lp);
-        if (reasoning != null && reasoning.length() > 0) {
+        if (hasReason) {
             t.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) { cb.onReasoning(reasoning); }
             });

@@ -150,6 +150,25 @@ public class SettingsActivity extends AppActivity {
                 cfg.setTools(!cfg.tools());
                 apply();
             } });
+        /**
+         * 下面三个是 v5「对齐官方 App」的开关。**总闸在最前面**：一出问题先关它，
+         * 整条链路（模式 / 卡片 / 引用 / 附件）就退回 v4 的单请求行为，不用改代码回滚。
+         */
+        row("check", "对齐官方 App", "关掉退回旧版单请求、只有聊天", cfg.parity() ? "开" : "关",
+            new Runnable() { public void run() {
+                cfg.setParity(!cfg.parity());
+                apply();
+            } });
+        row("edit", "自动标题", "顺手给会话起个像样的名字", cfg.titleAuto() ? "开" : "关",
+            new Runnable() { public void run() {
+                cfg.setTitleAuto(!cfg.titleAuto());
+                apply();
+            } });
+        row("copy", "网页上下文", "多轮对话里保留搜到的网页", cfg.stcReplay() ? "开" : "关",
+            new Runnable() { public void run() {
+                cfg.setStcReplay(!cfg.stcReplay());
+                apply();
+            } });
 
         head("语音");
         row("sound", "朗读", "回答念出来", cfg.speak() ? "开" : "关", new Runnable() {
@@ -221,6 +240,14 @@ public class SettingsActivity extends AppActivity {
             } });
         row("trash", "清空当前会话", "只清内容，图还在", null,
             new Runnable() { public void run() { confirmClear(); } });
+        /**
+         * 上传缓存：文档附件在本地的副本（`cache/uploads/`）。
+         *
+         * 正常情况下**上传成功就自己删了**（只留 `file_id`），这里显示的是
+         * "还没传完 / 传失败了"的那些 —— 但用户会看到它占地方，所以给一个清空的口子。
+         */
+        row("folder", "上传缓存", "没传完的附件副本", uploadCacheBrief(),
+            new Runnable() { public void run() { clearUploadCache(); } });
         row("wifi", "局域网", "关了只能插数据线连",
             cfg.lanOn() ? "开 · " + lanIp() + ":4444" : "关",
             new Runnable() { public void run() { lanDialog(); } });
@@ -238,7 +265,7 @@ public class SettingsActivity extends AppActivity {
             new Runnable() { public void run() { portable(); } });
 
         head("关于");
-        row("gear", "接口", null, shortModel() + " · " + (cfg.direct() ? "key 已填" : "还没填 key"),
+        row("gear", "接口", apiSub(), shortModel() + " · " + (cfg.direct() ? "key 已填" : "还没填 key"),
             new Runnable() { public void run() { apiDialog(); } });
         row("check", "版本", "端口 4444", BuildConfig.version(this), null);
         row("copy", "许可", "Apache-2.0 · 第三方署名", "查看",
@@ -637,6 +664,43 @@ public class SettingsActivity extends AppActivity {
     }
 
     private String shortModel() { return cfg.apiModel().replace("deepseek-", ""); }
+
+    /**
+     * 「接口」那一行的副标题：只有 pro 才有话说。
+     *
+     * 为什么要写出来：`deepseek-v4-pro` **不看图、不读文件**，而这两件事恰恰是这个 App
+     * 最常用的两件事。不写在这儿，用户切过去之后只会觉得"它坏了"。
+     */
+    private String apiSub() {
+        return Caps.isPro(cfg.apiModel()) ? "pro：不看图、不读文件" : null;
+    }
+
+    /** 上传缓存现在占多少（`cache/uploads/` 里那些没传完的副本）。 */
+    private String uploadCacheBrief() {
+        long n = Uploads.sizeOnDisk(this);
+        return n <= 0 ? "空" : Uploads.humanSize(n);
+    }
+
+    /** 清上传缓存（手动 = 不管多新都删）。 */
+    private void clearUploadCache() {
+        final long before = Uploads.sizeOnDisk(this);
+        if (before <= 0) { toast("缓存是空的"); return; }
+        new AlertDialog.Builder(this)
+            .setTitle("清理上传缓存？")
+            .setMessage("现在占 " + Uploads.humanSize(before) + "。\n\n"
+                + "这些是还没传完的附件副本。已经传成功的不受影响"
+                + "（它们只留一个文件号，原文件本来就已经删了）。\n"
+                + "清掉之后，正在等重试的那几个需要重新选一次文件。")
+            .setPositiveButton("清理", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int which) {
+                    int n = Uploads.sweep(SettingsActivity.this, true);
+                    toast(n > 0 ? "清了 " + n + " 个 · " + Uploads.humanSize(before) : "没有可清的");
+                    rebuild();
+                }
+            })
+            .setNegativeButton("算了", null)
+            .show();
+    }
 
     // ---------------------------------------------------------------- 各对话框
 
@@ -1093,8 +1157,10 @@ public class SettingsActivity extends AppActivity {
         col.addView(model);
 
         TextView tip = new TextView(this);
-        tip.setText("填了 key 才能用。模型默认 deepseek-v4-flash"
-            + "（旧名 deepseek-chat 已弃用，会自动映射到非思考模式）。");
+        tip.setText("填了 key 才能用。默认模型 " + Config.DEFAULT_MODEL
+            + "（能看图、能读文件）。\n"
+            + "填 " + Caps.MODEL_PRO + " 的话：不看图、不读文件 —— 换来的是更细的推理。\n"
+            + "旧名 deepseek-chat / deepseek-reasoner 已于 2026-07-24 弃用，会自动迁到新默认。");
         tip.setTextColor(Theme.TEXT_DIM);
         tip.setTextSize(Theme.T_TINY);
         tip.setPadding(0, dp(8), 0, 0);

@@ -119,6 +119,22 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     private final java.util.concurrent.ExecutorService sumQ =
         java.util.concurrent.Executors.newSingleThreadExecutor();
 
+    /**
+     * 标题轻请求专用线程。
+     *
+     * 为什么单独一条：它最多等 3 秒，但**绝不能在对话线程里等**（用户会以为 App 卡了），
+     * 也不能和摘要抢（摘要要几秒，标题就排到天荒地老）。
+     */
+    private final java.util.concurrent.ExecutorService titleQ =
+        java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    /**
+     * 用户在这个会话里**上一次选的模式**的缓存位置 —— 见 {@link Config#modeOf}。
+     *
+     * v5 已经把它挪进 Config（按会话记忆、`parity` 关掉自动退回聊天），
+     * 所以这里**不再保留任何字段**：少一份状态，少一类"界面与请求不一致"的 bug。
+     */
+
     /** 逐轮状态（`look` 的幂等与"这一轮那张图"）。 */
     private int lookCount;
     private Tools.Look lastLook;
@@ -213,8 +229,46 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
          */
         void onReply(String text, String reasoning, long thinkMs,
                      java.util.List<String> imageFiles, long at);
+
+        /**
+         * 一轮回答的完整元数据（引用 / 搜索步骤 / 服务端标题 / usage）。
+         *
+         * <p>**默认实现转发到老签名** —— 这样 {@link CallActivity} 那些只关心
+         * "说了什么"的实现一行都不用改；{@link MainActivity} 覆盖这个版本，
+         * 才能拿到角标与搜索卡片。
+         *
+         * <p>放在 {@code EyeService} 而不是 UI：T2 生产、T3 消费，中间隔着一个
+         * {@link Proto.Reply} 合同，谁也不认识谁。
+         */
+        default void onReply(Proto.Reply r, java.util.List<String> imageFiles, long at) {
+            onReply(r == null ? "" : r.text,
+                    r == null ? "" : r.reasoning,
+                    r == null ? 0 : r.thinkMs,
+                    imageFiles, at);
+        }
+
         /** 流式增量：界面把它追加到"正在说"的气泡后面。 */
         void onDelta(String text);
+
+        /**
+         * 服务端工具的一步（联网模式的"搜索卡片"）。
+         *
+         * 默认空实现：通话页与老的 {@code CallActivity} 不关心卡片，一行都不用改；
+         * 会话页覆盖它才能实时画"正在搜… → 3 个来源"。
+         */
+        default void onStep(Proto.Step s) { }
+
+        /**
+         * 思考增量（`reasoning_content` 的一段）。
+         *
+         * 默认空实现：只有画"思考折叠条"的界面才需要。逐段到达，界面自己拼；
+         * 不知道拼什么也行 —— {@link #onThinkDone} 的时长足够画"想了 6.2 秒"。
+         */
+        default void onThink(String delta) { }
+
+        /** 思考结束（第一次吐正文时，只回调一次）：`ms` 是净思考时间。 */
+        default void onThinkDone(long ms) { }
+
         /** 这一轮的增量作废（模型改主意去调工具了），界面撤掉临时气泡。 */
         void onRoundReset();
         /**
@@ -234,6 +288,41 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     void setUi(Ui u) { uiSink = u; }
 
     void setPreviewSink(PreviewSink p) { previewSink = p; }
+
+    /** 界面顶栏的喇叭：落盘 + 关掉时立刻停掉正在说的那句。 */
+    void setSpeak(boolean on) {
+        if (cfg != null) cfg.setSpeak(on);
+        if (!on && speaker != null) speaker.shutUp();
+        notifyState();
+    }
+
+    /** 当前上下文估算 token（按最坏情况：图全带）。给顶栏圆环用。 */
+    int contextTokens() {
+        synchronized (history) {
+            int n = 0;
+            for (Conv.Msg m : history) n += Conv.tokensOf(m, true);
+            return n;
+        }
+    }
+
+    int contextBudget() { return cfg == null ? 0 : cfg.ctxTokens(); }
+
+    // ---- 拍照弹层要的镜头/手电（相机借用由弹层自己持有） ----
+    boolean cameraFront() { return engine != null && engine.isFront(); }
+    boolean torchOn() { return engine != null && engine.isTorch(); }
+    boolean hasFlash() { return engine != null && engine.hasFlash(); }
+
+    void flipCamera() {
+        ensureEngine("切换摄像头");
+        CameraEngine e = engine;
+        if (e != null) e.flip();
+    }
+
+    void setTorch(boolean on) {
+        ensureEngine("手电筒");
+        CameraEngine e = engine;
+        if (e != null) e.setTorch(on);
+    }
 
     String lastLine() { return lastLine; }
 
@@ -679,6 +768,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         try { if (current != null) current.cancel(); } catch (Throwable ignored) { }
         try { asks.shutdownNow(); } catch (Throwable ignored) { }
         try { sumQ.shutdownNow(); } catch (Throwable ignored) { }
+        try { titleQ.shutdownNow(); } catch (Throwable ignored) { }
         try { filePoll.interrupt(); } catch (Throwable ignored) { }
         try { http.stop(); } catch (Throwable ignored) { }
         try { if (engine != null) engine.stop(); } catch (Throwable ignored) { }
@@ -807,9 +897,30 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         int budget = Math.max(1_500, cfg.ctxTokens() - overhead);
         // 轮数闸已删：`Conv.trim` 的 maxTurns 恒传"不限"，真正管事的只有预算。
         java.util.List<Conv.Msg> kept = Conv.trim(all, Config.TURNS_UNLIMITED, budget);
+        /**
+         * **stc 优先降级**：先摘掉"非最近一轮"的 `server_tool_calls`，摘完还不够才丢整轮。
+         *
+         * 为什么单独一步：`server_tool_calls` 会随轮数线性膨胀（每轮读 N 页的加密正文），
+         * 一旦超预算就整轮丢掉，等于"刚问的第 3 条突然记不住了"。
+         */
+        Conv.trimStc(kept, budget);
         java.util.List<Conv.Out> out = Conv.render(kept, cfg.imgWindow(), new Conv.Reader() {
             public byte[] read(String file) { return ConvStore.readImage(file); }
         });
+        /**
+         * 把 sidecar 里的 `server_tool_calls` 原文填回每一条 Out。
+         *
+         * `Conv` 不碰磁盘（它要能在电脑 JVM 上离线测），所以这一步只能在服务里做。
+         * `render` 是 1:1 映射，下标可以对齐。只有 `stcRef` 非空才读文件 ——
+         * 没搜过的那几轮零 IO。
+         */
+        String cid = convId();
+        for (int i = 0; i < kept.size() && i < out.size(); i += 1) {
+            Conv.Msg m = kept.get(i);
+            if (m == null || m.stcRef == null) continue;
+            Conv.Out o = out.get(i);
+            if (o != null) o.stcJson = ConvStore.readStc(cid, m.at);
+        }
         String sum = convSummary;
         if (cfg.summary() && sum != null && sum.length() > 0) {
             out.add(0, new Conv.Out("user", "[前情摘要 · 更早的对话已压缩]\n" + sum));
@@ -856,6 +967,23 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      */
     private java.util.List<String> rememberTurn(String you, String me, String reasoning,
                                                 long thinkMs, java.util.List<Tools.Look> shots) {
+        return rememberTurn(you, me, reasoning, thinkMs, shots, null, null);
+    }
+
+    /**
+     * 记一轮（v5 完整版）：除了正文与思考，还把**模式 / 档位 / 附件 / 引用 / 搜索步骤 /
+     * server_tool_calls** 一起落盘。
+     *
+     * 为什么这些要落盘而不能只留在内存：会话是"关掉再打开还得在"的东西。
+     * 尤其 `server_tool_calls` —— 它是下一轮联网追问的**唯一凭据**（不带就 400），
+     * 而它有几十 KB（`signature` 是加密页面正文），所以进 sidecar，不进 TSV。
+     *
+     * @param docs 这一轮带出去的文档（`file_id` 已上传成功；`null` = 没文档）
+     * @param rep  这一轮的完整结果（`null` = 老路径，只记正文与思考）
+     */
+    private java.util.List<String> rememberTurn(String you, String me, String reasoning,
+                                                long thinkMs, java.util.List<Tools.Look> shots,
+                                                java.util.List<Conv.Att> docs, Proto.Reply rep) {
         java.util.List<String> out = new java.util.ArrayList<>();
         lastAssistantAt = 0;
         if (cfg == null) return out;
@@ -863,7 +991,8 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         //    于是"只发图"的那一轮重进会话就没了（气泡在屏幕上，但磁盘上没有）。
         String mineText = you == null ? "" : you;
         boolean noImg = shots == null || shots.isEmpty();
-        if (mineText.length() == 0 && noImg) return out;
+        boolean noDoc = docs == null || docs.isEmpty();
+        if (mineText.length() == 0 && noImg && noDoc) return out;
         String id = convId();
         long now = System.currentTimeMillis();
         Conv.Msg u = Conv.Msg.user(now, mineText);
@@ -889,12 +1018,33 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         lastAssistantAt = a.at;
         a.withReasoning(reasoning);
         a.thinkMs = thinkMs;
+
+        // ── v5 元数据（全部可空：老路径一个字都不变）──────────────────────
+        Caps.Mode mode = rep == null ? null : rep.mode;
+        if (mode == null) mode = cfg.modeOf(id);
+        u.mode = mode;
+        a.mode = mode;
+        a.effort = rep == null ? null : rep.effort;
+        // 附件挂在 user 那一侧：它属于"我发了什么"，不属于回答
+        if (!noDoc) u.atts = new java.util.ArrayList<Conv.Att>(docs);
+        if (rep != null) {
+            a.cites = rep.cites;
+            a.steps = stepsLine(rep.steps);
+            a.titleGen = rep.title != null && rep.title.length() > 0;
+        }
+
         synchronized (history) {
             history.add(u);
             history.add(a);
             // 内存镜像的上限。以前是 400 条，那等于"上下文最多 200 轮" —— 预算调到 300k 以上时
             // 这条成了真瓶颈（用户看到的"怎么还是记不住"其实是这里在丢）。给到 2000 条。
             while (history.size() > 2000) history.remove(0);
+        }
+        // ⚠️ **先写 sidecar 再 append**：append 会把 `stcRef` 写进 TSV，
+        //    两行要是顺序反了，磁盘上就会出现"指向一个还没写出来的文件"的引用。
+        if (rep != null && rep.stcJson != null && rep.stcJson.length() > 0) {
+            ConvStore.writeStc(id, a.at, rep.stcJson);
+            a.stcRef = a.at + "-stc.json";
         }
         ConvStore.append(id, u);
         ConvStore.append(id, a);
@@ -1047,6 +1197,25 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
          * 以前是在 UI 线程算的 —— 通话页点一下发送会顿一下。
          */
         boolean buffered;
+        /**
+         * 这一轮的模式（null = 沿会话记忆，见 {@code modeFor}）。
+         *
+         * 为什么放这里而不是只读设置：`/ask` 那条 HTTP 路、自动看、通话页开口
+         * 三个入口都可能想指定模式（"这一条就是要联网"），而设置里记的是"默认"。
+         */
+        Caps.Mode mode;
+        /** 这一轮带的文档附件（已上传成功的那些）。null/空 = 没文档。 */
+        java.util.List<Conv.Att> atts;
+        /** 这一轮的档位（null = 用设置里的）。 */
+        String effort;
+        /**
+         * 这一轮的联网开关。**null = 用 `Config` 里按会话记的那个**（{@code webFor}）。
+         *
+         * 和 {@link #mode} 是两个维度：模式管"动手 / 服务端搜索"，这个管"要不要外部信息"。
+         * `Agent + web=true` = **混合模式**（多一个 `web_search` function，内部再发一次纯搜索请求）；
+         * `聊天 + web=true` 归一成原来的「联网」模式。
+         */
+        Boolean web;
     }
 
     /**
@@ -1081,10 +1250,26 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      * 走工具的话模型可能压根不调，用户会觉得图白发了。
      */
     void sendWithImages(String text, java.util.List<byte[]> images) {
+        send(text, images, null);
+    }
+
+    /**
+     * 图 + 文档一起发（文档 = 已经上传成功的那些 `Conv.Att`）。
+     *
+     * 为什么图与文档分两条路：图走 `image_url` 内联 base64，文档走
+     * `{"type":"file","file_id":…}` 引用 —— **文档不重传**，`file_id` 在会话里永久可用，
+     * 所以多轮追问同一份 PDF 不会再花一次上传的时间和流量。
+     *
+     * @param atts 可为 null/空（= 老行为，只有图或纯文字）
+     */
+    void send(String text, java.util.List<byte[]> images, java.util.List<Conv.Att> atts) {
         Turn t = new Turn();
         t.text = text;
-        t.shots = albumShots(images);
-        t.attach = true;
+        if (images != null && !images.isEmpty()) {
+            t.shots = albumShots(images);
+            t.attach = true;
+        }
+        if (atts != null && !atts.isEmpty()) t.atts = new java.util.ArrayList<Conv.Att>(atts);
         send(t);
     }
 
@@ -1165,6 +1350,38 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         // 用户又开口了 = 上一句别念了（在线音色是排队异步的，不掐会一句句追着念完）
         if (speaker != null) speaker.shutUp();
         pendingUser = t;
+        Caps.Mode m0 = modeFor(turn);
+        final boolean webOn = webFor(turn);
+        // 「聊天 + 联网」就是原来的联网模式；Agent + 联网 交给 Caps.plan 变混合模式
+        if (webOn && m0 == Caps.Mode.CHAT) m0 = Caps.Mode.WEB;
+        final Caps.Mode mode = m0;
+        final java.util.List<Conv.Att> docs = turn.atts;
+        /**
+         * **请求形状在这里定一次**（{@link Caps#plan} 是唯一决定点）。
+         *
+         * `titleSupported=true`：T0 探针 1 已证明 `/chat/completions` 认 `title`，
+         * 联网模式随本轮带，标题不用再多付一次轻请求。
+         * `allowDocsInWeb`：T0 探针 2 证明 `file` 块与 `deepseek_web_search` 可同请求，
+         * 所以这个开关默认可以放开（真出问题改设置就能关，不用改代码）。
+         *
+         * `webOn`（8 参版）：`Agent + true` → `hybrid=true`（多发一个 `web_search` function）；
+         * `聊天 + true` 上面已经归一成 WEB；`WEB` 不受它影响（本来就是联网）。
+         */
+        final Caps.Plan plan = Caps.plan(mode,
+            turn.effort == null ? cfg.think() : turn.effort,
+            cfg.apiModel(),
+            docs != null && !docs.isEmpty(),
+            hasUrl(t),
+            true,
+            cfg.allowDocsInWeb(),
+            webOn);
+        if (plan.blocked()) {
+            // 模式闸（"联网 + 文档"这类）：**一个字节都不发**，直接给文案
+            EyeLog.w("plan", "BLOCKED " + plan.toString());
+            notifyError(Err.text(plan.blocked));
+            return;
+        }
+        EyeLog.w("plan", plan.toString() + " q=" + head(t, 30));
         final Asker asker = new Asker(cfg, this);
         current = asker;
         busyRound = true;
@@ -1214,10 +1431,25 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
                 }
                 final java.util.List<byte[]> jpegs = attached ? jpegsOf(shots) : null;
                 final java.util.List<Conv.Out> ctx = contextFor();
-                asker.ask(askText, jpegs, ctx, new Asker.Cb() {
+                asker.ask(askText, jpegs, docs, ctx, plan, new Asker.Cb() {
                     public void onTool(String name, String phase, String detail) {
                         Ui u = uiSink;
                         if (u != null) u.onTool(name, phase, detail);
+                    }
+
+                    public void onStep(Proto.Step s) {
+                        Ui u = uiSink;
+                        if (u != null) u.onStep(s);
+                    }
+
+                    public void onThink(String d) {
+                        Ui u = uiSink;
+                        if (u != null) u.onThink(d);
+                    }
+
+                    public void onThinkDone(long ms) {
+                        Ui u = uiSink;
+                        if (u != null) u.onThinkDone(ms);
                     }
 
                     public void onDelta(String d) {
@@ -1239,34 +1471,66 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
                         busyRound = false;
                         String body = partial == null ? "" : partial.trim();
                         String out = body.length() == 0 ? "（已停止）" : body + "\n\n（已停止）";
+                        Proto.Reply stop = Asker.reply(cfg, out, null, 0, plan, null, null, null,
+                            null, false, true, 0, 0);
                         java.util.List<String> files =
-                            rememberTurn(pendingUser, out, null, 0, discardOr(shots));
+                            rememberTurn(pendingUser, out, null, 0, discardOr(shots), docs, stop);
                         lastLook = null;
                         Ui u = uiSink;
-                        if (u != null) u.onReply(out, null, 0, files, lastAssistantAt);
+                        if (u != null) u.onReply(stop, files, lastAssistantAt);
                         EyeLog.w("ask", "停止后落盘 " + out.length() + " 字");
                     }
 
                     public void onText(String out, String reasoning, long thinkMs) {
+                        // 老签名兜底（正常情况下走 onReply）
+                        onReply(Asker.reply(cfg, out, reasoning, thinkMs, plan, null, null, null,
+                            null, false, false, 0, 0));
+                    }
+
+                    /**
+                     * 一轮的完整结果。**这是 v5 的正路。**
+                     *
+                     * 三件事按顺序做，顺序错了会出怪现象：
+                     *   1. 先判"这一轮是不是被打断了"（作废的答案绝不能落盘）；
+                     *   2. 拒答（`finish_reason=content_filter`）**不落盘正文**（ARCH §7.2），
+                     *      否则下一轮它会看见自己"说过"这段被禁的话；
+                     *   3. 落盘 → 通知界面 → 起标题轻请求。
+                     */
+                    public void onReply(Proto.Reply rep) {
                         if (current != asker) return;      // 被打断了：这条答案作废
                         busyRound = false;
-                        if (pendingAuto) {
-                            pendingAuto = false;
-                            if (looksLikeNoop(out)) {
+                        boolean auto = pendingAuto;
+                        pendingAuto = false;
+                        if (rep == null) return;
+                        if (auto) {
+                            if (!rep.refused && looksLikeNoop(rep.text)) {
                                 // 自己看了一眼，没什么可说的：**不落盘也不念**
                                 // 记下被吞掉的原话：不然"它到底说了什么"事后查不到
-                                EyeLog.w("auto", "没什么变化 → 这一轮丢弃（不念不落盘）：" + head(out, 40));
+                                EyeLog.w("auto", "没什么变化 → 这一轮丢弃（不念不落盘）："
+                                    + head(rep.text, 40));
                                 Ui u = uiSink;
                                 if (u != null) u.onQuiet();
                                 return;
                             }
                         }
-                        java.util.List<String> files =
-                            rememberTurn(pendingUser, out, reasoning, thinkMs, discardOr(shots));
+                        if (rep.refused) {
+                            // 拒答：正文一个字都不落盘，也不念
+                            EyeLog.w("ask", "被拒答（finish=content_filter），不落盘正文");
+                            Ui u = uiSink;
+                            if (u != null) {
+                                u.onReply(rep, null, 0);
+                                u.onError(Err.text(Err.Code.CONTENT_RISK));
+                            }
+                            lastLook = null;
+                            return;
+                        }
+                        java.util.List<String> files = rememberTurn(pendingUser, rep.text,
+                            rep.reasoning, rep.thinkMs, discardOr(shots), docs, rep);
                         lastLook = null;
                         Ui u = uiSink;
-                        if (u != null) u.onReply(out, reasoning, thinkMs, files, lastAssistantAt);
-                        answerLine(out);
+                        if (u != null) u.onReply(rep, files, lastAssistantAt);
+                        answerLine(rep.text);
+                        afterReply(rep);
                     }
 
                     public void onFail(String reason) {
@@ -1281,6 +1545,143 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
         }); } catch (Throwable e) {
             EyeLog.w("ask", "提交失败（服务在退出？）: " + e);
         }
+    }
+
+    // ---------------------------------------------------------------- 模式 / 标题
+
+    /**
+     * 这一轮用什么模式。
+     *
+     * 优先级：`Turn.mode`（调用方显式指定）→ **`cfg.mode()`（按会话记忆，Config 存的）**。
+     *
+     * ⚠️ 这里刻意**不自己存一份**：T1 的 `Config.modeOf(convId)` 已经是"按会话记忆"的
+     * 唯一真相（`parity()` 关掉时它自己就返回 CHAT）。两边各存一份，迟早不同步 ——
+     * 界面显示"联网"、请求却按"聊天"发，那种 bug 极难查。
+     */
+    private Caps.Mode modeFor(Turn turn) {
+        if (turn != null && turn.mode != null) return turn.mode;
+        return cfg == null ? Caps.Mode.CHAT : cfg.mode();
+    }
+
+    /**
+     * 这一轮联网开着没有。
+     *
+     * 优先级：`Turn.web`（调用方显式指定，比如 `/ask?web=1`）→ `Config` 按会话记的那个。
+     * 和 {@link #modeFor} 同样的道理：**不在这里存第二份**，真相只有 Config 一个。
+     */
+    private boolean webFor(Turn turn) {
+        if (turn != null && turn.web != null) return turn.web.booleanValue();
+        return cfg != null && cfg.web();
+    }
+
+    /** 界面切联网开关（T3 的 CapRow 点 chip）。落 Config，按会话记。 */
+    void setWeb(boolean on) {
+        if (cfg == null) return;
+        cfg.setWeb(on);
+        notifyState();
+    }
+
+    /** 当前会话的联网开关（界面画胶囊用）。 */
+    boolean webNow() {
+        return cfg != null && cfg.web();
+    }
+
+    /** 界面切模式（T3 的 CapRow 点 chip）。落 Config，按会话记。 */
+    void setMode(Caps.Mode m) {
+        if (cfg == null) return;
+        cfg.setMode(m);
+        notifyState();
+    }
+
+    /** 当前会话的模式（界面画胶囊用）。 */
+    Caps.Mode modeNow() {
+        if (cfg == null) return Caps.Mode.CHAT;
+        return cfg.mode();
+    }
+
+    /** 这句话里有没有链接（联网模式决定要不要带 `deepseek_read_url`）。 */
+    static boolean hasUrl(String s) {
+        if (s == null || s.length() == 0) return false;
+        String low = s.toLowerCase(java.util.Locale.ROOT);
+        return low.contains("http://") || low.contains("https://") || low.contains("www.");
+    }
+
+    /**
+     * 一轮落地之后的收尾（标题）。
+     *
+     * 两条路（互不冲突）：
+     *   1. 联网模式服务端**已经给了** `title` → 直接改名（零成本，白给的）；
+     *   2. 其余情况走**独立轻请求** —— 但只在"这个会话还只有这一轮"时发，
+     *      否则每答一次就付一次标题钱。
+     *
+     * 任何失败都**不弹错误**（标题不是功能）。
+     */
+    private void afterReply(Proto.Reply rep) {
+        if (cfg == null || !cfg.titleAuto() || rep == null) return;
+        final String id = convId();
+        if (id == null || id.length() == 0) return;
+        if (rep.title != null && rep.title.length() > 0) {
+            String t = Brain.clean(rep.title);
+            if (t != null) {
+                ConvStore.renameGenerated(id, t);
+                notifyState();
+                return;                       // 服务端给了就别再花钱
+            }
+        }
+        if (ConvStore.titleLocked(id)) return;
+        final String q = pendingUser;
+        final String a = rep.text;
+        if (q == null || q.trim().length() == 0) return;
+        // 只有首轮值得起标题：`load` 里有 4 条以上就说明不是新会话了
+        try {
+            if (ConvStore.load(id).size() > 2) return;
+        } catch (Throwable ignored) { }
+        try {
+            titleQ.submit(new Runnable() {
+                public void run() {
+                    String t = Brain.title(cfg, q, a);
+                    if (t == null || t.length() == 0) return;   // 失败静默
+                    ConvStore.renameGenerated(id, t);
+                    notifyState();
+                }
+            });
+        } catch (Throwable e) {
+            EyeLog.w("title", "提交失败: " + e);
+        }
+    }
+
+    /**
+     * 步骤压成卡片那一行：`3 步 · 2.4s · 4 源`。
+     *
+     * 三段都能缺：只有一步时是 `1 步`；没有来源时不出"· 0 源"（写 0 比不写更难看）。
+     * 时长取**第一条与最后一条事件的时间差** —— 那是用户真正等的那段，不含排队。
+     * 落盘后历史卡片直接显示这一行，不重算（结构化数据仍在 `Proto.Reply.steps`）。
+     */
+    static String stepsLine(java.util.List<Proto.Step> steps) {
+        if (steps == null || steps.isEmpty()) return null;
+        // 一次调用 = 一对事件（started + completed），所以"步数"要数 call_started
+        int calls = 0;
+        int sources = 0;
+        long first = 0;
+        long last = 0;
+        for (Proto.Step s : steps) {
+            if (s == null) continue;
+            if ("call_started".equals(s.type)) calls += 1;
+            if (s.sources > sources) sources = s.sources;
+            if (s.at > 0) {
+                if (first == 0) first = s.at;
+                last = s.at;
+            }
+        }
+        if (calls == 0) calls = steps.size();
+        StringBuilder b = new StringBuilder(24);
+        b.append(calls).append(" 步");
+        long ms = last > first ? last - first : 0;
+        if (ms >= 100) {
+            b.append(" · ").append(String.format(java.util.Locale.ROOT, "%.1fs", ms / 1000.0));
+        }
+        if (sources > 0) b.append(" · ").append(sources).append(" 源");
+        return b.toString();
     }
 
     /** 这一轮没带图、但模型中途 `look` 过：把那张挂在问句上（和以前一样）。 */
@@ -1454,6 +1855,12 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
     }
 
     int workspaceCount() { return Workspace.count(); }
+
+    @Override public String replace(String path, String oldText, String newText, boolean all) {
+        String r = Workspace.replace(path, oldText, newText, all);
+        notifyState();
+        return r;
+    }
 
     @Override public String memRead(String name) {
         String n = Tools.safeName(name);

@@ -78,6 +78,13 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         final List<byte[]> images;
         /** 落盘路径（气泡里显示的那几张）。 */
         final List<String> files;
+        /**
+         * 这一轮带的**文档附件**（已上传成功、有 `file_id` 的那些）。
+         *
+         * 和 `images` 分开放的：图走 base64 内联，文档走 `{"type":"file","file_id":…}`
+         * 引用，两条完全不同的请求形状 —— 混在一个 list 里只会让下游到处判类型。
+         */
+        List<Conv.Att> atts;
 
         Out(String text, List<byte[]> images, List<String> files) {
             this.text = text == null ? "" : text;
@@ -86,6 +93,11 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         }
 
         Out(String text) { this(text, null, null); }
+
+        /** 有没有真的带内容（只发一个 PDF 也必须算"有内容"）。 */
+        boolean hasBody() {
+            return !images.isEmpty() || (atts != null && !atts.isEmpty());
+        }
     }
 
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -97,8 +109,45 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
 
     private ToolChip toolChip;
 
+    /**
+     * 输入框上方那一排能力胶囊（🛰 联网 / 🧠 自动 / ⚙ Agent）。
+     *
+     * <p>**三态互斥由它保证**（`Caps.Mode` 是同一个枚举），落盘在 `Config`，
+     * 界面只做"读出来 → 显示 → 用户点了 → 存回去"。
+     */
+    private CapRow caps;
+
     private ChatInputBar bar;
     private Bubbles bubbles;
+
+    /** 这一轮的过程卡（联网 → 搜索卡；Agent → 步骤条）。同一时刻最多一张。 */
+    private Cards.SearchCard searchCard;
+    private Cards.Steps stepsCard;
+    /** 这一轮发出去时的模式与档位（**发送那一刻**的快照，中途改胶囊不影响本轮）。 */
+    private Caps.Mode sendingMode = Caps.Mode.CHAT;
+    private String sendingEffort = Caps.EFF_AUTO;
+    /**
+     * 这一轮发出去时**联网开着吗**。
+     *
+     * <p>必须单独记：`sendingMode == AGENT` 时它可能是"纯 Agent"也可能是"混合"，
+     * 一个枚举分不出来。混合模式 = `sendingMode == AGENT && sendingWeb`。
+     */
+    private boolean sendingWeb;
+    /**
+     * 这一轮的过程卡已经收尾了。
+     *
+     * <p>收尾之后再来的步骤事件**不许再建卡** —— 否则一条迟到的 `call_completed`
+     * 会在答案下面凭空长出一张新的"进行中"卡片，永远不结束。
+     */
+    private boolean roundClosed = true;
+
+    /**
+     * 刚收到一条"拒答"回答，正在等紧随其后的 `onError`（它带官方文案）。
+     *
+     * <p>用来保证**同一个拒答只出现一条提示**：`onReply` 先留白，`onError` 到了就由它说，
+     * 600ms 没到才自己补。
+     */
+    private boolean pendingRefuse;
 
     /** "正在想…"那条临时气泡（拿到回答就换掉）。 */
     private View thinkingRow;
@@ -113,6 +162,8 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
     private boolean loaded;
     /** 上一次发出去的东西（失败气泡的「重试」要它）。 */
     private Out lastOut;
+    /** 最近一轮的完整结果（用量弹窗用）。 */
+    private Proto.Reply lastReply;
     /**
      * 最后一条**用户气泡**。
      *
@@ -187,6 +238,9 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         // 这时候 peek() 往往还是 null —— 800ms / 2000ms 后再挂两次。
         ui.postDelayed(new Runnable() { public void run() { bind(); } }, 800);
         ui.postDelayed(new Runnable() { public void run() { bind(); } }, 2000);
+        // 从设置页换了模型/开关回来：文件入口的死活要跟着变（pro 不能读文件）
+        refreshDocGate();
+        refreshUsage(null);
     }
 
     @Override
@@ -207,8 +261,83 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         EyeService s = EyeService.peek();
         if (s == null) return;
         s.setUi(this);
+        syncCaps();
         onState();
         if (!loaded) { loaded = true; reload(); }
+    }
+
+    // ---------------------------------------------------------------- 能力胶囊
+
+    /**
+     * 把 `Config` 里记的两个开关与档位推进胶囊（进页面、切会话、服务起来之后都要同步一次）。
+     *
+     * <p>**两个开关都要读**：只读 `modeOf` 会把混合模式读成"纯 Agent"（联网那个开丢掉了），
+     * 于是重进会话时界面上少亮一个胶囊、请求也不带搜索，用户会以为设置丢了。
+     */
+    private void syncCaps() {
+        if (caps == null) return;
+        try {
+            Config c = new Config(this);
+            String id = c.convId();
+            caps.setCaps(c.webOf(id), c.modeOf(id) == Caps.Mode.AGENT);
+            caps.setEffort(c.think());
+        } catch (Throwable e) {
+            EyeLog.w("ui", "读模式失败 " + e);
+        }
+    }
+
+    /**
+     * 用户改了联网 / Agent 的开关。
+     *
+     * <p>**只做三件事**：按会话存进 `Config`（两个键：`mode` + `web`）、刷新顶栏副标题、
+     * 重算文件入口的死活。真正的请求形状由 `Caps.plan(...)` 在发送时决定 ——
+     * 界面绝不在这里写"联网就带什么工具"这种判断（ARCH §9 第 2 条）。
+     *
+     * <p>为什么 mode 与 web 要**同时**写：`mode` 只有三档（聊/联/Agent），表达不了混合；
+     * `web` 是那个多出来的布尔。两者不一起写就会出现"mode=AGENT 但 web 丢了"的半截状态。
+     */
+    private void applyCaps(boolean web, boolean agent) {
+        try {
+            Config c = new Config(this);
+            String id = c.convId();
+            c.setMode(id, agent ? Caps.Mode.AGENT : (web ? Caps.Mode.WEB : Caps.Mode.CHAT));
+            c.setWeb(id, web);
+        } catch (Throwable e) {
+            EyeLog.w("ui", "存模式失败 " + e);
+        }
+        if (topBar != null) topBar.setSubtitle(subLine());
+        // 切到"不能读文件"的模式/模型 → 文件入口立刻置灰（别让用户白传 100MB 再被拒）
+        refreshDocGate();
+    }
+
+    /** 用户切了档位（全局偏好，不按会话记）。 */
+    private void applyEffort(String e) {
+        try {
+            Config c = new Config(this);
+            c.setThink(e);
+        } catch (Throwable ex) {
+            EyeLog.w("ui", "存档位失败 " + ex);
+        }
+        if (topBar != null) topBar.setSubtitle(subLine());
+    }
+
+    /** 当前会话 id（胶囊/卡片的偏好都按它记）。 */
+    private String convId() {
+        try {
+            return new Config(this).convId();
+        } catch (Throwable e) {
+            return "";
+        }
+    }
+
+    /**
+     * 给 T4（附件入口）用的只读把手。
+     *
+     * <p>联网模式下**文档入口要置灰**、并且拦在"上传之前"（别让用户白传 100MB
+     * 再被 `Caps.plan` 拒掉）。`ChatInputBar` 需要知道当前模式，通过这里读。
+     */
+    CapRow capsRow() {
+        return caps;
     }
 
     // ---------------------------------------------------------------- 界面骨架
@@ -228,7 +357,11 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
             public void onMenu() { openConvList(); }
             public void onVideo() { openCall(); }
             public void onGear() { openSettings(); }
+            public void onSpeak() { toggleSpeak(); }
+            public void onUsage() { openUsage(); }
         });
+        topBar.setSpeak(new Config(this).speak());
+        refreshUsage(null);
         col.addView(topBar, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -259,6 +392,19 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         col.addView(toolChip, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        /**
+         * 能力胶囊行：插在 `ToolChip` 之下、输入栏之上（PRD §6.1 的线框）。
+         *
+         * 为什么不放在 `ToolChip` 上面：那条是"正在干活"的状态条，离输入栏越近越容易
+         * 被当成按钮；反过来，胶囊是**这一轮怎么发**的开关，紧贴输入栏才符合手指的预期。
+         */
+        caps = new CapRow(this, new CapRow.Cb() {
+            public void onCaps(boolean web, boolean agent) { applyCaps(web, agent); }
+            public void onEffort(String e) { applyEffort(e); }
+        });
+        col.addView(caps, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         bar = new ChatInputBar(this);
         bar.setOnSend(new ChatInputBar.SendListener() {
             public boolean onSend(String text, List<ChatInputBar.Pick> picks) {
@@ -267,11 +413,29 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         });
         bar.setOnStop(new Runnable() { public void run() { stopStreaming(); } });
         bar.setOnFocus(new Runnable() { public void run() { scrollBottom(); } });
-        bar.setOnLook(new Runnable() { public void run() { sendLook(); } });
+        bar.setOnLook(new Runnable() { public void run() { openCamera(); } });
         col.addView(bar, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        refreshDocGate();          // 第一次：按当前模式/模型把文件入口定好死活
 
         bubbles = new Bubbles(this, this);
+        /**
+         * 角标的去处：点一下 → 底部来源面板；长按 → 直接把 URL 放进剪贴板。
+         *
+         * 回调里拿到的是**那条消息的完整引用列表**（Span 自己抱着它），所以历史消息
+         * 重新铺出来之后照样能点开「来源 2 / 4」—— 界面不需要维护"哪条消息配哪份引用"。
+         */
+        bubbles.citeCb(new CiteSpans.Cb() {
+            public void onCite(Cites.Cite c, List<Cites.Cite> all) {
+                if (c == null) return;
+                Sheets.sources(MainActivity.this, all, c.ordinal);
+            }
+
+            public void onCiteLong(Cites.Cite c) {
+                if (c == null || c.url == null || c.url.trim().length() == 0) return;
+                copy(c.url.trim());
+            }
+        });
         stream = bubbles.stream(box);
 
         scroll.getViewTreeObserver().addOnScrollChangedListener(
@@ -352,6 +516,11 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         endStream();
         setStreaming(false);
         if (toolChip != null) toolChip.hide(null);
+        // 卡片是"这一轮的过程"，重铺之后它们由磁盘里的 `Msg.steps` 重建
+        searchCard = null;
+        stepsCard = null;
+        if (caps != null) caps.setChipEnabled(true);
+        syncCaps();
         lastUser = null;                 // 这一屏重铺了：老把手已经不在视图树里
         loaded = true;
 
@@ -366,7 +535,15 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
             showEmpty();
             return;
         }
-        bubbles.render(box, msgs, MAX_RENDER);
+        /**
+         * 历史卡片**只读重建**：`Msg.steps` 那行摘要 + `Msg.mode` 决定画 🔍 还是 ⚙。
+         * 重新算一遍耗时/步数是不允许的 —— 那会和当时屏幕上看到的不一样。
+         */
+        bubbles.render(box, msgs, MAX_RENDER, new Bubbles.CardFor() {
+            public View card(Conv.Msg m) {
+                return Cards.history(MainActivity.this, m.mode, m.steps);
+            }
+        });
         scrollBottom();
     }
 
@@ -392,39 +569,116 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
     private Out fromPicks(String text, List<ChatInputBar.Pick> picks) {
         List<byte[]> images = new ArrayList<byte[]>();
         List<String> files = new ArrayList<String>();
+        List<Conv.Att> atts = new ArrayList<Conv.Att>();
         if (picks != null) {
             for (ChatInputBar.Pick p : picks) {
                 if (p == null) continue;
+                // 文档的 bytes/path 都是 null，两个判断天然互斥：
+                // 图进 images，文档进 atts，**绝不会混**
                 if (p.bytes != null) images.add(p.bytes);
                 if (p.path != null) files.add(p.path);
+                if (p.att != null) atts.add(p.att);
             }
         }
-        return new Out(text, images, files);
+        Out o = new Out(text, images, files);
+        o.atts = atts;
+        return o;
     }
 
     /** **唯一的发送入口**。三个来源（打字 / 语音 / 相册）都收敛到这里。 */
     private boolean send(Out o) {
         if (o == null) return false;
         String t = o.text == null ? "" : o.text.trim();
-        boolean has = o.images != null && !o.images.isEmpty();
+        // ⚠️ 只发一个 PDF、不打字，也必须能发出去 —— 否则输入栏不清空、什么也不发生
+        boolean has = o.hasBody();
         if (t.length() == 0 && !has) return false;
 
         EyeService s = EyeService.peek();
         // 服务没起来时**别清输入栏** —— 让他等两秒还能接着发
         if (s == null) { toast("服务还没起来，稍等一下"); return false; }
 
-        EyeLog.w("send", "imgs=" + (has ? o.images.size() : 0) + " text=" + t.length());
+        int docs = o.atts == null ? 0 : o.atts.size();
+        EyeLog.w("send", "imgs=" + o.images.size() + " docs=" + docs + " text=" + t.length());
         clearEmpty();
         endStream();
         setStreaming(true);
+        beginRound();
         lastOut = o;
         lastUser = bubbles.userBubble(t, o.files, 0);
         box.addView(lastUser.view);
-        showThinking("正在想…");
-        if (has) s.sendWithImages(t, o.images);
+        showThinking(thinkingLabel());
+        if (has) s.send(t, o.images, o.atts);
         else s.send(t);
         scrollBottom();
         return true;
+    }
+
+    /**
+     * 「正在…」那一条的文案：**四态**（混合 / 联网 / Agent / 聊天）。
+     *
+     * <p>混合模式必须单独说一句"查 + 动手"：只说"正在动手"用户不知道它在搜，
+     * 只说"正在查"又解释不了为什么后面会连着好几个步骤。
+     */
+    private String thinkingLabel() {
+        if (sendingMode == Caps.Mode.AGENT) {
+            return sendingWeb ? "正在查 + 动手…" : "正在动手…";
+        }
+        if (sendingMode == Caps.Mode.WEB) return "正在查…";
+        return "正在想…";
+    }
+
+    /**
+     * 附件入口的闸：**当前模式/模型能不能带文档**，灌给 `ChatInputBar`。
+     *
+     * 三处调用（`bar` 建好、切模式后、`onResume` —— 从设置页改完模型回来要刷新）。
+     * 判断本身在 `Caps.plan`，这里只是把结论搬过去：界面绝不自己写
+     * "联网就不能带文件"这种规则（ARCH §9 第 2 条）。
+     *
+     * <p>注意用的是**胶囊当前的模式**（`caps.mode()`）而不是 `sendingMode` ——
+     * 后者是"正在发的那一轮"的快照，用它会让闸门慢一轮（切到联网后还是允许带文件）。
+     */
+    private void refreshDocGate() {
+        if (bar == null) return;
+        try {
+            Config c = new Config(this);
+            Caps.Mode m = caps == null ? Caps.Mode.CHAT : caps.mode();
+            boolean web = caps != null && caps.isWeb();
+            /**
+             * ⚠️ 走**8 参**重载，把 `web` 传进去。
+             *
+             * 老 7 参版本只看 `mode`，而混合模式的 `mode` 也是 AGENT —— 传老版本
+             * 会把 hybrid 当成纯 Agent 算，附件闸门就和真实请求不一致了。
+             */
+            Caps.Plan p = Caps.plan(m, c.think(), c.apiModel(),
+                bar.docCount() > 0, false, c.titleAuto(), c.allowDocsInWeb(), web);
+            bar.setDocGate(p.allowDocs, Caps.degradeHint(Caps.CAP_FILES));
+        } catch (Throwable e) {
+            EyeLog.w("ui", "刷新附件闸失败 " + e);
+        }
+    }
+
+    /**
+     * 一轮的开始：把"这一轮怎么发"拍成快照，并锁住胶囊。
+     *
+     * <p>快照是必须的：请求发出之后用户还能点胶囊，而 PRD 的验收是
+     * "本轮行为不因中途改胶囊而变化"。所以这一轮用的模式和档位在**这里**定死，
+     * 界面上那些控件只是为下一轮服务。
+     */
+    private void beginRound() {
+        searchCard = null;
+        stepsCard = null;
+        roundClosed = false;
+        pendingRefuse = false;
+        sendingMode = caps == null ? Caps.Mode.CHAT : caps.mode();
+        sendingEffort = caps == null ? Caps.EFF_AUTO : caps.effort();
+        sendingWeb = caps != null && caps.isWeb();
+        if (caps != null) caps.setChipEnabled(false);
+        if (toolChip != null) toolChip.hide(null);
+    }
+
+    /** 一轮的结束：把胶囊还回来（下一轮可以改）。 */
+    private void endRound() {
+        if (caps != null) caps.setChipEnabled(true);
     }
 
     private void showThinking(String label) {
@@ -451,6 +705,8 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
     private void stopStreaming() {
         EyeService s = EyeService.peek();
         if (s != null) s.cancelTurn();
+        // 立刻给一个"停了"的信号：思考条先标「已停止」，不等服务那条回包
+        stream.thinkStopped();
         // 正常情况：服务把"已收到的部分 +（已停止）"落盘后推 onReply，这里不用收尾。
         // 但万一那条回包没到（服务被打断在别的分支上），按钮不能永远停在 ■ —— 兜一个超时。
         ui.postDelayed(new Runnable() {
@@ -459,6 +715,8 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
                 endStream();
                 setStreaming(false);
                 removeThinking();
+                settleCards(true);
+                endRound();
             }
         }, 4000);
     }
@@ -475,6 +733,44 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         stream.end();
     }
 
+    /** 左下角相机：先开预览弹层，按快门才真的抓图。 */
+    private void openCamera() {
+        EyeService s = EyeService.peek();
+        if (s == null) { toast("服务还没起来，稍等一下"); return; }
+        CameraSheet d = new CameraSheet(this, s, new CameraSheet.Cb() {
+            public void onShot(byte[] jpeg) {
+                if (jpeg == null || jpeg.length == 0) { sendLook(); return; }
+                capture(jpeg);
+            }
+        });
+        d.show();
+    }
+
+    /**
+     * 快门拍到的那一张：存盘 → 作为**用户图片**发出去（不是 look 工具图）。
+     *
+     * 存在工作区旁边的 conv 目录里，气泡能直接显示；`send()` 走
+     * `s.send(t, images, atts)`，`attach=true` 会让这张图真的进 API。
+     */
+    private void capture(byte[] jpeg) {
+        EyeService s = EyeService.peek();
+        if (s == null) { toast("服务还没起来，稍等一下"); return; }
+        String path = ConvStore.saveImage(convId(), jpeg);
+        ChatInputBar.Pick p = new ChatInputBar.Pick(path, jpeg);
+        send(fromPicks("这是什么？", java.util.Collections.singletonList(p)));
+    }
+
+    /** 顶栏喇叭：开/关朗读（关的时候正在说的那句也立刻停）。 */
+    private void toggleSpeak() {
+        Config c = new Config(this);
+        boolean on = !c.speak();
+        c.setSpeak(on);
+        if (topBar != null) topBar.setSpeak(on);
+        EyeService s = EyeService.peek();
+        if (s != null) s.setSpeak(on);
+        toast(on ? "朗读已开启" : "朗读已关闭");
+    }
+
     /**
      * 「拍一张」：输入栏那个相机按钮。
      *
@@ -489,6 +785,7 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         clearEmpty();
         endStream();
         setStreaming(true);
+        beginRound();
         lastUser = bubbles.userBubble("这是什么？", null, 0);
         box.addView(lastUser.view);
         showThinking("正在看一眼…");
@@ -517,6 +814,8 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
                 setStreaming(false);
                 removeThinking();
                 toolChip.hide(null);
+                settleCards(true);
+                endRound();
             }
         });
     }
@@ -539,61 +838,274 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         final boolean running = "running".equals(phase);
         ui.post(new Runnable() {
             public void run() {
+                /*
+                 * 这里**只负责那一行即时状态**。
+                 *
+                 * 步骤条的「▸/✓/✕ + 搜索词 + 来源数」统一由 `Asker` 的
+                 * `cb.onStep(...)` 发过来（含混合模式的 web_search）；如果这里再
+                 * 自己合成一条 Proto.Step，同一次工具调用会在卡片上长出两行，
+                 * 第二行永远停在"进行中"。
+                 */
                 if (running) toolChip.show(line);
                 else toolChip.hide(line);
             }
         });
     }
 
+    /**
+     * 老签名（`CallActivity` / 老的调用点还在用）。**行为不变**：包一个只有正文的
+     * `Proto.Reply` 转给新签名，于是"没有引用 / 没有卡片"的那条路一个字节都没改。
+     */
     @Override
     public void onReply(final String text, final String reasoning, final long thinkMs,
                         final List<String> imageFiles, final long at) {
+        Proto.Reply r = new Proto.Reply();
+        r.text = text;
+        r.reasoning = reasoning;
+        r.thinkMs = thinkMs;
+        // 老签名没有档位字段：用**这一轮真正发出去的那个**（`sendingEffort`），
+        // 而不是"现在胶囊上那个"—— 用户可能已经在等答案时把档位拨走了。
+        r.effort = sendingEffort;
+        r.mode = sendingMode;
+        r.cites = null;
+        r.steps = null;
+        onReply(r, imageFiles, at);
+    }
+
+    /**
+     * 一轮回答的完整元数据（联网/Agent 那一轮走这条）。
+     *
+     * <p>顺序仍然照老规矩：**先用权威全文覆盖正在显示的气泡，再拆它、再建正式气泡**。
+     * 多了两件事：`cites` 要跟着全文一起渲染（角标只在最后一帧才到），
+     * 卡片要在这里收尾（`settle` / `finish`）。
+     */
+    @Override
+    public void onReply(final Proto.Reply r, final List<String> imageFiles, final long at) {
+        final Proto.Reply reply = r == null ? new Proto.Reply() : r;
+        ui.post(new Runnable() {
+            public void run() { showReply(reply, imageFiles, at); }
+        });
+    }
+
+    private void showReply(Proto.Reply r, List<String> imageFiles, long at) {
+        // 对账：streamed 是流式累计的，authoritative 是落盘那份。两个数不一致
+        // 就说明增量有丢失（这才是真 bug），日志里一眼能看出来。
+        EyeLog.w("ui", "reply streamed=" + stream.chars()
+            + " authoritative=" + (r.text == null ? 0 : r.text.length())
+            + " cites=" + (r.cites == null ? 0 : r.cites.size())
+            + " steps=" + (r.steps == null ? 0 : r.steps.size())
+            + " mode=" + (r.mode == null ? "-" : r.mode.key)
+            + " stopped=" + r.stopped + " refused=" + r.refused);
+
+        // ① 思考条先定态（「已停止」不能被随后的收尾覆盖成「· 自动」）
+        if (r.stopped) stream.thinkStopped();
+        // ② 权威全文 + 角标，同步覆盖正在显示的那条
+        stream.finish(r.text, r.cites);
+        endStream();
+        setStreaming(false);
+        removeThinking();
+        toolChip.hide(null);
+        endRound();
+
+        // 顶栏圆环/花费：先按这一轮的 reply 更新，再等 900ms 让落盘后的上下文算准
+        lastReply = r;
+        refreshUsage(r);
+        ui.postDelayed(new Runnable() {
+            public void run() { refreshUsage(null); }
+        }, 900);
+
+        // ③ 卡片收尾
+        //    先兜一遍"流式事件一条都没到"的情况（T2 还没接 onStep 时就是这条路）：
+        //    用 `Reply.steps` 整批回放，卡片照样出现，只是没有逐行动画。
+        if (searchCard == null && stepsCard == null
+            && r.steps != null && !r.steps.isEmpty()) {
+            for (int i = 0; i < r.steps.size(); i += 1) showStep(r.steps.get(i));
+        }
+        settleCards(r.stopped);
+
+        // ④ 图只挂在"发出去"那一条上（磁盘也是这么存的）
+        if (lastUser != null && lastUser.shots == 0) {
+            bubbles.addShots(lastUser, imageFiles);
+        }
+        lastUser = null;
+
+        // ⑤ 服务端给的会话标题（联网模式随本轮带；没有就保持原样，绝不拿来源标题顶上）
+        if (r.title != null && r.title.trim().length() > 0) {
+            topBar.setTitle(r.title.trim());
+        }
+
+        String body = r.text == null ? "" : r.text;
+        if (r.refused && body.trim().length() == 0) {
+            /**
+             * 拒答。T2 的约定是**先 `onReply(rep)`、再 `onError(CONTENT_RISK)`**，
+             * 而且不落盘正文 —— 两处都画就会出两条"没答上"气泡。
+             *
+             * 所以这里先留白，600ms 内等到 `onError` 就交给它（文案统一走 `Err.text`）；
+             * 等不到才自己补一句，避免"界面上什么都不发生"。
+             */
+            pendingRefuse = true;
+            ui.postDelayed(new Runnable() {
+                public void run() {
+                    if (!pendingRefuse) return;
+                    pendingRefuse = false;
+                    failedRow = bubbles.ai(Err.text(Err.Code.CONTENT_RISK),
+                        null, 0, null, 0, true);
+                    box.addView(failedRow);
+                    scrollBottom();
+                }
+            }, 600);
+        } else if (body.trim().length() == 0) {
+            // 只有思考没有正文：不留一条空气泡（那种"什么都没发生"最让人困惑）
+            failedRow = bubbles.ai("（这条没答出内容，重试一次看看。）", null, 0, null, 0, true);
+            box.addView(failedRow);
+        } else {
+            box.addView(bubbles.ai(body, r.reasoning, r.thinkMs, r.effort, r.stopped,
+                null, at, false, r.cites));
+        }
+        scrollBottom();
+    }
+
+    // ---------------------------------------------------------------- 过程卡（搜索 / 步骤）
+
+    /**
+     * 服务端/工具的一步（流式）。
+     *
+     * <p>T2 已在 `EyeService.Ui` 上给了 `default` 实现，所以这里就是正常覆盖；
+     * 没这条事件也不影响最终结果 —— `onReply` 里会用 `Reply.steps` 整批回放补一遍。
+     */
+    @Override
+    public void onStep(final Proto.Step step) {
+        if (step == null) return;
+        ui.post(new Runnable() {
+            public void run() { showStep(step); }
+        });
+    }
+
+    /**
+     * 思考增量（`reasoning_content`）。
+     *
+     * <p>`Ui` 上暂时没有这个方法，所以**不加 `@Override`**：T2 什么时候加了
+     * `default void onThink(String)`，这里就自动成为实现，一行都不用改；
+     * 没加的话它只是个没人调的方法，编译照过（思考条由 `Reply.reasoning` 兜底显示）。
+     */
+    public void onThink(final String delta) {
         ui.post(new Runnable() {
             public void run() {
-                /**
-                 * ⚠️ 顺序在这里很要紧（P0：真机上丢过最后一段字）。
-                 *
-                 * `stream.finish(text)` 先用**落盘那份全文**同步覆盖正在显示的气泡，
-                 * 然后才拆掉它、再按同一份全文建一条正式气泡。两条路用的都是 `text`，
-                 * 所以"气泡里的字 == 磁盘里那行的字"是结构性的，不靠时序运气。
-                 */
-                // 对账：streamed 是流式累计的，authoritative 是落盘那份。两个数不一致
-                // 就说明增量有丢失（这才是真 bug），日志里一眼能看出来。
-                EyeLog.w("ui", "reply streamed=" + stream.chars()
-                    + " authoritative=" + (text == null ? 0 : text.length()));
-                stream.finish(text);
-                endStream();
-                setStreaming(false);
-                removeThinking();
-                toolChip.hide(null);
-                EyeLog.w("ui", "reply chars=" + (text == null ? 0 : text.length())
-                    + " thinkMs=" + thinkMs + " at=" + at);
-                /**
-                 * 图**只挂在"发出去"那一条**上（磁盘也是这么存的）。
-                 *
-                 * · 相册发的：发送那一刻就在气泡里了（`o.files`），这里什么都不用做；
-                 * · 通话页开口：宫格是服务端现拼的，落盘晚了 40~80ms，这里补进同一个气泡；
-                 * · 服务自己发起的（自动看）：没有用户气泡，界面就不显示 ——
-                 *   磁盘上有，重进会话时挂在"它自己看了一眼"那条下面。
-                 */
-                if (lastUser != null && lastUser.shots == 0) {
-                    bubbles.addShots(lastUser, imageFiles);
-                }
-                lastUser = null;      // 这一轮答完了：把手交出去，别再让下一轮（比如自动看）往上补
-                box.addView(bubbles.ai(text, reasoning, thinkMs, null, at, false));
+                if (!stream.active()) beginStream();
+                stream.think(delta);
                 scrollBottom();
             }
         });
+    }
+
+    /** 思考结束（耗时定下来）。 */
+    public void onThinkDone(final long ms) {
+        ui.post(new Runnable() {
+            public void run() { stream.thinkDone(ms, sendingEffort); }
+        });
+    }
+
+    /**
+     * 建卡 / 追加一行。
+     *
+     * <p>**联网只出搜索卡，Agent 只出步骤条**（PRD P0-8 验收第 5 条：不许两张卡叠在一起）：
+     * 判据是这条事件来自服务端工具还是客户端工具 —— 这比"当前模式"更准，
+     * 因为用户在等答案期间可能已经把胶囊切走了。
+     */
+    private void showStep(Proto.Step s) {
+        if (roundClosed || s == null) return;
+        if (isServerStep(s)) {
+            if (searchCard == null) {
+                removeThinking();          // 卡片替掉"正在想…"，别两行抢注意力
+                searchCard = new Cards.SearchCard(this, convId());
+                box.addView(searchCard);
+            }
+            String line = searchLine(s);
+            if (line != null) searchCard.row(line);
+        } else {
+            // 聊天模式的工具调用**静默**（现有 ToolChip 一行就够，PRD §2.1）
+            if (sendingMode != Caps.Mode.AGENT) return;
+            if (stepsCard == null) {
+                removeThinking();
+                stepsCard = new Cards.Steps(this, 16, convId(), new Cards.Cb() {
+                    public void onStop() { stopStreaming(); }
+                });
+                box.addView(stepsCard);
+            }
+            stepsCard.step(s);
+        }
+        scrollBottom();
+    }
+
+    /** 这条事件是服务端工具（搜索/读链接）还是自定义工具。 */
+    private static boolean isServerStep(Proto.Step s) {
+        String t = s.callType == null ? "" : s.callType.trim();
+        return t.startsWith("deepseek_");
+    }
+
+    /**
+     * 搜索卡的**一行人话**。
+     *
+     * <p>一次搜索通常是"开始搜 → 搜完"，读页面是"开始读 → 读完"，所以同一 `action`
+     * 按 `type` 给两句话。**不写"已读 N 个页面"** —— 那个 N 服务端没给，
+     * 编一个数字比不写更糟（用户会拿它当事实）。
+     */
+    private String searchLine(Proto.Step s) {
+        boolean done = "call_completed".equals(s.type);
+        boolean failed = "failed".equals(s.status);
+        String act = s.action == null ? "" : s.action.trim();
+        String q = s.query == null ? "" : s.query.trim();
+
+        if ("search".equals(act) || "deep_search".equals(act)) {
+            if (done) {
+                if (failed) return "这一步没搜成";
+                return s.sources >= 0 ? "找到 " + s.sources + " 个来源" : "搜完了";
+            }
+            return q.length() == 0 ? "开始搜索" : "已搜「" + q + "」";
+        }
+        if ("read_link".equals(act) || "open_page".equals(act)) {
+            String d = Cards.domain(s.url);
+            if (done) return d.length() == 0 ? "读完了一个页面" : "读完了 " + d;
+            return d.length() == 0 ? "正在读一个页面" : "正在读 " + d;
+        }
+        if ("find_in_page".equals(act)) {
+            return done ? "在页面里找到了" : "正在页面里找";
+        }
+        return done ? "这一步做完了" : "正在" + Cards.describe(s);
+    }
+
+    /**
+     * 卡片收尾。**中断态也必须收**：卡在"进行中"比没有卡片更糟。
+     *
+     * @param stopped 用户按了停止（步骤条写「已停止」；达到上限写「已停止（达最大步数 8）」）
+     */
+    private void settleCards(boolean stopped) {
+        roundClosed = true;                 // 之后再有迟到的步骤事件，不再往这一轮下面加卡
+        if (searchCard != null) searchCard.settle(stopped);
+        if (stepsCard != null) {
+            if (stopped) {
+                stepsCard.finish(stepsCard.count() >= stepsCard.max()
+                    ? "已停止（达最大步数 " + stepsCard.max() + "）" : "已停止");
+            } else {
+                stepsCard.finish(null);
+            }
+        }
     }
 
     @Override
     public void onError(final String msg) {
         ui.post(new Runnable() {
             public void run() {
+                // 拒答的那条 onReply 已经先到了：这里由 onError 统一说一句，别再来一条
+                pendingRefuse = false;
+                stream.thinkStopped();
                 endStream();
                 setStreaming(false);
                 removeThinking();
                 toolChip.hide(null);
+                // 卡片不能停在"进行中"：断了就写"中断"，并且把胶囊还回去（现场保留）
+                settleCards(true);
+                endRound();
                 lastUser = null;
                 failedRow = bubbles.ai("（没答上：" + msg + "）", null, 0, null, 0, true);
                 box.addView(failedRow);
@@ -618,11 +1130,69 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
     private String subLine() {
         try {
             Config c = new Config(this);
+            EyeService s = EyeService.peek();
+            int used = s != null ? s.contextTokens() : 0;
+            int budget = c.ctxTokens();
+            int pct = budget > 0 ? Math.round(used * 100f / budget) : 0;
             return c.apiModel().replace("deepseek-", "")
-                + " · 思考 " + c.thinkLabel() + " · " + Config.ctxLabel(c.ctxTokens());
+                + " · " + pct + "% · " + Cost.fmtShort(c.costTotalUsd());
         } catch (Throwable e) {
             return "";
         }
+    }
+
+    /** 刷新顶栏圆环、副标题（副标题带上下文百分比和累计花费）。 */
+    private void refreshUsage(Proto.Reply r) {
+        if (r != null) lastReply = r;
+        if (topBar == null) return;
+        try {
+            EyeService s = EyeService.peek();
+            int used = s != null ? s.contextTokens() : 0;
+            int budget = new Config(this).ctxTokens();
+            topBar.setUsage(used, budget);
+            topBar.setSubtitle(subLine());
+        } catch (Throwable e) {
+            EyeLog.w("ui", "刷新用量失败 " + e);
+        }
+    }
+
+    /** 点顶栏圆环：上下文 + 本轮/累计花费。 */
+    private void openUsage() {
+        EyeService s = EyeService.peek();
+        int used = s != null ? s.contextTokens() : 0;
+        Config c = new Config(this);
+        int budget = c.ctxTokens();
+        int pct = budget > 0 ? Math.round(used * 100f / budget) : 0;
+
+        Proto.Reply r = lastReply;
+        int in = r == null ? c.lastIn() : r.promptTokens;
+        int out = r == null ? c.lastOut() : r.completionTokens;
+        int tools = r == null ? c.lastTools() : Cost.countTools(r.steps);
+        double turn = r == null ? c.lastCostUsd() : r.costUsd;
+        boolean hasTurn = in > 0 || out > 0 || turn > 0;
+        String turnLine = !hasTurn ? "本轮：还没发过请求"
+            : "本轮：输入 " + fmtNum(in) + " · 输出 " + fmtNum(out)
+              + " · 工具 " + tools + " 次 → " + Cost.fmt(turn);
+
+        String msg = "上下文：" + fmtNum(used) + " / " + fmtNum(budget)
+            + "（" + pct + "%）\n"
+            + turnLine + "\n"
+            + "累计：" + Cost.fmt(c.costTotalUsd()) + "\n\n"
+            + "按牌价估算（参考 DSH Cost Meter 的 DeepSeek V4 价）：\n"
+            + "flash 输入 $0.15/M · 输出 $0.60/M；\n"
+            + "pro 输入 $0.66/M · 输出 $1.98/M；\n"
+            + "搜索/读网页 $0.00075/次。\n"
+            + "未计峰谷与缓存命中，实际通常更低。";
+
+        new android.app.AlertDialog.Builder(this)
+            .setTitle("上下文与花费")
+            .setMessage(msg)
+            .setPositiveButton("知道了", null)
+            .show();
+    }
+
+    private static String fmtNum(int n) {
+        return String.format(java.util.Locale.CHINA, "%,d", n);
     }
 
     // ---------------------------------------------------------------- Bubbles.Cb
@@ -634,10 +1204,10 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
             : new String[] { "复制", "朗读", "重发", "删这段" };
         Sheets.menu(this, items, "删这段", new Sheets.OnPick() {
             public void onPick(String pick) {
-                if ("复制".equals(pick)) { copy(text); return; }
+                if ("复制".equals(pick)) { copy(copyTextFor(at, text)); return; }
                 if ("朗读".equals(pick)) {
                     EyeService svc = EyeService.peek();
-                    if (svc != null) svc.say(text);
+                    if (svc != null) svc.say(copyTextFor(at, text));
                     return;
                 }
                 if ("重发".equals(pick)) { retry(at); return; }
@@ -693,8 +1263,10 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
             EyeService s = EyeService.peek();
             if (s == null) { toast("服务还没起来"); return; }
             setStreaming(true);
+            beginRound();
             showThinking("正在想…");
-            if (o.images != null && !o.images.isEmpty()) s.sendWithImages(o.text, o.images);
+            // 重发要**连附件一起重发**（文件 ID 还在，不用再传一遍）
+            if (o.hasBody()) s.send(o.text, o.images, o.atts);
             else s.send(o.text);
             return;
         }
@@ -723,6 +1295,36 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
             cm.setPrimaryClip(ClipData.newPlainText("鱼眼", text == null ? "" : text));
             toast("复制了");
         } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 复制时把**角标降级成 `[1]` 纯文本**（PRD P0-3 验收最后一条）。
+     *
+     * <p>磁盘上的正文永远是干净的（没有 `[1]`、没有哨兵），所以"复制"不是读磁盘原文，
+     * 而是**读磁盘 + 现算角标**（`Cites.plainWithMarkers`）。这样两个方向都对：
+     * 界面上看得到可点的角标，粘到别处是一段带编号的普通文字。
+     *
+     * @param at   这条消息的时间戳（0 = 还没落盘，比如"正在想"那种，没有引用可算）
+     * @param text 气泡里那份干净正文（找不到磁盘那条时的兜底）
+     */
+    private String copyTextFor(long at, String text) {
+        String fallback = text == null ? "" : text;
+        if (at <= 0) return fallback;
+        EyeService s = EyeService.peek();
+        if (s == null) return fallback;
+        try {
+            List<Conv.Msg> msgs = s.messages();
+            for (int i = 0; i < msgs.size(); i += 1) {
+                Conv.Msg m = msgs.get(i);
+                if (m == null || m.at != at) continue;
+                String body = m.text == null ? fallback : m.text;
+                if (m.cites == null || m.cites.isEmpty()) return body;
+                return Cites.plainWithMarkers(body, m.cites);
+            }
+        } catch (Throwable e) {
+            EyeLog.w("ui", "算角标失败 " + e);
+        }
+        return fallback;
     }
 
     // ------------------------------------------- 跳转 / 结果

@@ -41,6 +41,36 @@ final class Conv {
         /** 这一轮想了多久（毫秒，只给界面显示"想过 3.2 秒"用，不进请求）。 */
         long thinkMs;
 
+        // ── v5 新增（全部可空；7 列老文件读出来就是空/null，不需要迁移脚本）──────
+        /**
+         * 这一轮用的模式。**null = 老消息**（按聊天渲染：无卡片、无角标）。
+         * 别自作聪明默认成 CHAT —— 老消息确实没这个信息。
+         */
+        Caps.Mode mode;
+        /** 档位（`auto`/`high`/`max`/`off`）。界面显示「思考 6.2 秒 · 自动」要用。 */
+        String effort;
+        /**
+         * 这一轮**已经发过**自动标题轻请求。防"重试 / 继续生成 / 切模式重发"重复付费。
+         * （"用户手改过名"是另一件事，走会话级 `<id>.tlock`，见 {@link #titleLocked}。）
+         */
+        boolean titleGen;
+        /**
+         * 会话级标题锁的**镜像**：`<id>.tlock` 存在 = 用户手改过名，自动标题永不覆盖。
+         * 真值只在文件上；这里镜像一份是为了渲染列表时零 IO（{@link ConvStore#load} 时填）。
+         */
+        boolean titleLocked;
+        /** 这一轮带出去的文档附件（`file_id` 已落盘 → 多轮复用不再上传）。 */
+        List<Att> atts;
+        /** 引用（渲染用）。**不进请求** —— 回传引用没有意义，只会白烧 token。 */
+        List<Cites.Cite> cites;
+        /**
+         * 卡片的一句话摘要（"3 步 · 2.4s · 4 源"），折叠态直接显示，不用重算。
+         * T1 先按一行 String 存；结构化的 {@code Steps} 是 T3 的事。
+         */
+        String steps;
+        /** `server_tool_calls` 的 sidecar 文件名（null = 这一轮没有）。**不进 TSV**，见 ConvStore。 */
+        String stcRef;
+
         Msg() { }
 
         static Msg user(long at, String text) {
@@ -70,6 +100,69 @@ final class Conv {
         Msg withReasoning(String r) {
             reasoning = r == null || r.trim().length() == 0 ? null : r.trim();
             return this;
+        }
+
+        /** 挂一个文档附件（上传成功后才有 fileId）。 */
+        Msg withAtt(Att a) {
+            if (a == null) return this;
+            if (atts == null) atts = new ArrayList<>(1);
+            atts.add(a);
+            return this;
+        }
+    }
+
+    /**
+     * 一轮里带出去的**文档**附件（`/files` 上传的产物）。
+     *
+     * 为什么只存 `fileId`、不存原文件：官方 file 不设过期时间，"会话里的历史附件一直可用"，
+     * 所以 100MB 的 PDF 在磁盘上只占几十字节 —— 这也是"附件缓存泄漏"风险的根治办法。
+     * 图片不走这里（走 `image_url` base64，仍存在 `conv/<id>/*.jpg`）。
+     */
+    static final class Att {
+        static final int ST_PENDING = 0;     // 排队
+        static final int ST_UPLOADING = 1;   // 上传中
+        static final int ST_OK = 2;          // 成功（只有 2 / 3 会落盘）
+        static final int ST_FAIL = 3;        // 失败（可重试）
+
+        /** `file-api-…`（上传成功才有）。 */
+        String fileId;
+        /** 原名（中文原样，不信服务端回显）。 */
+        String name;
+        long size;
+        /** `text_recognition` | `rich_layout_recognition` | `user_data`。 */
+        String purpose;
+        /** {@link #ST_PENDING} … {@link #ST_FAIL}。 */
+        int state;
+
+        Att() { }
+
+        static Att of(String fileId, String name, long size, String purpose, int state) {
+            Att a = new Att();
+            a.fileId = fileId;
+            a.name = name;
+            a.size = size;
+            a.purpose = purpose;
+            a.state = state;
+            return a;
+        }
+
+        /** 能不能真的发出去（只有成功上传的才算）。 */
+        boolean usable() {
+            return state == ST_OK && fileId != null && fileId.length() > 0;
+        }
+
+        /**
+         * 一个 file 块大概要多少 token。
+         *
+         * 估算口径：服务端解析出的文字量 ≈ 文件字节的 1/3000~1/5000，取 {@code size/4000}，
+         * 再夹到 200~20000（防 0 字节文件算成 0、防 100MB PDF 估成 25 万把预算一次吃光）。
+         * 客户端拿不到真实值，这个数唯一用途是"别把请求撑爆"，所以宁可估大。
+         */
+        int tokens() {
+            long n = size / 4000L;
+            if (n < 200L) return 200;
+            if (n > 20000L) return 20000;
+            return (int) n;
         }
     }
 
@@ -123,6 +216,18 @@ final class Conv {
         /** assistant 的思考过程（带 tools 时要回传）。 */
         String reasoning;
 
+        // ── v5 新增 ────────────────────────────────────────────────────
+        /**
+         * `server_tool_calls` 的**原始 JSON 字符串**（原样回传，绝不重新序列化 ——
+         * 重排会把 `signature` 里的转义细节改掉，官方要求"逐字保留"）。
+         * 由 `EyeService` 从 sidecar 读出来填（`Conv` 不碰磁盘）。
+         */
+        String stcJson;
+        /** 这一轮要发的文档块（已上传成功的那些）。 */
+        List<Att> atts;
+        /** 这一轮的模式（日志画像 + 组请求时区分）。 */
+        Caps.Mode mode;
+
         Out(String role, String text) {
             this.role = role;
             this.text = text == null ? "" : text;
@@ -136,6 +241,13 @@ final class Conv {
         void addMark(String mark) {
             if (offloaded == null) offloaded = new ArrayList<>(1);
             offloaded.add(mark);
+        }
+
+        /** 真能发出去的文档块（`null` / 全失败 → 空表，调用方不用判 null）。 */
+        List<Att> usableAtts() {
+            List<Att> out = new ArrayList<Att>(1);
+            if (atts != null) for (Att a : atts) if (a != null && a.usable()) out.add(a);
+            return out;
         }
     }
 
@@ -159,13 +271,73 @@ final class Conv {
     }
 
     static int tokensOf(Msg m, boolean withImages) {
+        if (m == null) return 0;
         int n = textTokens(m.text);
         // reasoning 是真要发出去的 token（带 tools 时），必须算进预算，否则"设了 8k 实际发 12k"
         if (m.reasoning != null) n += textTokens(m.reasoning);
+        // ① server_tool_calls 回传成本：signature 是加密页面正文，客户端不可能知道多少 token，
+        //    按固定 STC_SIG_TOKENS/call 估（宁可估大 —— 这个数只用来"别把请求撑爆"）。
+        //    TODO(T2)：拿到 sidecar 正文后按 sources/action 实算文字部分，signature 仍走这个常量。
+        if (m.stcRef != null) n += STC_SIG_TOKENS;
+        // ② 文档附件：服务端解析出的文字量只能估（见 Att.tokens）
+        if (m.atts != null) {
+            for (Att a : m.atts) if (a != null) n += a.tokens();
+        }
+        // ③ 图的估算不变
         if (m.shots != null) {
             for (Shot s : m.shots) n += withImages ? Math.max(1, s.tokens) : textTokens(s.mark());
         }
         return n;
+    }
+
+    /**
+     * 一轮 `server_tool_calls` 回传的**粗估** token（按 1 个 call 算）。
+     *
+     * 为什么是常量：`signature` 是服务端加密过的页面正文，**解出来多少 token 客户端不可能知道**。
+     * T0 实测（探针 6）：一个 `read_link` 的 `signature` 就有 **51KB** —— 按 1200 估会把预算算爆
+     * （一次 3 页搜索实际吃掉十几 k，估成 3.6k，于是"预算 64k"实际发了 80k）。
+     * 6000 = "单页正文保守估"（51KB 密文解出来约一两万字，取 6k 并**宁可估大**）：
+     * 这个数唯一用途是"别把请求撑爆"，不是报价。
+     *
+     * TODO(T2)：拿到 sidecar 正文后可按"这次搜了几页"乘页数微调文字部分，
+     *   但 `signature` 那部分仍然只能靠这个常量。
+     */
+    static final int STC_SIG_TOKENS = 6000;
+
+    /**
+     * **stc 优先降级**：预算超了先把"非最近一轮"的 `stcRef` 摘掉，摘完还不够再交给
+     * {@link #trim(List, int, int)} 去丢整轮。
+     *
+     * 为什么单独一步：`server_tool_calls` 会随轮数线性膨胀（每轮读 N 页的加密正文），
+     * 一旦超预算就整轮丢掉，等于"刚问的第 3 条突然记不住了"。顺序是
+     * "先降引用 → 再降图（现有 imgWindow）→ 最后丢轮"。
+     *
+     * ⚠️ 只改**最近一轮之外**的消息（最近一个 `user` 及其之后的 assistant 一律不动），
+     * 而且只改内存里的这一份 `Msg`：磁盘上的行没动，下一轮 `load()` 还是全的。
+     *
+     * @param kept   已经过 {@code trim} 的列表（原地修改）
+     * @param budget token 预算（<=0 = 不设预算，直接返回）
+     */
+    static void trimStc(List<Msg> kept, int budget) {
+        if (kept == null || kept.isEmpty() || budget <= 0) return;
+
+        int sum = 0;
+        for (Msg m : kept) sum += tokensOf(m, true);
+        if (sum <= budget) return;
+
+        // 最近一轮的起点：最后一个 user 的下标（没有 user 就整段都不动）
+        int lastUser = kept.size();
+        for (int i = kept.size() - 1; i >= 0; i -= 1) {
+            if ("user".equals(kept.get(i).role)) { lastUser = i; break; }
+        }
+
+        for (int i = 0; i < lastUser && sum > budget; i += 1) {
+            Msg m = kept.get(i);
+            if (m != null && m.stcRef != null) {
+                m.stcRef = null;
+                sum -= STC_SIG_TOKENS;
+            }
+        }
     }
 
     // ---------------------------------------------------------------- 裁剪
@@ -225,6 +397,10 @@ final class Conv {
         for (Msg m : msgs) {
             Out o = new Out(m.role, m.text);
             o.reasoning = m.reasoning;
+            // 模式与附件直接带过去；stcJson 由调用方（EyeService）从 sidecar 读后填 ——
+            // Conv 不碰磁盘，这样这一段在电脑 JVM 上也能测。
+            o.mode = m.mode;
+            o.atts = m.atts;
             if (m.shots != null) {
                 for (Shot s : m.shots) {
                     boolean keep = idx >= keepFrom;
