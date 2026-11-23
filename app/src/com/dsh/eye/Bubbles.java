@@ -188,11 +188,14 @@ final class Bubbles {
 
         LinearLayout stack = stack(Gravity.START);
         LinearLayout card = card(false);
+        // SVG 段抽出来当图片显示（不走 ImageSpan：真机上它占位但不画）
+        Svg.Parts sp = Svg.extract(body);
         // 只有它说的话渲染 Markdown —— 我自己打的字不该被当成格式
-        TextView tv = textView(Markdown.render(body, cites), false);
+        TextView tv = textView(Markdown.render(sp.text, cites), false);
         // 角标要能点：setText 之后把回调与手势装上去（没有角标时 bind 什么都不做）
         if (cites != null && !cites.isEmpty()) CiteSpans.bind(tv, citeCb);
         card.addView(tv);
+        addPics(card, sp);
 
         boolean hasReason = reasoning != null && reasoning.length() > 0;
         // 有思考过程就必须让用户能点开 —— 哪怕不知道它想了多久（老会话文件没记时长）
@@ -208,9 +211,33 @@ final class Bubbles {
         return row(false, stack);
     }
 
+    /**
+     * 把 `Svg.extract` 抽出来的图放进气泡。
+     *
+     * 为什么是 `ImageView` 而不是 `ImageSpan`：真机验证过 —— span 的占位和行高都对，
+     * 但 `Drawable.draw()` 就是不落到屏幕上（换 `BitmapDrawable` 也一样）。
+     * 直接上 `ImageView` 之后缩放、圆角、长按全都正常，也省掉"图片比气泡宽"的测量问题。
+     */
+    void addPics(LinearLayout card, Svg.Parts sp) {
+        if (card == null || sp == null || sp.pics.isEmpty()) return;
+        int maxW = maxBodyWidth();
+        for (android.graphics.Bitmap b : sp.pics) {
+            if (b == null) continue;
+            ImageView iv = new ImageView(a);
+            iv.setImageBitmap(b);
+            iv.setAdjustViewBounds(true);
+            iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            iv.setMaxWidth(maxW);
+            iv.setMaxHeight(dp(420));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = dp(Theme.S1);
+            card.addView(iv, lp);
+        }
+    }
+
     /** 「正在想…」那条。拿到回答后由界面 `removeView` 掉。 */
-    LinearLayout thinking(String label) {
-        LinearLayout row = new LinearLayout(a);
+    LinearLayout thinking(String label) {        LinearLayout row = new LinearLayout(a);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -254,6 +281,8 @@ final class Bubbles {
         private final StringBuilder buf = new StringBuilder();
         /** 收尾之后不再接受增量：迟到的 onDelta 不许把气泡"复活"成一条半截话。 */
         private boolean closed;
+        /** 图只贴一次（`finish` 可能被重复调用，重复贴就是两张一样的图）。 */
+        private boolean picsDone;
 
         // ---- 思考（流式）：折叠条 + 一行滚动灰字（PRD §6.6）----
         private LinearLayout thinkWrap;
@@ -396,9 +425,19 @@ final class Bubbles {
          */
         void finish(String full, List<Cites.Cite> cites) {
             if (full != null && full.length() > 0 && tv != null) {
-                CharSequence cs = Markdown.render(full, cites);
+                // 收尾时再把 SVG 段抽出来（流式期间那几段一直是代码块，收尾才变成图）
+                Svg.Parts sp = Svg.extract(full);
+                CharSequence cs = Markdown.render(sp.text, cites);
                 tv.setText(cs);
                 if (cites != null && !cites.isEmpty()) CiteSpans.bind(tv, citeCb);
+                if (!picsDone && !sp.pics.isEmpty()) {
+                    picsDone = true;
+                    if (tv.getParent() instanceof LinearLayout) {
+                        LinearLayout cd = (LinearLayout) tv.getParent();
+                        // 图放在正文下面、思考条上面
+                        addPics(cd, sp);
+                    }
+                }
                 fitWidth(tv, cs);
                 tv.requestLayout();
             }
@@ -532,6 +571,26 @@ final class Bubbles {
     int bodyWidth(TextView tv, CharSequence text) {
         int maxBody = maxBodyWidth();
         float want = Layout.getDesiredWidth(text == null ? "" : text, tv.getPaint());
+        /**
+         * **图必须按图的宽度算**（v2.8.1 的 bug）。
+         *
+         * `Layout.getDesiredWidth` 量的是字宽，而图片在文本里只占一个 `\uFFFC`
+         * 占位符（宽度≈0）—— 于是 `fitWidth` 把 TextView 设成 20dp 宽，
+         * 一张 891px 的 SVG 被裁成一条缝，界面上就是"气泡是空的"。
+         *
+         * 这里是先量出文字宽度，再取"最大那张图的 intrinsic 宽度"两者的大者；
+         * 上限仍然是 `maxBody`，所以图会被 `Pic.draw` 等比缩进气泡里。
+         */
+        if (text instanceof android.text.Spanned) {
+            android.text.style.ImageSpan[] imgs =
+                ((android.text.Spanned) text).getSpans(0, text.length(),
+                    android.text.style.ImageSpan.class);
+            for (android.text.style.ImageSpan s : imgs) {
+                if (s.getDrawable() != null) {
+                    want = Math.max(want, s.getDrawable().getIntrinsicWidth());
+                }
+            }
+        }
         return Math.max(dp(20), (int) Math.ceil(Math.min(want, maxBody)));
     }
 

@@ -1167,22 +1167,33 @@ public class MainActivity extends AppActivity implements EyeService.Ui, Bubbles.
         Proto.Reply r = lastReply;
         int in = r == null ? c.lastIn() : r.promptTokens;
         int out = r == null ? c.lastOut() : r.completionTokens;
+        int hit = r == null ? c.lastHit() : r.cachedTokens;
+        int miss = Math.max(0, in - hit);
         int tools = r == null ? c.lastTools() : Cost.countTools(r.steps);
         double turn = r == null ? c.lastCostUsd() : r.costUsd;
+        boolean peak = r != null ? r.peak : Cost.peak(System.currentTimeMillis());
         boolean hasTurn = in > 0 || out > 0 || turn > 0;
-        String turnLine = !hasTurn ? "本轮：还没发过请求"
-            : "本轮：输入 " + fmtNum(in) + " · 输出 " + fmtNum(out)
-              + " · 工具 " + tools + " 次 → " + Cost.fmt(turn);
+        double saved = Cost.savedByCache(c.apiModel(), hit, peak);
+        String rate = in <= 0 ? "—" : Math.round(hit * 100f / in) + "%";
 
         String msg = "上下文：" + fmtNum(used) + " / " + fmtNum(budget)
             + "（" + pct + "%）\n"
-            + turnLine + "\n"
-            + "累计：" + Cost.fmt(c.costTotalUsd()) + "\n\n"
-            + "按牌价估算（参考 DSH Cost Meter 的 DeepSeek V4 价）：\n"
-            + "flash 输入 $0.15/M · 输出 $0.60/M；\n"
-            + "pro 输入 $0.66/M · 输出 $1.98/M；\n"
-            + "搜索/读网页 $0.00075/次。\n"
-            + "未计峰谷与缓存命中，实际通常更低。";
+            + (!hasTurn ? "本轮：还没发过请求\n"
+                : "本轮输入 " + fmtNum(in) + "\n"
+                  + "　· 缓存命中 " + fmtNum(hit) + "　· 未命中 " + fmtNum(miss)
+                  + "　· 命中率 " + rate + "\n"
+                  + "本轮输出 " + fmtNum(out) + " · 工具 " + tools + " 次\n"
+                  + "本轮花费 " + Cost.fmt(turn)
+                  + (saved > 0 ? "（缓存省下 " + Cost.fmt(saved) + "）" : "") + "\n")
+            + "累计：输入 " + fmtNum(c.sumIn()) + "（命中 " + fmtNum(c.sumHit()) + "）"
+            + " · 输出 " + fmtNum(c.sumOut()) + "\n"
+            + "累计花费：" + Cost.fmt(c.costTotalUsd()) + "\n\n"
+            + "按官方牌价（" + (peak ? "高峰价" : "空闲价") + "）：\n"
+            + "flash 命中 $0.003 / 未命中 $0.15 / 输出 $0.60（每百万）\n"
+            + "pro 命中 $0.022 / 未命中 $0.66 / 输出 $1.98\n"
+            + "搜索/读网页 $0.00075/次 · 文件解析 $0.225/千页\n"
+            + "高峰 = 北京时间 9-12 点、14-18 点（工作日），其余半价。\n"
+            + "一轮里多次工具往返是逐轮累加的（以前只算最后一轮，会低报）。";
 
         new android.app.AlertDialog.Builder(this)
             .setTitle("上下文与花费")

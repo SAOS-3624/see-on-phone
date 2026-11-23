@@ -41,6 +41,13 @@ MANIFEST="$HERE/AndroidManifest.xml"
 WANT_CODE=$(grep -o 'android:versionCode="[0-9]*"' "$MANIFEST" | head -1 | grep -o '[0-9]*')
 WANT_NAME=$(grep -o 'android:versionName="[^"]*"' "$MANIFEST" | head -1 | sed 's/.*="//;s/"//')
 
+# ⚠️ 屏幕黑着的时候，两道弹窗**照样在**，但 `input tap` 一个都点不动 ——
+#    表现是"点了继续安装却没装上"（2026-11-14 实测栽了一次）。先点亮 + 常亮。
+AS "input keyevent KEYCODE_WAKEUP" >/dev/null 2>&1
+AS "svc power stayon true" >/dev/null 2>&1
+# 装完/失败都恢复，不然插着线屏幕就一直亮着
+trap 'AS "svc power stayon false" >/dev/null 2>&1' EXIT
+
 WORK="$HERE/.tmp/install-work"
 mkdir -p "$WORK"
 

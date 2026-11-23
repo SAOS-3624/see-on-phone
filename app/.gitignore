@@ -1,0 +1,17 @@
+# 构建产物
+build/
+*.apk
+*.apk.idsig
+# ⚠️ dsh.keystore **故意不忽略**：覆盖安装（pm install -r）要求签名一致，
+#    仓库里没有它，别人重新生成的密钥装不上已经装了旧版的手机。
+
+# 临时目录（截图、uiautomator dump、对拍素材 —— 里面有本机绝对路径，绝不能进公开仓库）
+.tmp/
+
+# 系统和编辑器
+.DS_Store
+Thumbs.db
+
+# 对拍工具的临时工作区与输出（里面有本机绝对路径，且每次跑都会重建）
+tools/parity/.work-*/
+tools/parity/out/

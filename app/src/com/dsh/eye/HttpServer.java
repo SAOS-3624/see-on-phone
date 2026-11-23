@@ -57,6 +57,17 @@ final class HttpServer {
         /** 同步问一句，拿回回答。给 PC 端调这个 App 用，也给自测用。 */
         default String askOnce(String text, int timeoutSec) { return "no brain"; }
 
+        /**
+         * 同上，但**指定模式**（`chat` / `agent` / `web`）。
+         *
+         * 为什么需要：`http` / `look` / `files` 这些工具只在 Agent 下才有，
+         * 自测"链接通不通""工具会不会调"必须能点到那个模式 —— 否则只能靠人手在
+         * 手机上点，一晚上验不了几次。
+         */
+        default String askOnce(String text, String mode, int timeoutSec) {
+            return askOnce(text, timeoutSec);
+        }
+
         /** 会话+记忆导出成摊平目录（顺带打个 zip），返回 JSON。 */
         default String exportData() { return "{\"ok\":false,\"error\":\"not supported\"}"; }
 
@@ -300,9 +311,15 @@ final class HttpServer {
          * 要让 PC 端 agent 跟它说话、或者自测时问一句，都得有个能发消息的口子。
          */
         if (path.equals("/ask")) {
-            int sec = 30;
-            try { sec = Integer.parseInt(params.getOrDefault("timeout", "30")); } catch (Throwable ignored) { }
-            String r = src.askOnce(params.get("text"), Math.max(5, Math.min(90, sec)));
+            int sec = 60;
+            try { sec = Integer.parseInt(params.getOrDefault("timeout", "60")); } catch (Throwable ignored) { }
+            /**
+             * 上限从 90 秒放到 600：`/ask` 是**同步**接口，回答写多久它就等多久。
+             * 90 秒会把"长思考 + 长回答"从中间掐断 —— 用户看到的就是"说了一半没了"，
+             * 而真正的回答其实还在生成。
+             */
+            String r = src.askOnce(params.get("text"), params.get("mode"),
+                Math.max(5, Math.min(600, sec)));
             send(s, 200, "text/plain; charset=utf-8", r.getBytes("UTF-8"));
             return;
         }

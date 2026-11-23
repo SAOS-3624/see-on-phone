@@ -52,6 +52,24 @@ final class Speaker {
         java.util.concurrent.Executors.newSingleThreadExecutor();
     private volatile int edgeOk, edgeCacheHit, edgeFail;
     private volatile String edgeErr;
+    /**
+     * 打断代际。**每句话、每次"闭嘴"都 +1**，跑着的任务看到自己的 gen 过期就立刻收工。
+     *
+     * 以前只有一个 `MediaPlayer.stop()`：正在合成的那个任务完全不知道被叫停了，
+     * 合成完照样开口，用户按了"别念了"还会接着念一段（see-now 那边叫"新顶旧"，同一件事）。
+     */
+    private volatile int speakGen;
+    /** 当前正在播的流（打断时要连带拆掉解码器和扬声器）。 */
+    private volatile Mp3Stream stream;
+    /**
+     * 有没有任务正在跑（合成/播放中）。
+     *
+     * 只在**真有任务在跑**时才值得掐连接：空闲时把常驻连接掐掉，下一句话要多花
+     * 1.5 秒重新握手（实测：新连接首块 1477ms，复用 300ms）。
+     */
+    private volatile boolean edgeBusy;
+    /** 最近一次"第一个音频块出声"用了多少毫秒（0 = 还没测过）。 */
+    private volatile long edgeFirstMs;
 
     /** 系统里实际可用的中文音色名（`Voice.getName()`，华为上就是 `xiaoxuan` 这种）。 */
     private final java.util.List<android.speech.tts.Voice> voices = new java.util.ArrayList<>();
@@ -125,9 +143,16 @@ final class Speaker {
             final String t = s;
             final String v = edgeVoice;
             final String r = edgeRate;
+            /**
+             * **新顶旧**：新的一句话进来，先把正在念的那句掐掉。
+             * 不掐的话两句会叠着响，或者旧的那句合成完又冒出来接在新句子后面。
+             * `edgeBusy` = 有没有任务在跑：空闲时不关连接，下一句能省 1.5 秒握手。
+             */
+            interrupt(edgeBusy);
+            final int gen = speakGen;
             try {
                 edgeQ.submit(new Runnable() {
-                    public void run() { speakEdge(t, v, r); }
+                    public void run() { speakEdge(t, v, r, gen); }
                 });
                 lastText = s;
                 lastAt = System.currentTimeMillis();
@@ -371,33 +396,150 @@ final class Speaker {
     }
 
     /**
-     * 合成 → 播 → 存缓存；**任何一步失败就回落系统 TTS**。
+     * 念一段（在线音色）：**按句切开，逐句边收边播**；任何一步失败就回落系统 TTS。
      *
      * 跑在 {@link #edgeQ} 的线程上，所以可以直接阻塞。
+     *
+     * ## 为什么要按句切
+     *
+     * 以前整段丢进去合成：一段 1000 字的回答要等 5~10 秒才出声，用户以为没反应。
+     * 切开之后第一句（≤120 字）就开始收音频，后面的句子复用同一条连接接着合成，
+     * 听感是连贯的。实测（桌面探针跑真实协议，见 {@link EdgeTts}）：
+     *
+     * | | 第一块音频 | 整句收齐 |
+     * |---|---|---|
+     * | 冷启动（要握手） | 1.3~1.5s | 1.4~1.6s |
+     * | 复用连接（第 2 句起） | **200~300ms** | 230~400ms |
+     *
+     * 所以一段 500 字、切成 4 句的回答：第一句 1.5 秒开口，之后每句 300ms 就接上，
+     * 而以前要等整段合成完（≈6 秒）才有第一个字。
+     *
+     * ## 打断
+     *
+     * `gen != speakGen` 就是"用户又说话了/关了窗"：**立刻收工，且不回落系统音** ——
+     * 被打断不是失败，再去念一句就是错的。
      */
-    private void speakEdge(String text, String voice, String rate) {
-        byte[] mp3 = null;
-        java.io.File cf = EdgeTts.cacheFile(text, voice, rate);
-        mp3 = EdgeTts.readCache(cf);
-        if (mp3 != null) {
-            edgeCacheHit += 1;
-        } else {
-            try {
-                mp3 = EdgeTts.synth(text, voice, rate);
-                EdgeTts.writeCache(cf, mp3);
-                edgeOk += 1;
-            } catch (Throwable e) {
-                edgeFail += 1;
-                edgeErr = String.valueOf(e.getMessage() == null ? e : e.getMessage());
-                EyeLog.w("edge", "合成失败，回落系统音：" + edgeErr);
-                saySystem(text);
+    private void speakEdge(String text, String voice, String rate, int gen) {
+        if (gen != speakGen) return;                      // 排队期间就被顶掉了
+        edgeBusy = true;
+        try {
+            runParts(text, voice, rate, gen);
+        } finally {
+            edgeBusy = false;
+        }
+    }
+
+    private void runParts(String text, String voice, String rate, int gen) {
+        java.util.List<String> parts = split(text, CHUNK, MAX_CHUNKS);
+        if (parts.isEmpty()) return;
+        for (int i = 0; i < parts.size(); i += 1) {
+            if (gen != speakGen) return;                  // 开场前就被顶掉了
+            String part = parts.get(i);
+            java.io.File cf = EdgeTts.cacheFile(part, voice, rate);
+            byte[] hit = EdgeTts.readCache(cf);
+            if (hit != null) {
+                edgeCacheHit += 1;
+                if (playMp3(hit)) continue;
+                stopStream();
+                saySystem(rest(parts, i));                // 播不出来：这一句连同后面一起交给系统音
                 return;
             }
+            int r = streamOne(part, voice, rate, cf, gen);
+            if (r == DONE) continue;
+            if (r == CUT) return;                         // 被打断：静默收工
+            saySystem(rest(parts, i));                    // 失败：剩下的整段交给系统音
+            return;
         }
-        if (!playMp3(mp3)) {
+    }
+
+    /** 从第 `from` 句拼回去 —— 回落系统音时要念完，不能只念失败的这一句。 */
+    private static String rest(java.util.List<String> parts, int from) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < parts.size(); i += 1) sb.append(parts.get(i));
+        return sb.toString();
+    }
+
+    private static final int DONE = 0;
+    private static final int FAIL = 1;
+    private static final int CUT = 2;
+
+    /**
+     * 念一句：**边收边解码边播**，同时把整句攒下来写缓存。
+     *
+     * @return {@link #DONE} 正常念完 / {@link #FAIL} 失败（调用方回落系统音）/
+     *         {@link #CUT} 被打断（调用方静默收工，**不许**再出声）
+     */
+    private int streamOne(String text, String voice, String rate, java.io.File cacheTo, int gen) {
+        Mp3Stream s = new Mp3Stream();
+        java.io.File tmp = new java.io.File(app.getCacheDir(), "say-part.mp3");
+        java.io.FileOutputStream fo = null;
+        boolean played = false;
+        try {
+            s.start();
+            stream = s;
+            fo = new java.io.FileOutputStream(tmp, false);
+            final java.io.FileOutputStream foF = fo;
+            final Mp3Stream sF = s;
+            final int myGen = gen;
+            // 先收先播：sink 里写文件 + 直接喂解码器（feed 会阻塞，天然按播放速度节流）
+            EdgeTts.stream(text, voice, rate, new EdgeTts.Sink() {
+                public void audio(byte[] b, int off, int len) throws Exception {
+                    if (myGen != speakGen) throw new java.io.IOException("interrupted");
+                    foF.write(b, off, len);
+                    sF.feed(b, off, len);
+                }
+            });
+            fo.close();
+            fo = null;
+            s.finish();                                   // 等尾巴真的播完
+            long first = s.firstMs();
+            if (first > 0) edgeFirstMs = first;
+            s.stop();                                     // 释放解码器 + AudioTrack（finish 不会自己放）
+            stream = null;
+            s = null;
+            if (cacheTo != null && tmp.length() > 0) EdgeTts.writeCache(cacheTo, readAll(tmp));
+            try { tmp.delete(); } catch (Throwable ignored) { }
+            edgeOk += 1;
+            speaks += 1;
+            lastError = null;
+            lastText = text;
+            lastAt = System.currentTimeMillis();
+            return DONE;
+        } catch (Throwable e) {
+            boolean cut = gen != speakGen;                 // 被打断：静默收工，别回落
+            if (fo != null) { try { fo.close(); } catch (Throwable ignored) { } }
+            stopStream();
+            try { tmp.delete(); } catch (Throwable ignored) { }
+            if (cut) return CUT;
             edgeFail += 1;
-            saySystem(text);
+            edgeErr = String.valueOf(e.getMessage() == null ? e : e.getMessage());
+            EyeLog.w("edge", "流式合成失败，回落系统音：" + edgeErr);
+            return FAIL;
         }
+    }
+
+    private static byte[] readAll(java.io.File f) {
+        try {
+            byte[] b = new byte[(int) f.length()];
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            int off = 0;
+            while (off < b.length) {
+                int n = in.read(b, off, b.length - off);
+                if (n <= 0) break;
+                off += n;
+            }
+            in.close();
+            return off == b.length ? b : null;
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    /** 掐断当前的流式播放（从别的线程调）。 */
+    private void stopStream() {
+        Mp3Stream s = stream;
+        stream = null;
+        if (s != null) s.stop();
     }
 
     /** 播一段 MP3。**写临时文件再播** —— MediaPlayer 吃路径最稳，喂字节流各机型差异大。 */
@@ -443,6 +585,7 @@ final class Speaker {
     String edgeStatus() {
         if (edgeVoice.length() == 0) return "";
         return edgeVoice + " · 合成 " + edgeOk + " / 缓存 " + edgeCacheHit + " / 失败 " + edgeFail
+            + (edgeFirstMs > 0 ? " · 首声 " + edgeFirstMs + "ms" : "")
             + (edgeErr == null ? "" : "（" + edgeErr + "）");
     }
 
@@ -488,17 +631,34 @@ final class Speaker {
     java.util.List<String> voiceKeys() { return keysNow(); }
 
     void stop() {
+        interrupt(true);
         try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Throwable ignored) { }
         tts = null;
         ready = false;
-        stopMp();
         try { edgeQ.shutdownNow(); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 打断一切正在出声的东西：系统 TTS、流式解码器、媒体播放器，必要时**连合成连接也关掉**。
+     *
+     * `deep` 的区分很值钱：连接一关，下一句就要重新握一次手（实测 1477ms vs 复用 300ms）。
+     * 所以"新的一句顶掉旧的一句"只在**真有任务在跑**时才关连接；空闲时留着，
+     * 用户连着问两句，第二句立刻开口。
+     *
+     * @param deep true = 连 WebSocket 一起关（有流在跑时必须：只停播放的话，
+     *             正在收的那句还会继续收完、然后开口 —— 用户按了"别念了"又听见一句）
+     */
+    private void interrupt(boolean deep) {
+        speakGen += 1;
+        if (deep) EdgeTts.abort();
+        stopStream();
+        stopMp();
+        try { if (tts != null) tts.stop(); } catch (Throwable ignored) { }
     }
 
     /** 打断（用户又说话了 / 关了悬浮窗）：把正在念的那句掐掉。 */
     void shutUp() {
-        try { if (tts != null) tts.stop(); } catch (Throwable ignored) { }
-        stopMp();
+        interrupt(true);
     }
 
     /** 一段 JSON，给 `/tts/status` 和诊断用。 */
@@ -520,6 +680,7 @@ final class Speaker {
             + ",\"edgeOk\":" + edgeOk
             + ",\"edgeHit\":" + edgeCacheHit
             + ",\"edgeFail\":" + edgeFail
+            + ",\"edgeFirstMs\":" + edgeFirstMs
             + ",\"speaks\":" + speaks
             + ",\"lastAt\":" + lastAt
             + ",\"lastText\":" + (lastText == null ? "null" : "\"" + Json.esc(lastText) + "\"")

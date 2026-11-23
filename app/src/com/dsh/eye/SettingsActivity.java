@@ -145,6 +145,19 @@ public class SettingsActivity extends AppActivity {
                 cfg.setSummary(!cfg.summary());
                 apply();
             } });
+        /**
+         * 「回答长度」：**这就是模型嘴里那个"token 上限截断"**。
+         *
+         * 以前默认 800 token（≈500 汉字），讲一个知识点必然被切在半句上，
+         * 然后它自己说一句"回答被 token 上限截断了"——用户根本不知道那是什么。
+         * 现在默认 2000，想要长答案（读一本书、讲一章）可以调到 4000/8000。
+         */
+        row("edit", "回答长度", "自动 = 跟窗口一起算，想多长都行",
+            Config.maxTokensLabel(cfg.maxTokens()),
+            new Runnable() { public void run() {
+                cfg.setMaxTokens(cfg.nextMaxTokens());
+                apply();
+            } });
         row("edit", "工具", "关掉就只聊天，不看也不记", cfg.tools() ? "开" : "关（纯聊天）",
             new Runnable() { public void run() {
                 cfg.setTools(!cfg.tools());

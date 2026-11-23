@@ -70,6 +70,9 @@ final class Markdown {
         SpannableStringBuilder out = new SpannableStringBuilder();
         String[] lines = src.split("\n", -1);
         boolean inCode = false;
+        String lang = "";
+        StringBuilder buf = new StringBuilder();
+        int[] pics = { 0 };                      // 一条消息最多画几张（防刷屏）
 
         for (int i = 0; i < lines.length; i += 1) {
             String line = lines[i];
@@ -77,20 +80,19 @@ final class Markdown {
 
             // 代码围栏：``` 或 ```java
             if (trimmed.startsWith("```")) {
-                inCode = !inCode;
+                if (!inCode) {
+                    inCode = true;
+                    lang = trimmed.substring(3).trim().toLowerCase(java.util.Locale.ROOT);
+                    buf.setLength(0);
+                } else {
+                    inCode = false;
+                    flushCode(out, lang, buf, true, pics);
+                    lang = "";
+                }
                 continue;
             }
             if (inCode) {
-                int st = out.length();
-                out.append("│ ");
-                out.append(line);
-                out.setSpan(new TypefaceSpan("monospace"), st, out.length(),
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                out.setSpan(new BackgroundColorSpan(CODE_BG), st, out.length(),
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                out.setSpan(new ForegroundColorSpan(CODE_FG), st, out.length(),
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                if (i < lines.length - 1) out.append('\n');
+                buf.append(line).append('\n');
                 continue;
             }
 
@@ -142,7 +144,35 @@ final class Markdown {
             appendInline(out, line);
             if (i < lines.length - 1) out.append('\n');
         }
+        // 流式回答还没写完围栏：按代码块显示（**不尝试画**，半张图画出来比不画更误导）
+        if (inCode) flushCode(out, lang, buf, false, pics);
         return out;
+    }
+
+    /**
+     * 一段围栏内容的归宿。
+     *
+     * ⚠️ **SVG 不在这里画**：`ImageSpan` 这条路在真机上验证过 —— 占位、布局高度都对，
+     * 就是不画（换 `BitmapDrawable` 也一样）。所以改由 {@link Bubbles} 把 ```svg 段
+     * 抽出来，用真正的 `ImageView` 放进气泡（`Svg.extract`）。
+     * 这里只管代码块，SVG 段落由调用方在渲染前就摘走。
+     */
+    private static void flushCode(SpannableStringBuilder out, String lang, StringBuilder buf,
+                                  boolean closed, int[] pics) {
+        String body = buf.toString();
+        if (body.length() == 0) return;
+        String[] ls = body.split("\n", -1);
+        for (int k = 0; k < ls.length; k += 1) {
+            int st = out.length();
+            out.append("│ ").append(ls[k]);
+            out.setSpan(new TypefaceSpan("monospace"), st, out.length(),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            out.setSpan(new BackgroundColorSpan(CODE_BG), st, out.length(),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            out.setSpan(new ForegroundColorSpan(CODE_FG), st, out.length(),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            out.append('\n');
+        }
     }
 
     private static boolean isBullet(String s) {

@@ -39,6 +39,12 @@ final class Config {
     private static final String K_COST = "costMicros";
     private static final String K_LAST_IN = "lastIn";
     private static final String K_LAST_OUT = "lastOut";
+    /** 最近一轮输入里**命中缓存**的部分（0 = 没命中 / 端点没给）。 */
+    private static final String K_LAST_HIT = "lastHit";
+    /** 累计（token）：DSH 那种"总共用了多少 / 命中多少"。 */
+    private static final String K_SUM_IN = "sumIn";
+    private static final String K_SUM_OUT = "sumOut";
+    private static final String K_SUM_HIT = "sumHit";
     private static final String K_LAST_TOOLS = "lastTools";
     private static final String K_LAST_COST = "lastCostMicros";
     private static final String K_VOICE = "ttsVoice";
@@ -119,7 +125,18 @@ final class Config {
      * `deepseek-chat` / `deepseek-reasoner` 已于 2026-07-24 弃用，同样在迁移里换掉。
      */
     static final String DEFAULT_MODEL = "deepseek-flash";
-    static final String DEFAULT_VOICE = "";
+    /**
+     * 默认音色 = **小轩（在线）**。
+     *
+     * 2026-11-23 用户拍板改的：以前默认 `""`（系统 TTS，华为那三个十年前的系统嗓），
+     * 想听小轩得自己去设置页选。现在装完就有人说人话。
+     *
+     * 三条护栏不变，所以"默认联网"这件事不会咬人：
+     *   · 合成失败 / 没网 / 403 → **自动回落系统 TTS**（{@code Speaker.streamOne} 的 FAIL 分支）；
+     *   · 设置页选「系统默认」就彻底不走网络（这里存的是空串，`ttsVoice()` 会返回空串）；
+     *   · 常用短句有本地缓存（`DSH-Go/tts/<sha1>.mp3`），日常几乎不触网。
+     */
+    static final String DEFAULT_VOICE = "edge:zh-CN-XiaoxuanNeural";
 
     /**
      * 思考四档。顺序就是设置页的循环顺序（由浅入深 → 关）。
@@ -421,17 +438,34 @@ final class Config {
     }
 
     /** 最近一轮的用量（重启后"本轮"还能显示，不用把每条消息都存 cost）。 */
-    void setLastTurn(int in, int out, int tools, double usd) {
-        sp.edit().putInt(K_LAST_IN, in).putInt(K_LAST_OUT, out)
+    /**
+     * 记一轮的用量。
+     *
+     * `hit` 是**输入里命中前缀缓存**的部分 —— DSH 的用量面板就是按
+     * "输入（命中 / 未命中）+ 输出"三行拆的，因为它直接决定了这一轮多少钱
+     * （命中价只有未命中的 1/50）。旧版本只存 in/out，所以界面只能显示"输入 N"，
+     * 用户看不出缓存到底有没有起作用。
+     */
+    void setLastTurn(int in, int out, int hit, int tools, double usd) {
+        sp.edit().putInt(K_LAST_IN, in).putInt(K_LAST_OUT, out).putInt(K_LAST_HIT, hit)
             .putInt(K_LAST_TOOLS, tools)
             .putLong(K_LAST_COST, Math.max(0, Math.round(usd * 1_000_000.0)))
+            .putInt(K_SUM_IN, sumIn() + in)
+            .putInt(K_SUM_OUT, sumOut() + out)
+            .putInt(K_SUM_HIT, sumHit() + hit)
             .apply();
     }
 
     int lastIn() { return sp.getInt(K_LAST_IN, 0); }
     int lastOut() { return sp.getInt(K_LAST_OUT, 0); }
+    int lastHit() { return sp.getInt(K_LAST_HIT, 0); }
     int lastTools() { return sp.getInt(K_LAST_TOOLS, 0); }
     double lastCostUsd() { return sp.getLong(K_LAST_COST, 0L) / 1_000_000.0; }
+
+    /** 累计输入 / 输出 / 命中（token）。DSH 那种"总共用了多少"的统计。 */
+    int sumIn() { return sp.getInt(K_SUM_IN, 0); }
+    int sumOut() { return sp.getInt(K_SUM_OUT, 0); }
+    int sumHit() { return sp.getInt(K_SUM_HIT, 0); }
 
     /**
      * 音色的键。三种形态，**靠前缀区分**（不用再加一个开关字段）：
@@ -732,21 +766,72 @@ final class Config {
 
     // ---------------------------------------------------------------- 请求
 
-    /** 单次回答的 token 上限。v4 统一 800 —— 240 会把答案截在半句。 */
+    /**
+     * 单次回答的 token 上限。**0 = 自动（默认）**，由 {@link Brain#autoMaxTokens} 现算。
+     *
+     * ## 为什么默认从"800"改成"自动"
+     *
+     * 800 的来历是 v4 的"手机上一句话别太长"，2000 是 11-22 的半修 —— 两者都错在
+     * **把省钱放在了质量前面**：思考 token 也算在输出里，开"高"思考先花 1500~3000，
+     * 正文刚开头就被切。用户的原话是"我不明白你为什么要设置这个上限"。
+     *
+     * 真正的约束不是"我想让它写多少"，而是**窗口还剩多少**：
+     * `1M − 这次输入 − 余量`，上限再夹到官方的 384K。所以自动模式下
+     * "思考再长也不会被截断"，同时也不会因为 `max_tokens` 大于剩余窗口被服务端 400。
+     *
+     * 想省钱的人仍然可以手选一个固定值（设置 → 回答长度）。
+     */
     int maxTokens() {
-        int v = sp.getInt(K_MAXTOK, 800);
-        return v >= 200 && v <= 4000 ? v : 800;
+        int v = sp.getInt(K_MAXTOK, 0);
+        if (v <= 0) return 0;                    // 自动
+        return v >= 1000 && v <= 384_000 ? v : 0;
+    }
+
+    void setMaxTokens(int v) {
+        if (v <= 0) { sp.edit().putInt(K_MAXTOK, 0).apply(); return; }
+        sp.edit().putInt(K_MAXTOK, Math.max(1000, Math.min(384_000, v))).apply();
     }
 
     /**
-     * 一次 HTTP 请求最多等多久（秒）。
+     * 给"这次回答"预留多少上下文（只用于 `contextFor()` 的预算，**不是发给服务端的值**）。
      *
-     * v4 默认 **60**（以前 30）：开"高"思考时一次要想 10~20 秒，而工具轮还要再来一次。
-     * 30 秒会在最该等的时候先失败。
+     * 自动模式下不能按 384K 预留：那会把历史压到 50 万以下，正常聊天根本用不掉，
+     * 白白丢掉旧对话。留 16K 就够装下绝大多数回答；真写到更长，是赚的。
+     */
+    int answerReserve() {
+        int v = maxTokens();
+        return v > 0 ? v : 16_384;
+    }
+
+    /** 回答长度的档位。0 = 自动（推荐）。 */
+    static final int[] MAXTOK_CHOICES = { 0, 8_000, 16_000, 32_000, 65_536, 131_072 };
+
+    int nextMaxTokens() {
+        int cur = maxTokens();
+        for (int i = 0; i < MAXTOK_CHOICES.length; i += 1) {
+            if (MAXTOK_CHOICES[i] == cur) {
+                return MAXTOK_CHOICES[(i + 1) % MAXTOK_CHOICES.length];
+            }
+        }
+        return 0;
+    }
+
+    /** `自动（不设限）` / `32000 tok（约 2.1 万字）`。 */
+    static String maxTokensLabel(int v) {
+        if (v <= 0) return "自动（不设限）";
+        return v + " tok（约 " + (v * 2 / 3 / 1000) + " 千字）";
+    }
+
+    /**
+     * 一次 HTTP 请求最多等多久（秒）。**默认 180**（以前 60）。
+     *
+     * 这是 **socket 读超时**（"多久没有新字节就断"），不是总时长：流式有 token 进来
+     * 就一直续期。所以它挡的是"服务端卡死"，不是"回答太长"。
+     * 但长思考 + 大上下文时，服务端预填阶段可能几十秒不吐字节 —— 60 秒会在那时误杀。
      */
     int timeoutSec() {
-        int v = sp.getInt(K_TIMEOUT, 60);
-        return v >= 10 && v <= 180 ? v : 60;
+        int v = sp.getInt(K_TIMEOUT, 180);
+        return v >= 10 && v <= 300 ? v : 180;
     }
 
     /** 排障：把所有键原样吐出来（`/?peek=1`）。key 脱敏。 */

@@ -26,6 +26,30 @@ import java.util.List;
  */
 final class Conv {
 
+    /**
+     * `file_id → 页数`（只在本进程里有意义）。
+     *
+     * **故意放在 Conv 而不是 Uploads**：`Conv` 要能在电脑 JVM 上离线编（`caps` 那套
+     * 纯 Java 契约），不能 import 任何 `android.*`。所以由 `Uploads`（它才碰得到
+     * `PdfRenderer`）在数完之后**调进来**，Conv 只负责记和用。
+     *
+     * 不做持久化：重启后拿不到就退回按字节估，差的只是"估得准不准"。
+     */
+    private static final java.util.Map<String, Integer> PAGES =
+        new java.util.concurrent.ConcurrentHashMap<String, Integer>();
+
+    static void rememberPages(String fileId, int pages) {
+        if (fileId == null || fileId.length() == 0 || pages <= 0) return;
+        PAGES.put(fileId, pages);
+    }
+
+    /** 这个 file_id 的页数；不知道返回 0。 */
+    static int pagesOf(String fileId) {
+        if (fileId == null || fileId.length() == 0) return 0;
+        Integer n = PAGES.get(fileId);
+        return n == null ? 0 : n;
+    }
+
     private Conv() { }
 
     /** 磁盘上的一条消息。字段顺序就是 {@link ConvStore} 的行格式，改动要两边一起改。 */
@@ -154,14 +178,22 @@ final class Conv {
         /**
          * 一个 file 块大概要多少 token。
          *
-         * 估算口径：服务端解析出的文字量 ≈ 文件字节的 1/3000~1/5000，取 {@code size/4000}，
-         * 再夹到 200~20000（防 0 字节文件算成 0、防 100MB PDF 估成 25 万把预算一次吃光）。
-         * 客户端拿不到真实值，这个数唯一用途是"别把请求撑爆"，所以宁可估大。
+         * ## 为什么不能只看字节
+         *
+         * 旧口径 `size / 4000` 再夹到 **200~20000**：一本 240 页的 PDF（≈17 万 token）
+         * 会被算成 2 万 —— 预算里凭空多出 15 万的位置，于是"传了书就问不出东西"。
+         * 上限 2 万本来是防"100MB 文件算成 25 万把预算一次吃光"，但真正该做的是
+         * **如实算大**，让用户看到"这本书装不下"，而不是偷偷按小数字过账。
+         *
+         * 现在优先用页数（上传时 `PdfRenderer` 数出来的，见 {@link #rememberPages}）：
+         * 一页正文 ≈ 700 token —— 这个数比任何按字节的猜法都准。
          */
         int tokens() {
+            int pages = pagesOf(fileId);
+            if (pages > 0) return pages * 700;
             long n = size / 4000L;
             if (n < 200L) return 200;
-            if (n > 20000L) return 20000;
+            if (n > 400_000L) return 400_000;
             return (int) n;
         }
     }
@@ -371,6 +403,24 @@ final class Conv {
                 int t = tokensOf(out.get(i), true);   // 按最坏情况算（图全带）
                 if (sum + t > budget && i < out.size() - 1) { cut = i + 1; break; }
                 sum += t;
+            }
+            /**
+             * **带附件的消息不许裁**（v2.6.2）。
+             *
+             * 裁剪是从**最新**往回攒、超预算就丢掉更早的 —— 而"上传一本书"那条正好是
+             * 最早的一条，于是聊天几轮之后书就被裁掉了：用户看到的是"传了书，它却忘了"。
+             * 书在那条消息里（`file` 块），丢掉它等于把整本书从上下文里抽走。
+             *
+             * 只在"这本书本身没占掉大半个预算"时才钉住：真装不下还硬钉，请求会超出模型
+             * 窗口（那时该做的是提示用户先编目，不是假装装得下）。
+             */
+            int pin = -1;
+            for (int i = 0; i < out.size(); i += 1) {
+                Msg m = out.get(i);
+                if (m != null && m.atts != null && !m.atts.isEmpty()) pin = i;
+            }
+            if (cut > 0 && pin >= 0 && pin < cut && tokensOf(out.get(pin), true) <= budget / 2) {
+                cut = pin;
             }
             if (cut > 0) {
                 while (cut < out.size() && !"user".equals(out.get(cut).role)) cut += 1;

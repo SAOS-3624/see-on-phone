@@ -884,6 +884,15 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      * 的回答额度，剩下的才给历史。不扣的话用户选 900k 就会真的发出 900k + 两千，
      * 撞上 1M 的窗口边界直接 400。
      */
+    /**
+     * **这一轮要带的文档估算占多少 token**（一本书可能就是十几万）。
+     *
+     * 为什么要单独留一格：`contextFor()` 只看得见**历史**，而当前这一句带的附件是在
+     * `compose()` 里才加进去的 —— 不把它先算进预算，历史就会把"书该占的位置"吃掉，
+     * 表现成"传了书还问不出东西"。`send()` 在算预算之前把它填上。
+     */
+    private int docTokensThisTurn;
+
     private java.util.List<Conv.Out> contextFor() {
         if (cfg == null) return null;
         java.util.List<Conv.Msg> all;
@@ -891,10 +900,21 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             all = new java.util.ArrayList<>(history);
         }
         int overhead = Conv.textTokens(Memory.block(cfg))
-            + 1_500                       // 四个工具的定义（每轮都发）
-            + cfg.maxTokens()             // 这一次的回答额度
+            + 1_500                       // 工具定义（每轮都发）
+            + cfg.answerReserve()         // 这一次的回答额度（自动模式只留 16K，不是 384K）
             + 300;                        // system prompt
-        int budget = Math.max(1_500, cfg.ctxTokens() - overhead);
+        /**
+         * 文档预算（v2.5.9）：一本书进来之前先给它留位置。
+         *
+         * 以前完全不扣 —— 传一本 240 页的书（≈17 万 token），历史只按文字算，
+         * 于是"预算 64k"实际发了 17 万，模型看到的还是被服务端截过的残本。
+         */
+        int bookTok = Math.max(0, docTokensThisTurn);
+        int budget = Math.max(1_500, cfg.ctxTokens() - overhead - bookTok);
+        if (bookTok > 0 && bookTok > cfg.ctxTokens() * 6 / 10) {
+            EyeLog.w("ctx", "文档就占 " + bookTok + " token（预算 " + cfg.ctxTokens()
+                + "），历史只剩 " + budget + " —— 这本书已经装不下了");
+        }
         // 轮数闸已删：`Conv.trim` 的 maxTurns 恒传"不限"，真正管事的只有预算。
         java.util.List<Conv.Msg> kept = Conv.trim(all, Config.TURNS_UNLIMITED, budget);
         /**
@@ -1381,12 +1401,33 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
             notifyError(Err.text(plan.blocked));
             return;
         }
+        /**
+         * 「工具」总开关（设置 → 工具 → 关）。
+         *
+         * 关掉之后**一个工具都不带**，退回纯聊天 —— 以前这个开关只改设置页的显示，
+         * 请求里照样带 9 个工具，用户以为关掉了其实没有。
+         */
+        if (!cfg.tools()) Caps.mute(plan);
         EyeLog.w("plan", plan.toString() + " q=" + head(t, 30));
         final Asker asker = new Asker(cfg, this);
         current = asker;
         busyRound = true;
         lastRoundAt = System.currentTimeMillis();
         newTurn();
+
+        /**
+         * 这一轮带的文档要占多少上下文 —— `contextFor()` 里扣掉。
+         *
+         * **必须每轮重算**（含"没有附件"的那几轮清零）：书在历史里会由
+         * `Conv.trim` 按 `Att.tokens()` 单独计一遍，这里算的是"这一句新带进来的"，
+         * 不清零就会一直按"带着一本书"去裁历史。
+         */
+        docTokensThisTurn = 0;
+        if (docs != null) {
+            for (Conv.Att d : docs) {
+                if (d != null) docTokensThisTurn += d.tokens();
+            }
+        }
 
         try { asks.submit(new Runnable() {
             /**
@@ -1472,7 +1513,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
                         String body = partial == null ? "" : partial.trim();
                         String out = body.length() == 0 ? "（已停止）" : body + "\n\n（已停止）";
                         Proto.Reply stop = Asker.reply(cfg, out, null, 0, plan, null, null, null,
-                            null, false, true, 0, 0);
+                            null, false, true, null);
                         java.util.List<String> files =
                             rememberTurn(pendingUser, out, null, 0, discardOr(shots), docs, stop);
                         lastLook = null;
@@ -1484,7 +1525,7 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
                     public void onText(String out, String reasoning, long thinkMs) {
                         // 老签名兜底（正常情况下走 onReply）
                         onReply(Asker.reply(cfg, out, reasoning, thinkMs, plan, null, null, null,
-                            null, false, false, 0, 0));
+                            null, false, false, null));
                     }
 
                     /**
@@ -2319,16 +2360,33 @@ public class EyeService extends Service implements CameraEngine.Sink, HttpServer
      */
     @Override
     public String askOnce(String text, int timeoutSec) {
+        return askOnce(text, null, timeoutSec);
+    }
+
+    /**
+     * 同上，**可以指定模式**（`chat` / `agent` / `web`）。
+     *
+     * 存在理由只有一个：`http` 这类工具只在 Agent（+联网）的工具表里，
+     * 自测"接口通不通 / 它到底会不会调"必须能切到那个模式 —— 否则每次都要
+     * 用手指在手机上点一遍，一晚上验不了几回。
+     */
+    @Override
+    public String askOnce(String text, String mode, int timeoutSec) {
         final String t = text == null ? "" : text.trim();
         if (t.length() == 0) return "text 不能为空";
         if (!cfg.direct()) return "还没填 API key";
+        Caps.Mode m = Caps.Mode.of(mode);
+        docTokensThisTurn = 0;      // 这个入口不带附件，别沿用上一条消息的书
         final java.util.List<Conv.Out> ctx = contextFor();
+        final Caps.Plan plan = Caps.plan(m == null ? Caps.Mode.CHAT : m,
+            cfg.think(), cfg.apiModel(), false, false, true, cfg.allowDocsInWeb(), cfg.web());
+        if (!cfg.tools()) Caps.mute(plan);
         newTurn();
         final Asker asker = new Asker(cfg, this);
         final String[] out = new String[1];
         final String[] reason = new String[1];
         final long[] thinkMs = new long[1];
-        asker.ask(t, (byte[]) null, ctx, new Asker.Cb() {
+        asker.ask(t, (java.util.List<byte[]>) null, null, ctx, plan, new Asker.Cb() {
             public void onTool(String name, String phase, String detail) {
                 Ui u = uiSink;
                 if (u != null) u.onTool(name, phase, detail);

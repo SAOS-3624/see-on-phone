@@ -126,6 +126,14 @@ final class Uploads {
         File cache;
         /** 原始字节数。 */
         long size;
+        /**
+         * PDF 的页数（其他格式是 0）。**只为两件事**：
+         *   1. 官方按页收文件解析费（$0.225 / 千页）；
+         *   2. 估算这本书要吃掉多少上下文（一页正文 ≈ 700 token）。
+         *
+         * 用 `PdfRenderer` 数 —— 系统自带，不引库、不加体积。
+         */
+        int pages;
         /** {@link #ST_WAIT} … {@link #ST_FAIL}。 */
         int state = ST_WAIT;
         /** 0..100（复制阶段是复制进度，上传阶段是上传进度）。 */
@@ -137,13 +145,26 @@ final class Uploads {
             return state == ST_OK && fileId != null && fileId.trim().length() > 0;
         }
 
-        /** 卡片的副标题：`1.2MB` / `上传中 34%` / `上传失败 · 点重试`。 */
+        /** 卡片的副标题：`1.2MB · 已就绪` / `上传中 34%` / `上传失败 · 点重试`。 */
         String statusText() {
             if (state == ST_UP) return "上传中 " + pct + "%";
-            if (state == ST_OK) return humanSize(size) + " · 已就绪";
+            if (state == ST_OK) return humanSize(size) + pagesBit() + " · 已就绪";
             if (state == ST_FAIL) return error == null || error.length() == 0
                 ? "上传失败 · 点重试" : error;
-            return humanSize(size) + " · 等待上传";
+            return humanSize(size) + pagesBit() + " · 等待上传";
+        }
+
+        /**
+         * ` · 240 页≈17万token`。
+         *
+         * 这个数字是**给用户看的预算**：一本书传进来之前，他得先知道"这本书要吃掉
+         * 整个上下文" —— 以前没有任何提示，传完才发现模型只看到一部分。
+         */
+        String pagesBit() {
+            if (pages <= 0) return "";
+            int tok = estimateTokens(pages);
+            return " · " + pages + " 页≈" + (tok >= 10_000
+                ? (tok / 10_000) + "万" : String.valueOf(tok)) + "token";
         }
 
         public String toString() {
@@ -354,10 +375,55 @@ final class Uploads {
         }
         j.cache = out;
         j.size = out.length() > 0 ? out.length() : j.size;
+        if ("pdf".equals(e)) j.pages = countPdfPages(out);
+        if (j.pages > 0) {
+            EyeLog.w("upload", "页数 " + j.name + " = " + j.pages
+                + "（≈" + estimateTokens(j.pages) + " token）");
+        }
         j.pct = 100;
         j.state = ST_WAIT;
         EyeLog.w("upload", "副本就绪 " + j.name + " " + humanSize(j.size));
         return j;
+    }
+
+    /**
+     * PDF 页数。**数不出来就返回 0**（不抛）：加密 PDF / 损坏文件不该让附件传不上去。
+     *
+     * `PdfRenderer` 是系统自带的（API 21+），不引任何库 —— 这也是为什么"PDF 优化"
+     * 一个字节体积都不涨。
+     */
+    static int countPdfPages(File f) {
+        android.os.ParcelFileDescriptor fd = null;
+        android.graphics.pdf.PdfRenderer r = null;
+        try {
+            fd = android.os.ParcelFileDescriptor.open(f,
+                android.os.ParcelFileDescriptor.MODE_READ_ONLY);
+            r = new android.graphics.pdf.PdfRenderer(fd);
+            return r.getPageCount();
+        } catch (Throwable e) {
+            EyeLog.w("upload", "数不了页数（" + f.getName() + "）：" + e);
+            return 0;
+        } finally {
+            try { if (r != null) r.close(); } catch (Throwable ignored) { }
+            try { if (fd != null) fd.close(); } catch (Throwable ignored) { }
+        }
+    }
+
+    /**
+     * 一本书大概吃多少上下文。
+     *
+     * 一页 A4 正文 ≈ 700 token（中文 1000 字上下，1 token ≈ 1.5 字）；
+     * 扫描件/PPT 走 OCR 会更多，但那种页面本来字就少，取 700 是个保守中值。
+     */
+    static int estimateTokens(int pages) {
+        return pages <= 0 ? 0 : pages * 700;
+    }
+
+    /** 这一份附件估算要占多少上下文（非 PDF 按字节估：中文 UTF-8 约 3 字节/字）。 */
+    static int estimateTokens(Job j) {
+        if (j == null) return 0;
+        if (j.pages > 0) return estimateTokens(j.pages);
+        return (int) Math.min(Integer.MAX_VALUE, j.size / 3);
     }
 
     private static Job fail(Job j, String why) {
@@ -445,6 +511,20 @@ final class Uploads {
                     File copy = j.cache;
                     j.cache = null;
                     if (copy != null) { try { copy.delete(); } catch (Throwable ignored) { } }
+                    /**
+                     * 文件解析费**在这里记**（$0.225/千页，官方按页收）。
+                     *
+                     * 为什么不在"第一次引用"时记：解析是上传那一刻在服务端发生的，
+                     * 之后同一个 `file_id` 不会再解析一次。记在别处就会重复计费，
+                     * 或者永远漏掉 —— 一本 300 页的书是 $0.0675，比一轮对话贵得多。
+                     */
+                    if (j.pages > 0) {
+                        double fee = j.pages * Cost.PARSE_PAGE;
+                        cfg.addCostUsd(fee);
+                        Conv.rememberPages(j.fileId, j.pages);
+                        EyeLog.w("upload", "解析费 " + j.pages + " 页 → " + Cost.fmt(fee)
+                            + "（累计 " + Cost.fmt(cfg.costTotalUsd()) + "）");
+                    }
                     EyeLog.w("upload", "成功 " + j.name + " → " + j.fileId);
                     postDone(cb, j);
                 } else if (wasCancelled) {

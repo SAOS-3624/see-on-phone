@@ -80,6 +80,19 @@ final class EdgeTts {
 
     private EdgeTts() { }
 
+    /**
+     * 音频块回调：**边收边交给播放器**（流式）。
+     *
+     * 一句话的 MP3 是分很多帧过来的（每帧前面两个字节是头长）。老路径把它们全攒进
+     * `byte[]` 再播 —— 一句 120 字要等 1~3 秒才出声。有了这个回调，第一块到了就能播，
+     * 首声从"整句合成完"提前到"第一个音频帧"（实测 200~400ms）。
+     *
+     * 回调里抛异常 = 中止这次合成（打断就靠这个），异常会原样抛给调用方。
+     */
+    interface Sink {
+        void audio(byte[] data, int off, int len) throws Exception;
+    }
+
     // ---------------------------------------------------------------- 对外
 
     /**
@@ -90,10 +103,20 @@ final class EdgeTts {
      * @return MP3 字节；失败抛异常（调用方去回落系统 TTS）
      */
     static byte[] synth(String text, String voice, String rate) throws Exception {
+        return stream(text, voice, rate, null);
+    }
+
+    /**
+     * 流式合成：音频块一到就交给 `sink`，同时照样把整句攒下来（好写缓存）。
+     *
+     * @param sink 可空（空 = 老行为，只返回整段字节）
+     */
+    static byte[] stream(String text, String voice, String rate, Sink sink) throws Exception {
         String clean = sanitize(text);
         if (clean.trim().length() == 0) throw new IOException("空文本");
+        int[] got = new int[1];                 // 已经交给 sink 的字节数（决定能不能重试）
         try {
-            return once(clean, voice, rate, 0);
+            return turn(clean, voice, rate, sink, got);
         } catch (HandshakeError he) {
             /**
              * 403 多半是**本机时钟不准**（令牌按五分钟取整，偏了几分钟就对不上）。
@@ -106,8 +129,29 @@ final class EdgeTts {
             double adj = server - now;
             EyeLog.w("edge", "403，按服务端时间校正 " + String.format(Locale.ROOT, "%+.0f", adj) + "s 后重试");
             Drm.setSkew(Drm.skew() + adj);
-            return once(clean, voice, rate, 0);
+            return turn(clean, voice, rate, sink, got);
+        } catch (IOException e) {
+            /**
+             * 常驻连接被服务端收掉了 / 网络抖了一下 —— 换一条重试一次。
+             * 两个例外：
+             *  · 已经被打断（`abort()` 刚调过）：重试等于"叫停了还接着念"；
+             *  · 已经出过声（`got[0] > 0`）：重试会把开头再念一遍。
+             */
+            if (got[0] > 0 || System.currentTimeMillis() - abortedAt < 300) throw e;
+            EyeLog.w("edge", "合成失败（" + e.getMessage() + "），换新连接重试一次");
+            return turn(clean, voice, rate, sink, got);
         }
+    }
+
+    /** 掐断：把当前这条连接关掉（正在读它的线程会立刻抛异常退出）。 */
+    static void abort() {
+        abortedAt = System.currentTimeMillis();
+        Conn c;
+        synchronized (LOCK) {
+            c = warm;
+            warm = null;
+        }
+        if (c != null) c.close();
     }
 
     /** 缓存文件名：音色 + 语速 + 文本，任一变了就是另一份。 */
@@ -141,18 +185,80 @@ final class EdgeTts {
         for (File f : fs) { try { f.delete(); } catch (Throwable ignored) { } }
     }
 
-    // ---------------------------------------------------------------- 一次合成
+    // ---------------------------------------------------------------- 常驻连接
 
-    private static byte[] once(String text, String voice, String rate, int depth) throws Exception {
+    /**
+     * 一条握手完的 WebSocket。
+     *
+     * **为什么要常驻**：握手（TCP + TLS + 101）实测 600~900ms，而一句 30 字只念 2 秒 ——
+     * 每句都重开连接等于把一半时间花在建连上，多句回答会一顿一顿。
+     * 服务端一条连接可以连着吃多个 `Path:ssml`（每句一个新 `X-RequestId`），
+     * 这正是 see-now 那个常驻合成器做的事，这里照抄结论。
+     *
+     * ⚠️ 但连接的状态是**不可信**的：中途出错（打断、断网）之后不能再复用，
+     * 否则上一句残留的响应帧会串进下一句（表现为"念着念着冒出上一句的开头"）。
+     */
+    private static final class Conn {
+        Socket raw;
+        SSLSocket sock;
+        OutputStream out;
+        InputStream in;
+        boolean configSent;
+        long lastUsed;
+
+        void close() {
+            try { if (sock != null) sock.close(); } catch (Throwable ignored) { }
+            try { if (raw != null) raw.close(); } catch (Throwable ignored) { }
+            sock = null;
+            raw = null;
+            out = null;
+            in = null;
+        }
+    }
+
+    private static final Object LOCK = new Object();
+    private static Conn warm;
+    /** 空闲这么久就主动关掉：服务端反正也会掐，留着只会拿到一条"看起来能写、其实已死"的连接。 */
+    private static final long IDLE_MS = 20_000;
+    private static volatile long abortedAt;
+
+    /** 拿一条能用的连接（复用，不行就新开）。 */
+    private static Conn take() throws Exception {
+        synchronized (LOCK) {
+            if (warm != null) {
+                if (System.currentTimeMillis() - warm.lastUsed > IDLE_MS) {
+                    warm.close();
+                    warm = null;
+                } else {
+                    return warm;
+                }
+            }
+        }
+        Conn c = open();
+        synchronized (LOCK) { warm = c; }
+        return c;
+    }
+
+    /** 连接坏了：丢掉，下次重新握手（绝不复用状态可疑的连接）。 */
+    private static void drop(Conn c) {
+        synchronized (LOCK) {
+            if (warm == c) warm = null;
+        }
+        if (c != null) c.close();
+    }
+
+    private static Conn open() throws Exception {
+        Conn c = new Conn();
         Socket raw = new Socket();
-        SSLSocket sock = null;
+        c.raw = raw;
         try {
             raw.connect(new InetSocketAddress(HOST, 443), CONNECT_TIMEOUT);
             raw.setSoTimeout(READ_TIMEOUT);
             SSLSocketFactory f = (SSLSocketFactory) SSLSocketFactory.getDefault();
-            sock = (SSLSocket) f.createSocket(raw, HOST, 443, true);
+            SSLSocket sock = (SSLSocket) f.createSocket(raw, HOST, 443, true);
             sock.setSoTimeout(READ_TIMEOUT);
             sock.startHandshake();
+            c.sock = sock;
 
             String connId = uuidHex();
             String query = "?TrustedClientToken=" + Drm.TRUSTED_CLIENT_TOKEN
@@ -184,18 +290,40 @@ final class EdgeTts {
                 String date = headerOf(head, "date");
                 throw new HandshakeError(head == null ? "no response" : firstLine(head), date);
             }
+            c.out = out;
+            c.in = sock.getInputStream();
+            c.lastUsed = System.currentTimeMillis();
+            return c;
+        } catch (Throwable e) {
+            c.close();
+            throw e;
+        }
+    }
 
-            // ① 告诉服务端要什么格式
-            String ts = jsDate();
-            String cfg = "X-Timestamp:" + ts + "\r\n"
-                + "Content-Type:application/json; charset=utf-8\r\n"
-                + "Path:speech.config\r\n\r\n"
-                + "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{"
-                + "\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},"
-                + "\"outputFormat\":\"" + FORMAT + "\"}}}}\r\n";
-            writeFrame(out, 1, cfg.getBytes(UTF8));
+    /**
+     * 走一个 turn：发 SSML，收音频。
+     *
+     * `got[0]` 记"已经交给 sink 的字节数"——重试前要看它，出过声就不能重试（会把开头念两遍）。
+     */
+    private static byte[] turn(String text, String voice, String rate, Sink sink, int[] got)
+        throws Exception {
+        Conn c = take();
+        boolean ok = false;
+        try {
+            OutputStream out = c.out;
+            // ① 告诉服务端要什么格式（一条连接只要说一次）
+            if (!c.configSent) {
+                String cfg = "X-Timestamp:" + jsDate() + "\r\n"
+                    + "Content-Type:application/json; charset=utf-8\r\n"
+                    + "Path:speech.config\r\n\r\n"
+                    + "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{"
+                    + "\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},"
+                    + "\"outputFormat\":\"" + FORMAT + "\"}}}}\r\n";
+                writeFrame(out, 1, cfg.getBytes(UTF8));
+                c.configSent = true;
+            }
 
-            // ② 发 SSML
+            // ② 发 SSML（每句一个新 RequestId）
             String ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis'"
                 + " xml:lang='en-US'><voice name='" + voice + "'>"
                 + "<prosody pitch='+0Hz' rate='" + rate + "' volume='+0%'>"
@@ -203,14 +331,14 @@ final class EdgeTts {
                 + "</prosody></voice></speak>";
             String envelope = "X-RequestId:" + uuidHex() + "\r\n"
                 + "Content-Type:application/ssml+xml\r\n"
-                + "X-Timestamp:" + ts + "Z\r\n"
+                + "X-Timestamp:" + jsDate() + "Z\r\n"
                 + "Path:ssml\r\n\r\n"
                 + ssml;
             writeFrame(out, 1, envelope.getBytes(UTF8));
 
-            // ③ 收 MP3
+            // ③ 收 MP3（收到一块就交一块 —— 这就是"流式"的全部秘密）
             ByteArrayOutputStream audio = new ByteArrayOutputStream(64 * 1024);
-            InputStream in = sock.getInputStream();
+            InputStream in = c.in;
             int guard = 0;
             while (guard++ < 5000) {
                 Frame fr = readFrame(in);
@@ -224,7 +352,13 @@ final class EdgeTts {
                     if (fr.payload.length < 2) continue;
                     int hl = ((fr.payload[0] & 0xff) << 8) | (fr.payload[1] & 0xff);
                     if (hl > fr.payload.length) continue;
-                    audio.write(fr.payload, hl + 2, fr.payload.length - hl - 2);
+                    int from = hl + 2;
+                    int n = fr.payload.length - from;
+                    if (n > 0) {
+                        audio.write(fr.payload, from, n);
+                        got[0] += n;
+                        if (sink != null) sink.audio(fr.payload, from, n);
+                    }
                     if (audio.size() > MAX_AUDIO) break;
                 } else if (fr.opcode == 1) {          // 文本：turn.end 就是完了
                     String t = new String(fr.payload, UTF8);
@@ -233,10 +367,11 @@ final class EdgeTts {
             }
             byte[] mp3 = audio.toByteArray();
             if (mp3.length == 0) throw new IOException("没收到音频");
+            c.lastUsed = System.currentTimeMillis();
+            ok = true;
             return mp3;
         } finally {
-            try { if (sock != null) sock.close(); } catch (Throwable ignored) { }
-            try { raw.close(); } catch (Throwable ignored) { }
+            if (!ok) drop(c);
         }
     }
 

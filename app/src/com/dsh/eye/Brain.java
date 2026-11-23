@@ -121,7 +121,7 @@ final class Brain {
     }
 
     static void setReadTimeoutSec(int sec) {
-        readTimeoutMs = Math.max(10, Math.min(180, sec)) * 1000;
+        readTimeoutMs = Math.max(10, Math.min(300, sec)) * 1000;
     }
 
     // ---------------------------------------------------------------- 发
@@ -155,11 +155,101 @@ final class Brain {
      */
     static JSONObject build(Config cfg, Caps.Plan plan, JSONArray messages, boolean stream)
             throws Exception {
+        return build(cfg, plan, messages, stream, 0);
+    }
+
+    /**
+     * @param capOverride 非 0 = 这一次强制用这个 `max_tokens`（端点嫌自动值太大时的降级，
+     *                    见 `Asker` 里那个 400 分支）。0 = 走自动 / 用户设置。
+     */
+    static JSONObject build(Config cfg, Caps.Plan plan, JSONArray messages, boolean stream,
+                            int capOverride)
+            throws Exception {
         Caps.Plan p = plan != null ? plan
             : Caps.plan(Caps.Mode.CHAT, cfg.think(), cfg.apiModel(),
                 false, false, true, cfg.allowDocsInWeb(), cfg.web());
-        return assemble(cfg.apiModel(), cfg.maxTokens(), messages, stream,
+        /**
+         * `max_tokens`：用户设了固定值就用它；**自动（0）就按"窗口还剩多少"现算**。
+         *
+         * 这一步是"思考再长也不截断"的关键：`max_tokens` 是**包括思考**的总输出额度，
+         * 写死一个 2000 意味着开"高"思考时正文只剩几百 token。自动模式把它抬到
+         * `1M − 输入 − 余量`（再夹到官方 384K），既不会截断，也不会因为
+         * `max_tokens` 超过剩余窗口被服务端 400。
+         */
+        int cap = capOverride > 0 ? capOverride : cfg.maxTokens();
+        if (cap <= 0) cap = autoMaxTokens(messages);
+        return assemble(cfg.apiModel(), cap, messages, stream,
             p.thinking, p.effort, p.sendTemperature, toolsOf(p), p.title);
+    }
+
+    /** 官方窗口（1M）与单次输出上限（384K）。自动上限在这两个数之间算。 */
+    static final int WINDOW = 1_048_576;
+    static final int OUT_MAX = 384_000;
+    /** 给"估算误差 + 工具定义 + 系统提示"留的余量。 */
+    private static final int SAFETY = 16_384;
+
+    /**
+     * 自动输出上限 = `窗口 − 这次输入的估算 − 余量`，夹在 `[4096, 384000]`。
+     *
+     * 为什么要减：官方虽然允许 384K 输出，但 `输入 + 输出` 不能超过 1M 窗口。
+     * 一次带着 90 万 token 历史的请求再要 384K 输出，会被服务端直接判 400。
+     * 现算之后，"能写多长"永远等于"窗口真的还剩多少"。
+     */
+    static int autoMaxTokens(JSONArray messages) {
+        int in = promptTokensOf(messages);
+        int cap = WINDOW - in - SAFETY;
+        if (cap < 4_096) cap = 4_096;
+        if (cap > OUT_MAX) cap = OUT_MAX;
+        return cap;
+    }
+
+    /**
+     * 估算这次输入的 token 数。
+     *
+     * **必须跳过 base64**：一张宫格图 base64 之后是几十万字符，按字符数算会把
+     * 输出上限压到 4K —— 那正是"明明没多少字却被截断"的另一种成因。
+     * 图片按块计（宫格 ≈ 197 token，取 250），文件块按 1000 估。
+     *
+     * 中文按 **1 token ≈ 1.5 字** 折算，再留 10% 余量（宁可少算输出，不要超窗口）。
+     */
+    static int promptTokensOf(JSONArray messages) {
+        if (messages == null) return 0;
+        long chars = 0;
+        int blocks = 0;
+        for (int i = 0; i < messages.length(); i += 1) {
+            JSONObject m = messages.optJSONObject(i);
+            if (m == null) continue;
+            Object c = m.opt("content");
+            if (c instanceof String) {
+                chars += ((String) c).length();
+            } else if (c instanceof JSONArray) {
+                JSONArray parts = (JSONArray) c;
+                for (int k = 0; k < parts.length(); k += 1) {
+                    JSONObject p = parts.optJSONObject(k);
+                    if (p == null) continue;
+                    String type = p.optString("type", "");
+                    if ("text".equals(type)) {
+                        chars += p.optString("text", "").length();
+                    } else if ("image_url".equals(type)) {
+                        blocks += 250;
+                    } else if ("file".equals(type)) {
+                        blocks += 1_000;
+                    }
+                }
+            }
+            // 工具调用的参数/结果（assistant.tool_calls、tool.content 已经在上面按字符串算过）
+            JSONArray tc = m.optJSONArray("tool_calls");
+            if (tc != null) {
+                for (int k = 0; k < tc.length(); k += 1) {
+                    JSONObject one = tc.optJSONObject(k);
+                    JSONObject fn = one == null ? null : one.optJSONObject("function");
+                    if (fn != null) chars += fn.optString("arguments", "").length() + 40;
+                }
+            }
+        }
+        long tok = chars / 3 * 2;               // ÷1.5
+        tok = tok * 11 / 10;                    // +10%
+        return (int) Math.min(Integer.MAX_VALUE, tok + blocks);
     }
 
     /**
@@ -195,7 +285,11 @@ final class Brain {
             throws Exception {
         JSONObject b = new JSONObject();
         b.put("model", model);
-        b.put("max_tokens", maxTokens);
+        /**
+         * `max_tokens <= 0` = **这个键根本不写**，让服务端按自己的上限走。
+         * 这是"彻底去掉上限"的那条路，只在调用方明确要"不设限"时才会走到。
+         */
+        if (maxTokens > 0) b.put("max_tokens", maxTokens);
         b.put("messages", messages == null ? new JSONArray() : messages);
         b.put("stream", stream);
 
@@ -570,6 +664,14 @@ final class Brain {
         long thinkMs;
         int promptTokens;
         int completionTokens;
+        /**
+         * 输入里**命中前缀缓存**的那部分 token。
+         *
+         * 官方在 `usage` 里给 `prompt_cache_hit_tokens`（V4 系）；有些兼容端点改成
+         * `prompt_tokens_details.cached_tokens`，两个都读。拿不到就是 0 —— 计价按
+         * 全未命中算（高估，不会低报）。
+         */
+        int cachedTokens;
     }
 
     /**
@@ -593,8 +695,15 @@ final class Brain {
      */
     static StreamResult streamChat(Config cfg, Caps.Plan plan, JSONArray messages, StreamCb cb)
             throws Exception {
+        return streamChat(cfg, plan, messages, cb, 0);
+    }
+
+    /** @param capOverride 见 {@link #build(Config, Caps.Plan, JSONArray, boolean, int)} */
+    static StreamResult streamChat(Config cfg, Caps.Plan plan, JSONArray messages, StreamCb cb,
+                                   int capOverride)
+            throws Exception {
         aborting = false;
-        JSONObject body = build(cfg, plan, messages, true);
+        JSONObject body = build(cfg, plan, messages, true, capOverride);
         // 排障用：把**实际发出去的** tools 打出来（plan 说 search=true 不等于 body 里真有）
         JSONArray tj = body.optJSONArray("tools");
         StringBuilder tn = new StringBuilder();
@@ -609,6 +718,8 @@ final class Brain {
         }
         EyeLog.w("brain", "stream " + (plan == null ? "plan=-" : plan.toString())
             + " tools=" + (tj == null ? 0 : tj.length()) + "[" + tn + "]"
+            // max= 是**这次真正发出去的**输出额度（0 = 没写这个键，服务端自己定）
+            + " max=" + body.optInt("max_tokens", 0)
             + " msgs=" + messages.length() + " chars=" + body.toString().length());
         return streamBody(cfg, body, cb);
     }
@@ -638,6 +749,8 @@ final class Brain {
         String finish;
         int promptTokens;
         int completionTokens;
+        /** 输入里命中缓存的部分（见 {@link #cachedTokensOf}）。 */
+        int cachedTokens;
         /** 这一段思考是什么时候开始的（0 = 当前不在思考）。 */
         long thinkFrom;
         long thinkMs;
@@ -753,6 +866,29 @@ final class Brain {
         out.thinkMs = acc.thinkMs;
         out.promptTokens = acc.promptTokens;
         out.completionTokens = acc.completionTokens;
+        out.cachedTokens = acc.cachedTokens;
+    }
+
+    /**
+     * 从 `usage` 里取"命中缓存"的输入 token 数。**取不到返回 -1**（调用方保留原值）。
+     *
+     * 两种形状都要认：
+     * ```
+     * {"prompt_cache_hit_tokens": 1024, "prompt_cache_miss_tokens": 2000}   ← DeepSeek 原生
+     * {"prompt_tokens_details": {"cached_tokens": 1024}}                     ← OpenAI 兼容层
+     * ```
+     * 不能只认一种：这决定了计价里 1/50 价的那部分算不算得出来。
+     */
+    static int cachedTokensOf(JSONObject usage) {
+        if (usage == null) return -1;
+        if (usage.has("prompt_cache_hit_tokens")) {
+            return Math.max(0, usage.optInt("prompt_cache_hit_tokens", 0));
+        }
+        JSONObject d = usage.optJSONObject("prompt_tokens_details");
+        if (d != null && d.has("cached_tokens")) {
+            return Math.max(0, d.optInt("cached_tokens", 0));
+        }
+        return -1;
     }
 
     /**
@@ -786,6 +922,8 @@ final class Brain {
         if (usage != null) {
             acc.promptTokens = usage.optInt("prompt_tokens", acc.promptTokens);
             acc.completionTokens = usage.optInt("completion_tokens", acc.completionTokens);
+            int hit = cachedTokensOf(usage);
+            if (hit >= 0) acc.cachedTokens = hit;
         }
 
         JSONArray ch = o.optJSONArray("choices");
@@ -1018,6 +1156,8 @@ final class Brain {
             if (usage != null) {
                 out.promptTokens = usage.optInt("prompt_tokens", 0);
                 out.completionTokens = usage.optInt("completion_tokens", 0);
+                int hit = cachedTokensOf(usage);
+                if (hit >= 0) out.cachedTokens = hit;
             }
             JSONArray ch = o.optJSONArray("choices");
             if (ch == null || ch.length() == 0) return;

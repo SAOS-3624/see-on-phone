@@ -39,10 +39,17 @@ import java.util.Locale;
  */
 final class Asker {
 
-    /** 整轮最多耗多久（不管几轮工具）。 */
-    private static final long BUDGET_MS = 90_000;
-    /** Agent / 混合：16 步 + 搜索/读网页，90 秒不够；给到 5 分钟。 */
-    private static final long AGENT_BUDGET_MS = 300_000;
+    /**
+     * 一次提问最多耗多久（不管几轮工具）。
+     *
+     * ⚠️ 这个数**不是"回答长度上限"**：它在**两轮之间**才判，单次回答写多久都不会被它掐断
+     * （那是 `max_tokens` / 读超时的事）。它只防"工具来回 16 次停不下来"。
+     * 11-23 从 90 秒放宽到 5 分钟：长思考 + 长回答本来就要几分钟，90 秒会把
+     * 正常的多步任务判死。
+     */
+    private static final long BUDGET_MS = 300_000;
+    /** Agent / 混合：16 步 + 搜索/读网页；给到 15 分钟。 */
+    private static final long AGENT_BUDGET_MS = 900_000;
     /** 一轮最多问几次模型（Plan 没给时的兜底）。 */
     private static final int FALLBACK_ROUNDS = 3;
 
@@ -103,8 +110,8 @@ final class Asker {
      *      "忽略之前的指令"，模型看到的是像素，很容易当成命令执行。
      */
     private static final String SYSTEM =
-        "你是「鱼眼」，装在用户手机上的助手。你有三样别人没有的东西：手机摄像头、可调的显示档位、"
-        + "一份你自己能读能写的长期记忆。\n"
+        "你是「鱼眼」，装在用户手机上的助手。**你的能力以每一轮的工具表为准** —— "
+        + "看画面、读写文件、查资料、记东西，工具表里列出来的就是你能做的；没列的才叫没有。\n"
         + "\n"
         + "说话：中文，直接，不客套。长度跟着问题走 —— 一句能说清就别展开，需要细节就分点。"
         + "不要复述用户刚说的话，不要「好的，我来帮你看看」这种铺垫，直接给结论。\n"
@@ -120,6 +127,13 @@ final class Asker {
         + "关于档位：糊了/小了/字认不出 → `tune {tier:\"native\"}` 再 `look`；"
         + "图太多太贵太慢 → `tune {tier:\"compact\"}`；画面一直在动 → `tune {pace:\"dense\"}`。"
         + "什么时候该调你自己判断，不要问用户「要不要调清楚一点」。\n"
+        + "\n"
+        + "关于画图：用户要示意图 / 结构图 / 流程 / 对比时，**用 ```svg 代码块画** —— "
+        + "这边会真的把它渲染成图（不是显示代码）。画布写 `viewBox=\"0 0 640 360\"`；"
+        + "只用 `<rect> <line> <path> <circle> <text> <polygon>`；"
+        + "箭头用 `<polygon>` 画三角（不支持 marker）；"
+        + "不要用 `<style>` / CSS 类 / 渐变 / 滤镜。**图里必须有文字标签**（每个框都要写字），"
+        + "字号 ≥ 14。图是给用户看的，不是给你自己看的。\n"
         + "\n"
         + "关于记忆：只有用户让你记、或者你自己觉得**以后还用得上**的事才写。"
         + "别记流水账 —— 记忆会被每一轮发给模型，写多了等于每句话都在为它付钱。\n"
@@ -150,44 +164,63 @@ final class Asker {
         + "本轮**没有**摄像头、工作区、记忆工具：不要声称你看了画面或写了文件；"
         + "用户要动手就让他切到 Agent。";
 
-    private static final String AGENT_NOTE =
-        "\n\n【本轮是 Agent 模式】你可以连续多步调用工具：`look` 看画面、`files` 读写工作区、"
-        + "`memory_read` / `memory_write` 读写记忆、`tune` 调画质。需要动手时**直接调用**，不要先问；"
-        + "每一步的结果会回到你这里，最多 16 步。\n"
-        + "本轮**没有**联网搜索：遇到实时信息，如实说「这次没联网，切到联网再问」，不要编。";
-
     /**
-     * 混合模式（Agent + 联网）的 system 段。**它替换 {@link #AGENT_NOTE}，不是追加。**
+     * ⚠️ 老的 `AGENT_NOTE` / `HYBRID_NOTE` 两份**手写**清单已经删了（v2.5.9）。
      *
-     * ⚠️ `AGENT_NOTE` 里有「本轮**没有**联网搜索：…如实说『这次没联网，切到联网再问』」——
-     * 这一段**绝不能**出现在混合模式里：提示词说"没联网"、工具表里却有 `web_search`，
-     * 模型会挑提示词信，于是工具白给、用户明明开着联网却被告知"我没联网"。
-     * 所以这里是一份**完整重写**（不是字符串 replace：replace 依赖原文一字不差，
-     * 哪天改了 AGENT_NOTE 的措辞就会静默失效）。
+     * 它们的问题不是措辞，是**结构**：工具表在 `Tools`，清单在 `Asker`，两边各写一套，
+     * 加一个工具必漏一处。日志里的实证 —— 工具表里有 `web_search`、提示词说"本轮没有联网"，
+     * 模型信提示词，于是回答「我没有网络出口」。
      *
-     * 三句必须说清：① 同时有联网与动手工具；② 要实时信息先调 `web_search {query}`；
-     * ③ 不要回答「我没有联网」。另外比 AGENT_NOTE 多列一个工具、多一句"搜索也算一步"。
+     * 现在唯一来源是 {@link #agentNote(Caps.Plan)} + {@link Tools#capacity(boolean)}。
      */
-    private static final String HYBRID_NOTE =
-        "\n\n【本轮是 Agent 模式，并且开着联网】你可以连续多步调用工具："
-        + "`look` 看画面、`files` 读写工作区（含 replace 精确替换）、`memory_read` / `memory_write` "
-        + "读写记忆、`tune` 调画质、`web_search` 联网搜索、`read_url` 读网页正文。"
-        + "需要动手时**直接调用**，不要先问；每一步的结果会回到你这里，最多 16 步（搜索也算一步）。\n"
-        + "需要**今天 / 现在 / 最新 / 实时**的信息（新闻、价格、天气、比分、谁是谁、"
-        + "某地最近发生了什么）时，先调 `web_search {query}`，拿到结果再继续；"
-        + "用户给了链接、或者搜索结果里有一条需要看全文时，调 `read_url {url}` 读正文。"
-        + "**用户消息里有 URL、或说「读这个页面 / 看全文」时，必须先调 `read_url`**，"
-        + "不要凭记忆答，也不要在没调工具前就说「抓不到」。"
-        + "搜索/读网页只是多两个工具，不影响你动手（`look` / `files`）。\n"
-        + "**不要回答「我没有联网」**：你这一轮就是联网的。不需要实时信息时，"
-        + "直接动手或直接回答，不必为搜索而搜索。";
 
     /** 按模式拼 system：聊天 = 原样，联网/Agent/混合 追加本轮能力说明。 */
     static String systemFor(Caps.Plan p) {
         if (p == null) return SYSTEM;
+        // 工具被总开关关掉：**什么都不能承诺**，否则它会说"我看看"然后调一个不存在的工具
+        if (p.kind == Caps.Plan.Kind.NONE) {
+            return SYSTEM + "\n\n【本轮没有工具】用户把工具关掉了：不要调用任何工具，"
+                + "也不要声称你看了画面、写了文件或查了网；需要这些就让他去设置里打开「工具」。";
+        }
         if (p.mode == Caps.Mode.WEB) return SYSTEM + WEB_NOTE;
-        if (p.mode == Caps.Mode.AGENT) return SYSTEM + (p.hybrid ? HYBRID_NOTE : AGENT_NOTE);
+        if (p.mode == Caps.Mode.AGENT) return SYSTEM + agentNote(p);
         return SYSTEM;
+    }
+
+    /**
+     * Agent / 混合模式的本轮能力说明。**工具清单是从 {@link Tools#capacity} 现取的**。
+     *
+     * ## 为什么不再手写
+     *
+     * 老写法有两份手写清单（`AGENT_NOTE` / `HYBRID_NOTE`），改工具时必然漏一处：
+     * 日志里出现过"工具表里有 `web_search`、提示词却说本轮没有联网"，模型信了提示词，
+     * 于是回答「我没有网络出口」——用户以为能力没做，其实是提示词在否认自己。
+     *
+     * 现在还多了两条硬规则，针对的是更隐蔽的一种情况：**它在历史里把自己说服了**。
+     * `20261114-035324.jsonl` 里它写过「我应该调工具。但我这边只能输出文本」，
+     * 这段进了历史，之后每轮重读，越用越退化。规则 2 就是给这句话打的补丁。
+     */
+    private static String agentNote(Caps.Plan p) {
+        StringBuilder sb = new StringBuilder(640);
+        sb.append("\n\n【本轮是 Agent 模式").append(p.hybrid ? "，并且开着联网" : "").append("】");
+        sb.append("你可以连续多步调用工具，最多 ").append(p.maxRounds).append(" 步。");
+        sb.append("**你现在真的有这些工具**（名字就是调用时的名字）：\n");
+        sb.append(Tools.capacity(p.hybrid));
+        sb.append("需要动手时**直接调用**，不要先问「要不要我帮你……」。每一步的结果都会回到你这里。\n");
+        if (p.hybrid) {
+            sb.append("要**今天 / 现在 / 最新 / 实时**的信息（新闻、价格、天气、比分、谁是谁），"
+                + "先 `web_search`；要某个接口的结构化数据、或者「先查 A 再按结果查 B」，用 `http`；"
+                + "用户给了链接或说「读这个页面」，先 `read_url`。拿到结果再答，不要凭记忆答。\n");
+        } else {
+            sb.append("本轮工具表里**没有**联网工具：遇到实时信息，如实说「这次没联网，切到联网再问」，不要编。\n");
+        }
+        sb.append("⚠️ 三条硬规则：\n"
+            + "1. 上面列出来的工具就是你的能力。**不许回答「我没有」** —— 说没有之前，先调一次试试。\n"
+            + "2. 你确实能发工具调用。历史里如果出现过「我只能输出文本」「我发不出请求」，"
+            + "那是旧版本的错误认知，**不要照抄**。\n"
+            + "3. 用户点名某个工具（「用 web_search 搜」「用 look 看看」「用 http 查」），"
+            + "就**必须真的调它**，不能拿记忆里的答案顶 —— 他会去对数，对不上就是错的。\n");
+        return sb.toString();
     }
 
     private final Config cfg;
@@ -285,18 +318,44 @@ final class Asker {
         String stcJson = null;
         String title = null;
         String finish = "";
-        int promptTokens = 0;
-        int completionTokens = 0;
+        /**
+         * 这一轮的**真实用量**：逐轮累加，不是"最后一次"。
+         *
+         * 一次 5 轮的工具调用 = 5 次完整请求 = 5 份输入 token，全都付了钱。
+         * 旧版只留最后一轮，显示值因此只有实际的一小半（用户说的"计价不准"就是这个）。
+         */
+        final Cost.Use use = new Cost.Use();
 
         // 这一轮临时长出来的消息（assistant 的 tool_calls、tool 结果、look 的图）
         // 只活在内存里：落盘只存"用户说的"和"它最后回答的"。
         JSONArray turn = new JSONArray();
 
         try {
-            String text = userText;
+            /**
+             * **只在这一轮的第一句加时刻**（`〔现在 22:44 周日〕`）。
+             *
+             * 不能放在 `compose()` 里逐轮加：工具循环每轮都会拼一次消息，而工具轮那几句
+             * 是「继续。」—— 给它加时间戳等于每轮多烧 8 个 token、还会让模型以为
+             * 用户又说了一遍时间。第一句有时刻就够了，同一次回答里时间不会跳。
+             *
+             * 空消息（只发图/只发文档）**不加**：那会变成"用户说了句时间"，很怪。
+             */
+            String text = (userText == null || userText.trim().length() == 0)
+                ? (userText == null ? "" : userText)
+                : stampNow(userText);
             List<byte[]> img = images;
             List<Conv.Att> docs = atts;
             int round = 0;
+            /** 用户点名了某个工具、模型却没调 —— 只强制重试一次，第二次还不动就认了。 */
+            boolean nudged = false;
+            /**
+             * 非 0 = 这一次的 `max_tokens` 被降级过（见下面 400 分支）。
+             *
+             * 自动上限可能算到 384K，而**兼容端点**常常只认 8K/32K，会回 400
+             * `max_tokens too large`。那不是用户的问题，自动降一档重试即可。
+             */
+            int capOverride = 0;
+            final String askText = userText == null ? "" : userText;
 
             while (true) {
                 if (cancelled) { cb.onFail(""); return; }
@@ -306,8 +365,18 @@ final class Asker {
                 Brain.StreamResult sr;
                 Brain.Resp r;
                 try {
-                    sr = Brain.streamChat(cfg, p, messages, sink(cb));
+                    sr = Brain.streamChat(cfg, p, messages, sink(cb), capOverride);
                 } catch (Brain.HttpError he) {
+                    /**
+                     * 端点嫌 `max_tokens` 太大（自动上限算到 384K，兼容端点只认 8K/32K）：
+                     * **降一档重试**，而不是把 400 丢给用户。只降一次。
+                     */
+                    if (capOverride == 0 && isMaxTokensReject(he)) {
+                        capOverride = 16_384;
+                        EyeLog.w("ask", "端点嫌 max_tokens 太大 → 降到 16384 重试："
+                            + Brain.clip(he.body, 140));
+                        continue;
+                    }
                     /**
                      * 端点不认 `latest_reminder` → 关掉它重来一次。
                      *
@@ -359,17 +428,64 @@ final class Asker {
                 if (sr.title != null && sr.title.length() > 0) title = sr.title;
                 if (sr.finish != null && sr.finish.length() > 0) finish = sr.finish;
                 if (sr.steps != null && !sr.steps.isEmpty()) steps.addAll(sr.steps);
-                promptTokens = sr.promptTokens > 0 ? sr.promptTokens : promptTokens;
-                completionTokens = sr.completionTokens > 0 ? sr.completionTokens : completionTokens;
+                /*
+                 * 累加，**不覆盖**：工具循环里每一轮都是一次完整请求。
+                 *
+                 * `hit` 由 `usage` 给（拿不到就 0 = 全按未命中算，宁可高估）。
+                 * `miss = prompt - hit`，负值不可能，但真出现就夹到 0。
+                 */
+                if (sr.promptTokens > 0) {
+                    int hit = Math.min(Math.max(0, sr.cachedTokens), sr.promptTokens);
+                    use.hit += hit;
+                    use.miss += sr.promptTokens - hit;
+                }
+                use.out += Math.max(0, sr.completionTokens);
 
                 if (!r.hasCalls()) {
+                    /**
+                     * 用户**点名**了某个工具，模型却只回了文字 → 强制重试一次。
+                     *
+                     * 为什么要在代码里做，而不是只写在提示词里：日志里它明写着
+                     * 「用户明确要求用 web_search 搜…我应该调工具。**但我这边只能输出文本**」，
+                     * 然后拿记忆里的旧答案顶了一轮。提示词治不了这种"自我认知漂移"，
+                     * 一次代码级的"你刚才没调，现在调"才治得了。
+                     *
+                     * 只做一次（`nudged`）：万一工具本身坏了，不该把 16 步预算耗在重试上。
+                     * 提示用 **user 角色**：`system` 出现在历史末尾有些兼容端点会拒。
+                     */
+                    String forced = nudged ? null : forcedTool(askText, p, steps);
+                    if (forced != null && round < p.maxRounds) {
+                        nudged = true;
+                        EyeLog.w("ask", "点名了 " + forced + " 但模型没调 → 强制重试一次");
+                        try {
+                            turn.put(new JSONObject().put("role", "assistant")
+                                .put("content", r.text == null ? "" : r.text));
+                            turn.put(new JSONObject().put("role", "user").put("content",
+                                "（系统提示，不是用户说的）你刚才只回了文字，**没有调用 `" + forced
+                                + "`**，可它就在这一轮的工具表里。现在真的调用一次，"
+                                + "参数按问题自己填；不要用记忆里的旧答案顶替。"));
+                        } catch (Throwable ignored) { }
+                        text = "继续。";
+                        continue;
+                    }
                     String out = r.text == null ? "" : r.text.trim();
                     boolean refused = isRefused(finish);
                     if (out.length() == 0 && !refused) {
                         cb.onFail("它这次没说话（返回空）");
                         return;
                     }
-                    if (r.truncated) out = out + "\n\n（回答被 token 上限截断了）";
+                    if (r.truncated) {
+                        /**
+                         * 到上限了。自动模式下正常**不会**出现（上限 = 窗口剩余，最多 384K）；
+                         * 真出现只有两种可能：用户手设了一个小值，或者真的写满了服务端上限。
+                         * 文案要分得清，不然用户又不知道该改哪儿。
+                         */
+                        int fixed = cfg == null ? 0 : cfg.maxTokens();
+                        out = out + (fixed > 0
+                            ? "\n\n（到你自己设的 " + fixed + " 上限了。"
+                              + "设置 → 回答长度 改成「自动」就不会再切；也可以回「继续」接着写。）"
+                            : "\n\n（写满了服务端的单次上限。回「继续」我接着写。）");
+                    }
                     EyeLog.w("ask", "round=" + round + " " + p
                         + " reason_len=" + r.reasoning.length()
                         + " stc=" + (stcJson == null ? 0 : stcJson.length())
@@ -378,7 +494,7 @@ final class Asker {
                         + " finish=" + (finish.length() == 0 ? "-" : finish)
                         + " took=" + (System.currentTimeMillis() - started) + "ms");
                     cb.onReply(reply(cfg, out, r.reasoning, thinkMs, p, stcJson, sr.annotations,
-                        title, steps, refused, false, promptTokens, completionTokens));
+                        title, steps, refused, false, use));
                     // 正常收尾 = 任务做完了，清掉续跑日志
                     if (cfg != null) ConvStore.taskClear(cfg.convId());
                     return;
@@ -390,7 +506,7 @@ final class Asker {
                     EyeLog.w("ask", "到了 " + p.maxRounds + " 轮上限，收尾");
                     cb.onReply(reply(cfg, out.length() > 0 ? out : "（看了几轮还没结论，再说一次？）",
                         r.reasoning, thinkMs, p, stcJson, sr.annotations, title, steps,
-                        isRefused(finish), false, promptTokens, completionTokens));
+                        isRefused(finish), false, use));
                     return;
                 }
 
@@ -442,17 +558,19 @@ final class Asker {
                      */
                     boolean search = "web_search".equals(c.name);
                     boolean read = "read_url".equals(c.name);
+                    boolean http = "http".equals(c.name);
                     String q = "";
                     String url = "";
                     try {
                         JSONObject aa = new JSONObject(c.args == null ? "{}" : c.args);
                         if (search) q = aa.optString("query", "").trim();
-                        if (read) url = aa.optString("url", "").trim();
+                        if (read || http) url = aa.optString("url", "").trim();
                     } catch (Throwable ignored) { }
-                    final String stepQ = search ? q : (read ? url : "");
+                    final String stepQ = search ? q : (read || http ? url : "");
                     cb.onTool(c.name, "running",
                         search && q.length() > 0 ? "正在联网搜「" + Brain.clip(q, 18) + "」…"
                         : read ? "正在读网页…"
+                        : http ? "正在请求接口…"
                         : toolVerb(c.name));
                     final int no = stepBar ? clientSeq++ : -1;
                     if (stepBar) {
@@ -461,9 +579,18 @@ final class Asker {
                         cb.onStep(begun);
                     }
                     long tt = System.currentTimeMillis();
-                    String result = search ? Brain.search(cfg, q)
-                        : read ? Brain.fetch(cfg, url)
-                        : Tools.run(c.name, c.args, env);
+                    String result;
+                    if (search) {
+                        result = Brain.search(cfg, q);
+                        if (result != null && !result.startsWith("{\"error\"")) use.search += 1;
+                    } else if (read) {
+                        result = Brain.fetch(cfg, url);
+                        if (result != null && !result.startsWith("{\"error\"")) use.fetch += 1;
+                    } else if (http) {
+                        result = Net.http(cfg, c.args);
+                    } else {
+                        result = Tools.run(c.name, c.args, env);
+                    }
                     long cost = System.currentTimeMillis() - tt;
                     // 落盘"这一步做了什么 + 结果"：万一步数到顶/被停止，下一句"继续"能接上
                     if (cfg != null) ConvStore.taskAppend(cfg.convId(), c.name, c.args, result);
@@ -543,8 +670,22 @@ final class Asker {
      * 只认很窄的两种措辞（提到 `latest_reminder`，或同时提到 `role` + `invalid`），
      * 免得把"别的 400"也当成它、白重试一次。
      */
-    private static boolean isReminderReject(Brain.HttpError he) {
+    /**
+     * 400 是不是"`max_tokens` 太大"。
+     *
+     * 只认窄的三种措辞，避免把"别的 400"也当成它白重试一次：
+     * 提到 `max_tokens` / 提到 `max output` / 同时提到 `too large`（或 `exceed`）+ `token`。
+     */
+    private static boolean isMaxTokensReject(Brain.HttpError he) {
         if (he == null || he.code != 400) return false;
+        String low = he.body == null ? "" : he.body.toLowerCase(Locale.ROOT);
+        if (low.contains("max_tokens")) return true;
+        if (low.contains("max output")) return true;
+        return low.contains("token")
+            && (low.contains("too large") || low.contains("exceed") || low.contains("maximum"));
+    }
+
+    private static boolean isReminderReject(Brain.HttpError he) {        if (he == null || he.code != 400) return false;
         String low = he.body == null ? "" : he.body.toLowerCase(Locale.ROOT);
         if (low.contains("latest_reminder")) return true;
         return low.contains("role") && low.contains("invalid");
@@ -658,7 +799,7 @@ final class Asker {
     static Proto.Reply reply(Config cfg, String text, String reasoning, long thinkMs, Caps.Plan p,
                              String stcJson, JSONArray annotations, String title,
                              List<Proto.Step> steps, boolean refused, boolean stopped,
-                             int promptTokens, int completionTokens) {
+                             Cost.Use use) {
         Proto.Reply r = new Proto.Reply();
         r.text = text == null ? "" : text;
         r.reasoning = reasoning == null ? "" : reasoning;
@@ -671,16 +812,18 @@ final class Asker {
         r.cites = buildCites(annotations, stcJson);
         r.refused = refused;
         r.stopped = stopped;
-        r.promptTokens = promptTokens;
-        r.completionTokens = completionTokens;
+        r.promptTokens = use == null ? 0 : use.prompt();
+        r.completionTokens = use == null ? 0 : use.out;
+        r.cachedTokens = use == null ? 0 : use.hit;
         r.web = p != null && p.kind == Caps.Plan.Kind.SERVER;
-        // 花费：按牌价估算，并累加到全局总数（微美元落盘）
-        r.costUsd = Cost.of(cfg == null ? null : cfg.apiModel(),
-            promptTokens, completionTokens, r.steps);
+        // 花费：按官方牌价估算（含峰谷与缓存命中），并累加到全局总数（微美元落盘）
+        boolean peak = Cost.peak(System.currentTimeMillis());
+        r.costUsd = Cost.of(cfg == null ? null : cfg.apiModel(), use, peak);
+        r.peak = peak;
         if (cfg != null) {
             cfg.addCostUsd(r.costUsd);
-            cfg.setLastTurn(promptTokens, completionTokens,
-                Cost.countTools(r.steps), r.costUsd);
+            cfg.setLastTurn(r.promptTokens, r.completionTokens, r.cachedTokens,
+                use == null ? 0 : (use.search + use.fetch), r.costUsd);
         }
         return r;
     }
@@ -695,6 +838,36 @@ final class Asker {
     /** `finish_reason` 是不是"被拒答"。Chat Completions 侧对应 `content_filter`。 */
     static boolean isRefused(String finish) {
         return "content_filter".equals(finish) || "refusal".equals(finish);
+    }
+
+    /**
+     * 用户这句话里**点了名**、但这一轮还没调用过的工具。没有就返回 null。
+     *
+     * 判据刻意保守（只看工具名本身，不做"意思相近"的猜测）：
+     * 宁可漏判一次，也不要在用户随口说句英文时白烧一轮。
+     */
+    static String forcedTool(String text, Caps.Plan p, List<Proto.Step> steps) {
+        if (text == null || text.length() == 0) return null;
+        if (p == null || !p.allowToolsFunction) return null;
+        java.util.HashSet<String> called = new java.util.HashSet<String>();
+        if (steps != null) {
+            for (Proto.Step s : steps) {
+                if (s != null && s.callType != null) called.add(s.callType);
+            }
+        }
+        String[] names = { "web_search", "read_url", "http", "look", "files", "memory_read",
+            "memory_write", "tune", "book" };
+        String low = text.toLowerCase(Locale.ROOT);
+        for (String n : names) {
+            if (called.contains(n)) continue;
+            if (!Tools.has(p.hybrid, n)) continue;
+            // ASCII 名字按词边界匹配（`files` 出现在 "these files" 里不算点名）
+            if (java.util.regex.Pattern.compile("(?<![a-z0-9_])" + n + "(?![a-z0-9_])")
+                .matcher(low).find()) {
+                return n;
+            }
+        }
+        return null;
     }
 
     // ---------------------------------------------------------------- 引用
@@ -939,8 +1112,29 @@ final class Asker {
         return a;
     }
 
-    /** 这条历史要不要回放 `server_tool_calls`（只有联网模式、开关开着、且真的有）。 */
-    private boolean needsReplay(Conv.Out o, Caps.Plan p) {
+    /**
+     * 给用户这句话补一个**时刻**（`〔现在 22:25 周六〕`）。
+     *
+     * ## 为什么不写进 system
+     *
+     * system 在最前面，改一个字符就让整段前缀缓存失效（命中价只有 1/50）；
+     * 而时间每分钟都在变。放在用户消息尾部，前缀（system + 历史）完全不动，
+     * 缓存照命中 —— 这是唯一不烧钱的位置。
+     *
+     * 日期本来就有（`latest_reminder`），这里补的是**时刻**：它以前只有日期，
+     * 所以会答"我不知道现在几点"，也就没法算"还有多久"。
+     */
+    static String stampNow(String text) {
+        String t = text == null ? "" : text;
+        java.util.Calendar c = java.util.Calendar.getInstance();
+        String clock = String.format(Locale.ROOT, "%02d:%02d",
+            c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE));
+        String wk = String.valueOf("日一二三四五六".charAt(c.get(java.util.Calendar.DAY_OF_WEEK) - 1));
+        String tail = "〔现在 " + clock + " 周" + wk + "〕";
+        return t.length() == 0 ? tail : t + "\n\n" + tail;
+    }
+
+    /** 这条历史要不要回放 `server_tool_calls`（只有联网模式、开关开着、且真的有）。 */    private boolean needsReplay(Conv.Out o, Caps.Plan p) {
         if (o == null || p == null) return false;
         if (!"assistant".equals(o.role)) return false;
         if (p.mode != Caps.Mode.WEB) return false;
@@ -1045,6 +1239,7 @@ final class Asker {
         if ("memory_write".equals(name)) return "正在记一笔…";
         if ("web_search".equals(name)) return "正在联网搜…";
         if ("read_url".equals(name)) return "正在读网页…";
+        if ("http".equals(name)) return "正在请求接口…";
         return "正在用 " + name + "…";
     }
 
@@ -1084,6 +1279,15 @@ final class Asker {
                 return "读了 " + o.optString("answer", "").length() + " 字 · " + took;
             } catch (Throwable ignored) { }
             return "读完了 · " + took;
+        }
+        if ("http".equals(name)) {
+            try {
+                JSONObject o = new JSONObject(result);
+                if (o.has("error")) return "没请求成：" + o.optString("error", "未知原因");
+                return "HTTP " + o.optInt("status", 0) + " · "
+                    + o.optInt("bytes", 0) + " 字 · " + took;
+            } catch (Throwable ignored) { }
+            return "请求完了 · " + took;
         }
         if (result.startsWith("{\"error\"")) return "失败 · " + took;
         return "完成 · " + took;

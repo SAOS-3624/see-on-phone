@@ -63,6 +63,72 @@ final class Tools {
 
     private Tools() { }
 
+    // ---------------------------------------------------------------- 能力清单
+
+    /**
+     * 工具名 → 一句"它能干什么"。
+     *
+     * ## 为什么清单必须和工具表同源
+     *
+     * 之前是**两处各写一套**：`Tools.spec()` 里有 `web_search`，但 system prompt 里
+     * 写的是「你有三样东西：摄像头、档位、记忆」—— 模型信提示词，于是用户明明开着
+     * 联网，它还是回答「我没有网络出口」。日志里能抓到原话：
+     * 「我应该调工具。但我这边只能输出文本」。
+     *
+     * 所以能力清单**只从这里取**，`Asker` 拿 `spec()` 的名字来过一遍：
+     * 加工具 → 清单自动多一行；删工具 → 自动少一行。想改说法就改这里。
+     */
+    static String brief(String name) {
+        if ("look".equals(name)) return "看一眼手机摄像头（抓几秒，拼成一张宫格给你）";
+        if ("tune".equals(name)) return "调自己的画质档位（糊了调清楚、贵了调省）";
+        if ("memory_read".equals(name)) return "翻自己的长期记忆";
+        if ("memory_write".equals(name)) return "往长期记忆里记一笔";
+        if ("files".equals(name)) return "读写手机工作区里的文件（含精确替换）";
+        if ("web_search".equals(name)) return "联网搜索（今天/最新/实时的事）";
+        if ("read_url".equals(name)) return "读一个网页的正文";
+        if ("http".equals(name)) return "直接请求一个 https 接口，拿回 JSON/文本（GET/POST）";
+        if ("book".equals(name)) return "翻一本已上传的书（先编目，或按需展开原文）";
+        return name;
+    }
+
+    /** 能力清单的缓存（按有没有联网分两套，和 {@link #spec(boolean)} 同生命周期）。 */
+    private static volatile String capBase;
+    private static volatile String capWeb;
+
+    /**
+     * 这一轮**真的有**的工具清单（给 system prompt 用）。
+     *
+     * 形状：每行 `· \`name\` 一句话`。**名字来自 {@link #spec(boolean)} 本身**，
+     * 不是手写的列表 —— 这样"提示词说有、请求里没有"这种漂移在结构上就不会发生。
+     */
+    static String capacity(boolean web) {
+        String c = web ? capWeb : capBase;
+        if (c != null) return c;
+        JSONArray a = spec(web);
+        StringBuilder sb = new StringBuilder(256);
+        for (int i = 0; i < a.length(); i += 1) {
+            JSONObject f = a.optJSONObject(i);
+            JSONObject fn = f == null ? null : f.optJSONObject("function");
+            String n = fn == null ? null : fn.optString("name", "");
+            if (n == null || n.length() == 0) continue;
+            sb.append("· `").append(n).append("` ").append(brief(n)).append('\n');
+        }
+        String out = sb.toString();
+        if (web) capWeb = out; else capBase = out;
+        return out;
+    }
+
+    /** 这一轮工具表里有没有这个工具（点名强制调用时用）。 */
+    static boolean has(boolean web, String name) {
+        JSONArray a = spec(web);
+        for (int i = 0; i < a.length(); i += 1) {
+            JSONObject f = a.optJSONObject(i);
+            JSONObject fn = f == null ? null : f.optJSONObject("function");
+            if (fn != null && name.equals(fn.optString("name", ""))) return true;
+        }
+        return false;
+    }
+
     // ---------------------------------------------------------------- 契约
 
     /**
@@ -133,6 +199,31 @@ final class Tools {
             + "只支持 http/https 的普通网页。",
             new String[][] {
                 { "url", "string", "完整 URL（http:// 或 https:// 开头）" },
+            },
+            new String[] { "url" }));
+        /**
+         * `http`：**它自己发起的**请求。
+         *
+         * 和 `read_url` 的分工写死在描述里，否则模型会拿它当搜索用、或者干脆两个都不调：
+         *   - 找"是哪一篇/哪个人/最近怎样" → `web_search`（有摘要和来源）
+         *   - 要结构化数据（汇率、天气 JSON、GitHub、公开 API）→ `http`
+         *   - 要一整页正文 → `read_url`
+         *
+         * 描述里**必须**写限制（只 https、禁内网、4KB 截断），
+         * 否则它会去请求 `http://10.0.0.1` 然后拿到一句"被拒绝"，白费一轮。
+         */
+        arr.put(fn("http",
+            "**你自己发起的** http 请求：调一个接口，拿回 JSON 或文本。\n"
+            + "什么时候用：需要某个接口的真实数据（汇率、天气、GitHub、公开 API、"
+            + "「先查列表拿到 id，再按 id 查详情」这种两步操作）；搜索结果只有摘要、不够用时。\n"
+            + "什么时候不用：找「是哪一篇 / 哪个人 / 最近发生了什么」→ `web_search`；"
+            + "要一整页正文 → `read_url`。\n"
+            + "限制：只允许 https 公网地址（内网/本机一律拒绝）；单次 8 秒；返回超过 4KB 会截断。",
+            new String[][] {
+                { "url", "string", "完整 https 地址" },
+                { "method", "string", "GET（默认）或 POST" },
+                { "body", "string", "POST 的请求体（JSON 字符串）；GET 不用传" },
+                { "headers", "string", "额外的请求头，一行一个，如 `Accept: application/json`（可选）" }
             },
             new String[] { "url" }));
         return arr;

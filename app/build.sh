@@ -55,13 +55,19 @@ fi
 mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/res"
 
 echo "[1/6] javac"
+# ⚠️ 别把源文件直接塞进命令行：仓库目录名一长（`dsh-see-on-phone/app/`），
+#    参数字节数就撞上 Windows 的命令行上限（报 `Argument list too long`，
+#    看着像 javac/d8 的错，其实是 bash 起不来进程）。用 @argfile 传，一行一个。
+#    argfile 里**不会**做 MSYS 的 POSIX→Windows 路径转换，所以要自己转（`/d/x` → `d:/x`）。
+toWin() { sed 's|^/\([a-zA-Z]\)/|\1:/|'; }
+find "$HERE/src" -name '*.java' | toWin > "$OUT/src.list"
 javac -encoding UTF-8 -source 8 -target 8 -nowarn -classpath "$AJ" -d "$OUT/classes" \
-  $(find "$HERE/src" -name '*.java')
+  "@$OUT/src.list"
 
 echo "[2/6] d8"
-CLASSES=$(find "$OUT/classes" -name '*.class' | tr '\n' ' ')
+find "$OUT/classes" -name '*.class' | toWin > "$OUT/classes.list"
 java -cp "$SDK/lib/d8.jar" com.android.tools.r8.D8 --lib "$AJ" --min-api 21 \
-  --output "$OUT/dex" $CLASSES
+  --output "$OUT/dex" "@$OUT/classes.list"
 
 echo "[3/6] aapt2 compile"
 "$AAPT2" compile --dir "$HERE/res" -o "$OUT/res.zip"

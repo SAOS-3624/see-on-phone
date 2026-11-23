@@ -354,6 +354,26 @@ final class Caps {
         return p != null && p.allowToolsFunction && p.allowWebSearch;
     }
 
+    /**
+     * 「工具」总开关关掉之后的形状：**一个工具都不带**。
+     *
+     * 为什么要专门一个方法：`Config.tools()` 从 0.x 起就存在，但**请求端从来没读过它**
+     * （只在设置页和 `/status` 里显示）。用户关掉以为"它不会动手了"，实际工具照发。
+     * 这类"界面允许、请求不让"（或反过来）正是本类注释里禁止的东西。
+     *
+     * 不动 `allowDocs` / `allowImages`：文档和图片是**素材**，不是工具。
+     */
+    static void mute(Plan p) {
+        if (p == null) return;
+        p.kind = Plan.Kind.NONE;
+        p.allowToolsFunction = false;
+        p.allowWebSearch = false;
+        p.allowReadUrl = false;
+        p.hybrid = false;
+        p.maxRounds = 1;
+        p.title = false;
+    }
+
     // ---------------------------------------------------------------- 待 T2
 
     /*

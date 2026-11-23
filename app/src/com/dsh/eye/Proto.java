@@ -77,6 +77,10 @@ final class Proto {
         /** usage（拿不到就是 0）。 */
         int promptTokens;
         int completionTokens;
+        /** 输入里命中前缀缓存的部分（0 = 没命中或端点没给）。 */
+        int cachedTokens;
+        /** 这一轮是不是按时**高峰价**算的（界面提示用）。 */
+        boolean peak;
         /** 本轮是否真的发过 server tools（决定卡片要不要出现）。 */
         boolean web;
         /** 本轮估算花费（美元，见 {@link Cost}）。 */
